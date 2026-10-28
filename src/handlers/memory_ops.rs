@@ -15,7 +15,7 @@
 //! filed answer must be regenerated, not folded into primary material.
 
 use axum::{extract::State, response::Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::crud::{forget_by_id, ForgetByIdRequest};
 use super::recall::AppState;
@@ -51,6 +51,16 @@ pub struct MergeRequest {
     pub memory_type: Option<String>,
 }
 
+/// Reply of `POST /api/memory/merge`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MergeMemoriesResponse {
+    pub success: bool,
+    /// The memory written from the merged content.
+    pub merged_id: String,
+    /// The memories forgotten into it, as sent.
+    pub source_ids: Vec<String>,
+}
+
 /// POST /api/memory/merge — merge N memories into one (J3).
 ///
 /// Concatenates the source bodies, unions their tags, records each source as
@@ -61,7 +71,7 @@ pub struct MergeRequest {
 pub async fn merge_memories(
     State(state): State<AppState>,
     Json(req): Json<MergeRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<MergeMemoriesResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     if req.ids.len() < 2 {
         return Err(AppError::InvalidInput {
@@ -131,11 +141,11 @@ pub async fn merge_memories(
         let _ = forget_by_id(State(state.clone()), Json(freq)).await?;
     }
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "merged_id": merged_id,
-        "source_ids": req.ids,
-    })))
+    Ok(Json(MergeMemoriesResponse {
+        success: true,
+        merged_id,
+        source_ids: req.ids,
+    }))
 }
 
 /// Request to split one memory into several.
@@ -151,6 +161,16 @@ pub struct SplitRequest {
     pub memory_type: Option<String>,
 }
 
+/// Reply of `POST /api/memory/split`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SplitMemoryResponse {
+    pub success: bool,
+    /// The memory that was split, as sent.
+    pub parent_id: String,
+    /// One new memory per range, in range order.
+    pub child_ids: Vec<String>,
+}
+
 /// POST /api/memory/split — split one memory into N children (J3, W-021).
 ///
 /// Each range carves a child body by character index (multibyte-safe). Each
@@ -161,7 +181,7 @@ pub struct SplitRequest {
 pub async fn split_memory(
     State(state): State<AppState>,
     Json(req): Json<SplitRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<SplitMemoryResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     if req.ranges.is_empty() {
         return Err(AppError::InvalidInput {
@@ -223,11 +243,11 @@ pub async fn split_memory(
     };
     let _ = forget_by_id(State(state.clone()), Json(freq)).await?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "parent_id": req.id,
-        "child_ids": child_ids,
-    })))
+    Ok(Json(SplitMemoryResponse {
+        success: true,
+        parent_id: req.id,
+        child_ids,
+    }))
 }
 
 #[cfg(test)]

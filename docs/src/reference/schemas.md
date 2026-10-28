@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **487** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **501** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -207,11 +207,11 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `POST` | `/api/forget` | body [`ForgetByIdRequest`](#forgetbyidrequest) | [`DeleteMemoryResponse`](#deletememoryresponse) |
-| `POST` | `/api/forget/age` | body [`ForgetByAgeRequest`](#forgetbyagerequest) | `serde_json::Value` |
-| `POST` | `/api/forget/date` | body [`ForgetByDateRequest`](#forgetbydaterequest) | `serde_json::Value` |
-| `POST` | `/api/forget/importance` | body [`ForgetByImportanceRequest`](#forgetbyimportancerequest) | `serde_json::Value` |
-| `POST` | `/api/forget/pattern` | body [`ForgetByPatternRequest`](#forgetbypatternrequest) | `serde_json::Value` |
-| `POST` | `/api/forget/tags` | body [`ForgetByTagsRequest`](#forgetbytagsrequest) | `serde_json::Value` |
+| `POST` | `/api/forget/age` | body [`ForgetByAgeRequest`](#forgetbyagerequest) | [`ForgetByCriteriaResponse`](#forgetbycriteriaresponse) |
+| `POST` | `/api/forget/date` | body [`ForgetByDateRequest`](#forgetbydaterequest) | [`ForgetByDateResponse`](#forgetbydateresponse) |
+| `POST` | `/api/forget/importance` | body [`ForgetByImportanceRequest`](#forgetbyimportancerequest) | [`ForgetByCriteriaResponse`](#forgetbycriteriaresponse) |
+| `POST` | `/api/forget/pattern` | body [`ForgetByPatternRequest`](#forgetbypatternrequest) | [`ForgetByPatternResponse`](#forgetbypatternresponse) |
+| `POST` | `/api/forget/tags` | body [`ForgetByTagsRequest`](#forgetbytagsrequest) | [`ForgetByTagsResponse`](#forgetbytagsresponse) |
 | `DELETE` | `/api/forget/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`DeleteMemoryResponse`](#deletememoryresponse) |
 
 ### /gap
@@ -283,10 +283,10 @@ The request and response shape of every HTTP route, read from the handler signat
 |---|---|---|---|
 | `POST` | `/api/lineage/branch` | body [`LineageCreateBranchRequest`](#lineagecreatebranchrequest) | [`LineageBranch`](#lineagebranch) |
 | `POST` | `/api/lineage/branches` | body [`LineageListRequest`](#lineagelistrequest) | [`LineageBranchesResponse`](#lineagebranchesresponse) |
-| `POST` | `/api/lineage/confirm` | body [`LineageEdgeRequest`](#lineageedgerequest) | `serde_json::Value` |
+| `POST` | `/api/lineage/confirm` | body [`LineageEdgeRequest`](#lineageedgerequest) | [`LineageConfirmResponse`](#lineageconfirmresponse) |
 | `POST` | `/api/lineage/edges` | body [`LineageListRequest`](#lineagelistrequest) | [`LineageEdgesResponse`](#lineageedgesresponse) |
 | `POST` | `/api/lineage/link` | body [`LineageAddEdgeRequest`](#lineageaddedgerequest) | [`LineageEdge`](#lineageedge) |
-| `POST` | `/api/lineage/reject` | body [`LineageEdgeRequest`](#lineageedgerequest) | `serde_json::Value` |
+| `POST` | `/api/lineage/reject` | body [`LineageEdgeRequest`](#lineageedgerequest) | [`LineageRejectResponse`](#lineagerejectresponse) |
 | `POST` | `/api/lineage/stats` | body [`LineageListRequest`](#lineagelistrequest) | [`LineageStats`](#lineagestats) |
 | `POST` | `/api/lineage/trace` | body [`LineageTraceRequest`](#lineagetracerequest) | [`LineageTraceResponse`](#lineagetraceresponse) |
 
@@ -302,8 +302,8 @@ The request and response shape of every HTTP route, read from the handler signat
 |---|---|---|---|
 | `GET` | `/api/memories` | query [`ListMemoriesQuery`](#listmemoriesquery) | [`ListResponse`](#listresponse) |
 | `POST` | `/api/memories` | body [`ListMemoriesRequest`](#listmemoriesrequest) | [`ListResponse`](#listresponse) |
-| `POST` | `/api/memories/bulk` | body [`BulkDeleteRequest`](#bulkdeleterequest) | `serde_json::Value` |
-| `POST` | `/api/memories/clear` | body [`ClearAllRequest`](#clearallrequest) | `serde_json::Value` |
+| `POST` | `/api/memories/bulk` | body [`BulkDeleteRequest`](#bulkdeleterequest) | [`BulkDeleteResponse`](#bulkdeleteresponse) |
+| `POST` | `/api/memories/clear` | body [`ClearAllRequest`](#clearallrequest) | [`ClearAllResponse`](#clearallresponse) |
 | `GET` | `/api/memories/count` | query [`CountMemoriesQuery`](#countmemoriesquery) | [`CountResponse`](#countresponse) |
 | `GET` | `/api/memories/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`MemoryWithHierarchy`](#memorywithhierarchy) |
 
@@ -312,10 +312,10 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `GET` | `/api/memory/by-external-id` | query `HashMap<String, String>` | [`ExternalIdRecord`](#externalidrecord) |
-| `POST` | `/api/memory/compress` | body [`CompressMemoryRequest`](#compressmemoryrequest) | `serde_json::Value` |
-| `POST` | `/api/memory/decompress` | body [`DecompressMemoryRequest`](#decompressmemoryrequest) | `serde_json::Value` |
-| `POST` | `/api/memory/merge` | body [`MergeRequest`](#mergerequest) | `serde_json::Value` |
-| `POST` | `/api/memory/split` | body [`SplitRequest`](#splitrequest) | `serde_json::Value` |
+| `POST` | `/api/memory/compress` | body [`CompressMemoryRequest`](#compressmemoryrequest) | [`CompressMemoryResponse`](#compressmemoryresponse) |
+| `POST` | `/api/memory/decompress` | body [`DecompressMemoryRequest`](#decompressmemoryrequest) | [`DecompressMemoryResponse`](#decompressmemoryresponse) |
+| `POST` | `/api/memory/merge` | body [`MergeRequest`](#mergerequest) | [`MergeMemoriesResponse`](#mergememoriesresponse) |
+| `POST` | `/api/memory/split` | body [`SplitRequest`](#splitrequest) | [`SplitMemoryResponse`](#splitmemoryresponse) |
 | `POST` | `/api/memory/tier` | body [`TierMoveRequest`](#tiermoverequest) | [`TierMoveResponse`](#tiermoveresponse) |
 | `DELETE` | `/api/memory/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`DeleteMemoryResponse`](#deletememoryresponse) |
 | `GET` | `/api/memory/{memory_id}` | query `HashMap<String, String>`; path `{memory_id: String}` | [`MemoryWithHierarchy`](#memorywithhierarchy) |
@@ -599,7 +599,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/wiki/render` | query `HashMap<String, String>` | `serde_json::Value` |
+| `POST` | `/api/wiki/render` | query `HashMap<String, String>` | [`WikiRenderResponse`](#wikirenderresponse) |
 
 ### /wintermute
 
@@ -1033,6 +1033,15 @@ Defined in `src/handlers/crud.rs`. Bulk delete memories by filters
 | `created_after` | `Option<chrono::DateTime<chrono::Utc>>` | no | Delete memories created after this timestamp |
 | `created_before` | `Option<chrono::DateTime<chrono::Utc>>` | no | Delete memories created before this timestamp |
 
+### BulkDeleteResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/memories/bulk`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+
 ### CausalFactLink
 
 Defined in `src/memory/compression.rs`. A heuristic-detected causal relationship between two facts.
@@ -1144,6 +1153,16 @@ Defined in `src/handlers/crud.rs`. Clear ALL memories for a user (GDPR complianc
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `confirm` | `String` | yes | Safety confirmation - must be "CONFIRM" to proceed |
+
+### ClearAllResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/memories/clear`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+| `message` | `String` | yes |  |
 
 ### Cluster
 
@@ -1304,6 +1323,15 @@ Defined in `src/handlers/compression.rs`. Request for compressing a memory
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `id` | `String` | yes |  |
+
+### CompressMemoryResponse
+
+Defined in `src/handlers/compression.rs`. Reply of `POST /api/memory/compress`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `message` | `String` | yes |  |
 
 ### ConceptRelationship
 
@@ -1773,6 +1801,27 @@ Defined in `src/handlers/compression.rs`. Request for decompressing a memory
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `id` | `String` | yes |  |
+
+### DecompressMemoryResponse
+
+Defined in `src/handlers/compression.rs`. Reply of `POST /api/memory/decompress`. `memory` is present only when a compressed record was decompressed.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `message` | `String` | yes |  |
+| `was_compressed` | `bool` | yes |  |
+| `memory` | Option&lt;[`DecompressedMemory`](#decompressedmemory)&gt; | no | omitted when empty |
+
+### DecompressedMemory
+
+Defined in `src/handlers/compression.rs`. The decompressed record of a `POST /api/memory/decompress` reply.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `content` | `String` | yes |  |
+| `importance` | `f32` | yes | score |
 
 ### DeleteEntityRequest
 
@@ -2618,6 +2667,16 @@ Defined in `src/handlers/crud.rs`. Forget memories by age
 | `user_id` | `String` | yes |  |
 | `days_old` | `u32` | yes |  |
 
+### ForgetByCriteriaResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/forget/age` and `POST /api/forget/importance`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `forgotten_count` | `usize` | yes |  |
+| `criteria` | `String` | yes | The criterion applied, in words. |
+
 ### ForgetByDateRequest
 
 Defined in `src/handlers/crud.rs`. Forget memories by date range
@@ -2627,6 +2686,17 @@ Defined in `src/handlers/crud.rs`. Forget memories by date range
 | `user_id` | `String` | yes |  |
 | `start` | `chrono::DateTime<chrono::Utc>` | yes | Start of date range (inclusive) - ISO 8601 format |
 | `end` | `chrono::DateTime<chrono::Utc>` | yes | End of date range (inclusive) - ISO 8601 format |
+
+### ForgetByDateResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/forget/date`. `start` and `end` are the window applied, RFC 3339.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+| `start` | `String` | yes |  |
+| `end` | `String` | yes |  |
 
 ### ForgetByIdRequest
 
@@ -2655,6 +2725,16 @@ Defined in `src/handlers/crud.rs`. Forget memories matching a pattern
 | `user_id` | `String` | yes |  |
 | `pattern` | `String` | yes |  |
 
+### ForgetByPatternResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/forget/pattern`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `forgotten_count` | `usize` | yes |  |
+| `pattern` | `String` | yes |  |
+
 ### ForgetByTagsRequest
 
 Defined in `src/handlers/crud.rs`. Forget memories by tags
@@ -2663,6 +2743,16 @@ Defined in `src/handlers/crud.rs`. Forget memories by tags
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `tags` | `Vec<String>` | yes | Tags to match for deletion (deletes memories matching ANY of these tags) |
+
+### ForgetByTagsResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/forget/tags`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+| `tags` | `Vec<String>` | yes |  |
 
 ### Frequency
 
@@ -3262,6 +3352,14 @@ Defined in `src/handlers/lineage.rs`. Response for branches list
 | `branches` | Vec&lt;[`LineageBranch`](#lineagebranch)&gt; | yes |  |
 | `total` | `usize` | yes |  |
 
+### LineageConfirmResponse
+
+Defined in `src/handlers/lineage.rs`. Reply of `POST /api/lineage/confirm`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `confirmed` | `bool` | yes | False when no inferred edge with that id existed. |
+
 ### LineageCreateBranchRequest
 
 Defined in `src/handlers/lineage.rs`. Request to create a branch
@@ -3317,6 +3415,14 @@ Defined in `src/handlers/lineage.rs`. Request to list lineage edges
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `limit` | `usize` | no | default when absent |
+
+### LineageRejectResponse
+
+Defined in `src/handlers/lineage.rs`. Reply of `POST /api/lineage/reject`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `rejected` | `bool` | yes | False when no inferred edge with that id existed. |
 
 ### LineageSource
 
@@ -3902,6 +4008,16 @@ Defined in `src/handlers/prompt_gen.rs`.
 | `user_id` | `String` | yes |  |
 | `source_name` | `String` | yes |  |
 | `target_name` | `String` | yes |  |
+
+### MergeMemoriesResponse
+
+Defined in `src/handlers/memory_ops.rs`. Reply of `POST /api/memory/merge`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `merged_id` | `String` | yes | The memory written from the merged content. |
+| `source_ids` | `Vec<String>` | yes | The memories forgotten into it, as sent. |
 
 ### MergeRequest
 
@@ -5711,6 +5827,16 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 | `Inferred` | none | Inferred by the system |
 | `Unknown` | none | Unknown source |
 
+### SplitMemoryResponse
+
+Defined in `src/handlers/memory_ops.rs`. Reply of `POST /api/memory/split`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `parent_id` | `String` | yes | The memory that was split, as sent. |
+| `child_ids` | `Vec<String>` | yes | One new memory per range, in range order. |
+
 ### SplitRequest
 
 Defined in `src/handlers/memory_ops.rs`. Request to split one memory into several.
@@ -6632,6 +6758,18 @@ Defined in `src/memory/facets.rs`. The WHY of an engram — goals served, typed 
 | `boundary` | Option&lt;[`BoundaryCause`](#boundarycause)&gt; | no | Did this engram open a new event? Why did the boundary fire? |
 | `prediction` | Option&lt;[`Prediction`](#prediction)&gt; | no | Prediction at encoding and whether it held — schema-violation signal. |
 | `schema_id` | `Option<String>` | no | Identifier of the schema this engram instantiates (vmPFC schema slot). |
+
+### WikiRenderResponse
+
+Defined in `src/handlers/crud.rs`. Reply of `POST /api/wiki/render`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `enabled` | `bool` | yes | Always true in a reply: a disabled render answers 503 instead. |
+| `target_dir` | `String` | yes | Directory the wiki was rendered into. |
+| `pages` | `usize` | yes | Pages written. |
+| `edits_applied` | `usize` | yes | Obsidian edits folded back into the store before rendering. |
 
 ---
 

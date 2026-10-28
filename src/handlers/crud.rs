@@ -1008,12 +1008,21 @@ pub(crate) fn journal_bulk_forget(
     super::remember::journal_batch(state, user_id, &payloads);
 }
 
+/// Reply of `POST /api/forget/age` and `POST /api/forget/importance`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForgetByCriteriaResponse {
+    pub success: bool,
+    pub forgotten_count: usize,
+    /// The criterion applied, in words.
+    pub criteria: String,
+}
+
 /// POST /api/forget/age - Forget memories older than N days
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn forget_by_age(
     State(state): State<AppState>,
     Json(req): Json<ForgetByAgeRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ForgetByCriteriaResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
@@ -1035,11 +1044,11 @@ pub async fn forget_by_age(
         &format!("Forgot {count} memories"),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "forgotten_count": count,
-        "criteria": format!("older than {} days", req.days_old)
-    })))
+    Ok(Json(ForgetByCriteriaResponse {
+        success: true,
+        forgotten_count: count,
+        criteria: format!("older than {} days", req.days_old),
+    }))
 }
 
 // =============================================================================
@@ -1051,7 +1060,7 @@ pub async fn forget_by_age(
 pub async fn forget_by_importance(
     State(state): State<AppState>,
     Json(req): Json<ForgetByImportanceRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ForgetByCriteriaResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     if req.threshold < 0.0 || req.threshold > 1.0 {
@@ -1080,23 +1089,31 @@ pub async fn forget_by_importance(
         &format!("Forgot {count} memories"),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "forgotten_count": count,
-        "criteria": format!("importance < {}", req.threshold)
-    })))
+    Ok(Json(ForgetByCriteriaResponse {
+        success: true,
+        forgotten_count: count,
+        criteria: format!("importance < {}", req.threshold),
+    }))
 }
 
 // =============================================================================
 // FORGET BY PATTERN HANDLER
 // =============================================================================
 
+/// Reply of `POST /api/forget/pattern`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForgetByPatternResponse {
+    pub success: bool,
+    pub forgotten_count: usize,
+    pub pattern: String,
+}
+
 /// POST /api/forget/pattern - Forget memories matching a pattern
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn forget_by_pattern(
     State(state): State<AppState>,
     Json(req): Json<ForgetByPatternRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ForgetByPatternResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     // Validate regex pattern to prevent ReDoS attacks
@@ -1132,23 +1149,31 @@ pub async fn forget_by_pattern(
         &format!("Forgot {count} memories"),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "forgotten_count": count,
-        "pattern": req.pattern
-    })))
+    Ok(Json(ForgetByPatternResponse {
+        success: true,
+        forgotten_count: count,
+        pattern: req.pattern,
+    }))
 }
 
 // =============================================================================
 // FORGET BY TAGS HANDLER
 // =============================================================================
 
+/// Reply of `POST /api/forget/tags`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForgetByTagsResponse {
+    pub success: bool,
+    pub deleted_count: usize,
+    pub tags: Vec<String>,
+}
+
 /// POST /api/forget/tags - Forget memories matching any of the provided tags
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn forget_by_tags(
     State(state): State<AppState>,
     Json(req): Json<ForgetByTagsRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ForgetByTagsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     if req.tags.is_empty() {
@@ -1189,23 +1214,32 @@ pub async fn forget_by_tags(
         results: None,
     });
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "deleted_count": deleted_count,
-        "tags": req.tags
-    })))
+    Ok(Json(ForgetByTagsResponse {
+        success: true,
+        deleted_count,
+        tags: req.tags,
+    }))
 }
 
 // =============================================================================
 // FORGET BY DATE HANDLER
 // =============================================================================
 
+/// Reply of `POST /api/forget/date`. `start` and `end` are the window applied, RFC 3339.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForgetByDateResponse {
+    pub success: bool,
+    pub deleted_count: usize,
+    pub start: String,
+    pub end: String,
+}
+
 /// POST /api/forget/date - Forget memories within a date range
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn forget_by_date(
     State(state): State<AppState>,
     Json(req): Json<ForgetByDateRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ForgetByDateResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     if req.end < req.start {
@@ -1253,24 +1287,31 @@ pub async fn forget_by_date(
         results: None,
     });
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "deleted_count": deleted_count,
-        "start": req.start.to_rfc3339(),
-        "end": req.end.to_rfc3339()
-    })))
+    Ok(Json(ForgetByDateResponse {
+        success: true,
+        deleted_count,
+        start: req.start.to_rfc3339(),
+        end: req.end.to_rfc3339(),
+    }))
 }
 
 // =============================================================================
 // BULK DELETE HANDLER
 // =============================================================================
 
+/// Reply of `POST /api/memories/bulk`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BulkDeleteResponse {
+    pub success: bool,
+    pub deleted_count: usize,
+}
+
 /// POST /api/bulk_delete - Bulk delete memories by filters
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn bulk_delete_memories(
     State(state): State<AppState>,
     Json(req): Json<BulkDeleteRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<BulkDeleteResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
@@ -1327,22 +1368,30 @@ pub async fn bulk_delete_memories(
         &format!("Deleted {total_count} memories"),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "deleted_count": total_count
-    })))
+    Ok(Json(BulkDeleteResponse {
+        success: true,
+        deleted_count: total_count,
+    }))
 }
 
 // =============================================================================
 // CLEAR ALL HANDLER (GDPR)
 // =============================================================================
 
+/// Reply of `POST /api/memories/clear`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClearAllResponse {
+    pub success: bool,
+    pub deleted_count: usize,
+    pub message: String,
+}
+
 /// POST /api/clear_all - Clear ALL memories for a user (GDPR compliance)
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn clear_all_memories(
     State(state): State<AppState>,
     Json(req): Json<ClearAllRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ClearAllResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     // Safety check - require explicit confirmation
@@ -1372,11 +1421,11 @@ pub async fn clear_all_memories(
         &format!("GDPR erasure: deleted {count} memories"),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "deleted_count": count,
-        "message": "All memories have been permanently deleted (GDPR erasure)"
-    })))
+    Ok(Json(ClearAllResponse {
+        success: true,
+        deleted_count: count,
+        message: "All memories have been permanently deleted (GDPR erasure)".to_string(),
+    }))
 }
 
 // =============================================================================
@@ -1632,6 +1681,20 @@ pub async fn anchor_memory(
     }))
 }
 
+/// Reply of `POST /api/wiki/render`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WikiRenderResponse {
+    pub success: bool,
+    /// Always true in a reply: a disabled render answers 503 instead.
+    pub enabled: bool,
+    /// Directory the wiki was rendered into.
+    pub target_dir: String,
+    /// Pages written.
+    pub pages: usize,
+    /// Obsidian edits folded back into the store before rendering.
+    pub edits_applied: usize,
+}
+
 /// POST /api/wiki/render — materialise / refresh the wiki for a user (W-018).
 ///
 /// Authed: the user is resolved against the tenant binding via
@@ -1647,7 +1710,7 @@ pub async fn wiki_render(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<WikiRenderResponse>, AppError> {
     let user_id = resolve_request_user_id(
         params.get("user_id").map(String::as_str),
         authenticated_user.as_ref().map(|extension| &extension.0),
@@ -1668,13 +1731,13 @@ pub async fn wiki_render(
     let (target_dir, pages, edits_applied) =
         state.render_wiki(&user_id).map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "enabled": true,
-        "target_dir": target_dir,
-        "pages": pages,
-        "edits_applied": edits_applied,
-    })))
+    Ok(Json(WikiRenderResponse {
+        success: true,
+        enabled: true,
+        target_dir,
+        pages,
+        edits_applied,
+    }))
 }
 
 /// Request body for the tier-move endpoint.

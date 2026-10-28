@@ -168,12 +168,19 @@ pub async fn lineage_list_edges(
     Ok(Json(LineageEdgesResponse { edges, total }))
 }
 
+/// Reply of `POST /api/lineage/confirm`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LineageConfirmResponse {
+    /// False when no inferred edge with that id existed.
+    pub confirmed: bool,
+}
+
 /// POST /api/lineage/confirm - Confirm an inferred lineage edge
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id, edge_id = %req.edge_id))]
 pub async fn lineage_confirm_edge(
     State(state): State<AppState>,
     Json(req): Json<LineageEdgeRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<LineageConfirmResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -194,7 +201,14 @@ pub async fn lineage_confirm_edge(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({ "confirmed": confirmed })))
+    Ok(Json(LineageConfirmResponse { confirmed }))
+}
+
+/// Reply of `POST /api/lineage/reject`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LineageRejectResponse {
+    /// False when no inferred edge with that id existed.
+    pub rejected: bool,
 }
 
 /// POST /api/lineage/reject - Reject (delete) an inferred lineage edge
@@ -202,7 +216,7 @@ pub async fn lineage_confirm_edge(
 pub async fn lineage_reject_edge(
     State(state): State<AppState>,
     Json(req): Json<LineageEdgeRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<LineageRejectResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -221,7 +235,7 @@ pub async fn lineage_reject_edge(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({ "rejected": rejected })))
+    Ok(Json(LineageRejectResponse { rejected }))
 }
 
 /// POST /api/lineage/link - Add an explicit lineage edge

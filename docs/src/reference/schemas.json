@@ -617,35 +617,35 @@
       "path": "/api/forget/age",
       "handler": "crud::forget_by_age",
       "body": "ForgetByAgeRequest",
-      "response": "serde_json::Value"
+      "response": "ForgetByCriteriaResponse"
     },
     {
       "method": "POST",
       "path": "/api/forget/date",
       "handler": "crud::forget_by_date",
       "body": "ForgetByDateRequest",
-      "response": "serde_json::Value"
+      "response": "ForgetByDateResponse"
     },
     {
       "method": "POST",
       "path": "/api/forget/importance",
       "handler": "crud::forget_by_importance",
       "body": "ForgetByImportanceRequest",
-      "response": "serde_json::Value"
+      "response": "ForgetByCriteriaResponse"
     },
     {
       "method": "POST",
       "path": "/api/forget/pattern",
       "handler": "crud::forget_by_pattern",
       "body": "ForgetByPatternRequest",
-      "response": "serde_json::Value"
+      "response": "ForgetByPatternResponse"
     },
     {
       "method": "POST",
       "path": "/api/forget/tags",
       "handler": "crud::forget_by_tags",
       "body": "ForgetByTagsRequest",
-      "response": "serde_json::Value"
+      "response": "ForgetByTagsResponse"
     },
     {
       "method": "DELETE",
@@ -888,7 +888,7 @@
       "path": "/api/lineage/confirm",
       "handler": "lineage::lineage_confirm_edge",
       "body": "LineageEdgeRequest",
-      "response": "serde_json::Value"
+      "response": "LineageConfirmResponse"
     },
     {
       "method": "POST",
@@ -909,7 +909,7 @@
       "path": "/api/lineage/reject",
       "handler": "lineage::lineage_reject_edge",
       "body": "LineageEdgeRequest",
-      "response": "serde_json::Value"
+      "response": "LineageRejectResponse"
     },
     {
       "method": "POST",
@@ -955,14 +955,14 @@
       "path": "/api/memories/bulk",
       "handler": "crud::bulk_delete_memories",
       "body": "BulkDeleteRequest",
-      "response": "serde_json::Value"
+      "response": "BulkDeleteResponse"
     },
     {
       "method": "POST",
       "path": "/api/memories/clear",
       "handler": "crud::clear_all_memories",
       "body": "ClearAllRequest",
-      "response": "serde_json::Value"
+      "response": "ClearAllResponse"
     },
     {
       "method": "GET",
@@ -994,28 +994,28 @@
       "path": "/api/memory/compress",
       "handler": "compression::compress_memory",
       "body": "CompressMemoryRequest",
-      "response": "serde_json::Value"
+      "response": "CompressMemoryResponse"
     },
     {
       "method": "POST",
       "path": "/api/memory/decompress",
       "handler": "compression::decompress_memory",
       "body": "DecompressMemoryRequest",
-      "response": "serde_json::Value"
+      "response": "DecompressMemoryResponse"
     },
     {
       "method": "POST",
       "path": "/api/memory/merge",
       "handler": "memory_ops::merge_memories",
       "body": "MergeRequest",
-      "response": "serde_json::Value"
+      "response": "MergeMemoriesResponse"
     },
     {
       "method": "POST",
       "path": "/api/memory/split",
       "handler": "memory_ops::split_memory",
       "body": "SplitRequest",
-      "response": "serde_json::Value"
+      "response": "SplitMemoryResponse"
     },
     {
       "method": "POST",
@@ -2059,7 +2059,7 @@
       "path": "/api/wiki/render",
       "handler": "crud::wiki_render",
       "query": "HashMap<String, String>",
-      "response": "serde_json::Value"
+      "response": "WikiRenderResponse"
     },
     {
       "method": "POST",
@@ -3664,6 +3664,24 @@
         }
       ]
     },
+    "BulkDeleteResponse": {
+      "name": "BulkDeleteResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/memories/bulk`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
     "CausalFactLink": {
       "name": "CausalFactLink",
       "file": "src/memory/compression.rs",
@@ -3957,6 +3975,32 @@
           "type": "String",
           "required": true,
           "doc": "Safety confirmation - must be \"CONFIRM\" to proceed",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "ClearAllResponse": {
+      "name": "ClearAllResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/memories/clear`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "message",
+          "type": "String",
+          "required": true,
           "refs": [
             "String"
           ]
@@ -4839,6 +4883,27 @@
         },
         {
           "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "CompressMemoryResponse": {
+      "name": "CompressMemoryResponse",
+      "file": "src/handlers/compression.rs",
+      "doc": "Reply of `POST /api/memory/compress`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "message",
           "type": "String",
           "required": true,
           "refs": [
@@ -6766,6 +6831,76 @@
           "required": true,
           "refs": [
             "String"
+          ]
+        }
+      ]
+    },
+    "DecompressMemoryResponse": {
+      "name": "DecompressMemoryResponse",
+      "file": "src/handlers/compression.rs",
+      "doc": "Reply of `POST /api/memory/decompress`. `memory` is present only when a compressed record was decompressed.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "message",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "was_compressed",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "memory",
+          "type": "Option<DecompressedMemory>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "DecompressedMemory"
+          ]
+        }
+      ]
+    },
+    "DecompressedMemory": {
+      "name": "DecompressedMemory",
+      "file": "src/handlers/compression.rs",
+      "doc": "The decompressed record of a `POST /api/memory/decompress` reply.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "importance",
+          "type": "f32",
+          "required": true,
+          "notes": [
+            "score"
           ]
         }
       ]
@@ -10046,6 +10181,33 @@
         }
       ]
     },
+    "ForgetByCriteriaResponse": {
+      "name": "ForgetByCriteriaResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/forget/age` and `POST /api/forget/importance`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "forgotten_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "criteria",
+          "type": "String",
+          "required": true,
+          "doc": "The criterion applied, in words.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "ForgetByDateRequest": {
       "name": "ForgetByDateRequest",
       "file": "src/handlers/crud.rs",
@@ -10078,6 +10240,40 @@
           "refs": [
             "DateTime",
             "Utc"
+          ]
+        }
+      ]
+    },
+    "ForgetByDateResponse": {
+      "name": "ForgetByDateResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/forget/date`. `start` and `end` are the window applied, RFC 3339.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "start",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "end",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
           ]
         }
       ]
@@ -10151,6 +10347,32 @@
         }
       ]
     },
+    "ForgetByPatternResponse": {
+      "name": "ForgetByPatternResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/forget/pattern`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "forgotten_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "pattern",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "ForgetByTagsRequest": {
       "name": "ForgetByTagsRequest",
       "file": "src/handlers/crud.rs",
@@ -10170,6 +10392,33 @@
           "type": "Vec<String>",
           "required": true,
           "doc": "Tags to match for deletion (deletes memories matching ANY of these tags)",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
+    "ForgetByTagsResponse": {
+      "name": "ForgetByTagsResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/forget/tags`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "tags",
+          "type": "Vec<String>",
+          "required": true,
           "refs": [
             "Vec",
             "String"
@@ -12521,6 +12770,20 @@
         }
       ]
     },
+    "LineageConfirmResponse": {
+      "name": "LineageConfirmResponse",
+      "file": "src/handlers/lineage.rs",
+      "doc": "Reply of `POST /api/lineage/confirm`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "confirmed",
+          "type": "bool",
+          "required": true,
+          "doc": "False when no inferred edge with that id existed."
+        }
+      ]
+    },
     "LineageCreateBranchRequest": {
       "name": "LineageCreateBranchRequest",
       "file": "src/handlers/lineage.rs",
@@ -12735,6 +12998,20 @@
           "notes": [
             "default when absent"
           ]
+        }
+      ]
+    },
+    "LineageRejectResponse": {
+      "name": "LineageRejectResponse",
+      "file": "src/handlers/lineage.rs",
+      "doc": "Reply of `POST /api/lineage/reject`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "rejected",
+          "type": "bool",
+          "required": true,
+          "doc": "False when no inferred edge with that id existed."
         }
       ]
     },
@@ -15019,6 +15296,38 @@
           "type": "String",
           "required": true,
           "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "MergeMemoriesResponse": {
+      "name": "MergeMemoriesResponse",
+      "file": "src/handlers/memory_ops.rs",
+      "doc": "Reply of `POST /api/memory/merge`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "merged_id",
+          "type": "String",
+          "required": true,
+          "doc": "The memory written from the merged content.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "source_ids",
+          "type": "Vec<String>",
+          "required": true,
+          "doc": "The memories forgotten into it, as sent.",
+          "refs": [
+            "Vec",
             "String"
           ]
         }
@@ -22560,6 +22869,38 @@
         }
       ]
     },
+    "SplitMemoryResponse": {
+      "name": "SplitMemoryResponse",
+      "file": "src/handlers/memory_ops.rs",
+      "doc": "Reply of `POST /api/memory/split`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "parent_id",
+          "type": "String",
+          "required": true,
+          "doc": "The memory that was split, as sent.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "child_ids",
+          "type": "Vec<String>",
+          "required": true,
+          "doc": "One new memory per range, in range order.",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
     "SplitRequest": {
       "name": "SplitRequest",
       "file": "src/handlers/memory_ops.rs",
@@ -26114,6 +26455,46 @@
             "Option",
             "String"
           ]
+        }
+      ]
+    },
+    "WikiRenderResponse": {
+      "name": "WikiRenderResponse",
+      "file": "src/handlers/crud.rs",
+      "doc": "Reply of `POST /api/wiki/render`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "enabled",
+          "type": "bool",
+          "required": true,
+          "doc": "Always true in a reply: a disabled render answers 503 instead."
+        },
+        {
+          "name": "target_dir",
+          "type": "String",
+          "required": true,
+          "doc": "Directory the wiki was rendered into.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "pages",
+          "type": "usize",
+          "required": true,
+          "doc": "Pages written."
+        },
+        {
+          "name": "edits_applied",
+          "type": "usize",
+          "required": true,
+          "doc": "Obsidian edits folded back into the store before rendering."
         }
       ]
     }
