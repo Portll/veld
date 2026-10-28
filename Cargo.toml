@@ -210,7 +210,10 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 # tiberius is the de-facto MSSQL Rust client (sqlx has no maintained MSSQL
 # driver); it ships its own TDS protocol stack. tokio-util/compat adapts a
 # tokio TcpStream into the futures AsyncRead/Write tiberius expects.
-tiberius = { version = "0.12", optional = true }
+# tiberius's defaults minus `winauth`: winauth (Windows NTLM/SSPI, every
+# release) pins rand 0.7 (GHSA-cq8v-f236-94qc). The backend connects with SQL
+# Server logins from an ADO string; Windows integrated security is unsupported.
+tiberius = { version = "0.12", optional = true, default-features = false, features = ["tds73", "native-tls"] }
 
 # Concurrency
 parking_lot = "0.12"
