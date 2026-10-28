@@ -1759,8 +1759,9 @@ impl AblationConfig {
 /// operating point users get, and `-ce` reads the reranker's.
 ///
 /// Setting `SHODH_DISABLE_BOOSTS` replaces its default-disabled set, so every arm
-/// that sets it names `hebbian` (or `all`) to keep the term off, except `+hebbian`,
-/// which empties the list to switch it on.
+/// that sets it names `hebbian` and `graph_strength` (or `all`) to keep those terms
+/// off, except `+hebbian` and `+graph-strength`, which each leave out the one they
+/// switch on.
 pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
     fn arm(name: &'static str, env: &[(&'static str, &'static str)]) -> AblationConfig {
         AblationConfig {
@@ -1798,13 +1799,20 @@ pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
         arm("+graph-traverse", &[("SHODH_GRAPH_TRAVERSE", "1")]),
         arm(
             "-lateral-inhibition",
-            &[("SHODH_DISABLE_BOOSTS", "hebbian,lateral_inhibition")],
+            &[(
+                "SHODH_DISABLE_BOOSTS",
+                "hebbian,graph_strength,lateral_inhibition",
+            )],
         ),
         arm(
             "-graph-potentiation",
-            &[("SHODH_DISABLE_BOOSTS", "hebbian,graph_potentiation")],
+            &[(
+                "SHODH_DISABLE_BOOSTS",
+                "hebbian,graph_strength,graph_potentiation",
+            )],
         ),
-        arm("+hebbian", &[("SHODH_DISABLE_BOOSTS", "")]),
+        arm("+hebbian", &[("SHODH_DISABLE_BOOSTS", "graph_strength")]),
+        arm("+graph-strength", &[("SHODH_DISABLE_BOOSTS", "hebbian")]),
         arm(
             "+graph-boost-mult+expand",
             &[
@@ -5193,21 +5201,39 @@ mod tests {
     }
 
     #[test]
-    fn every_boost_ablation_but_plus_hebbian_keeps_hebbian_off() {
+    fn every_boost_ablation_keeps_the_default_off_families_off_but_the_one_it_measures() {
+        use crate::memory::ablation::{DEFAULT_DISABLED, DISABLE_BOOSTS_VAR};
+        let mut measured = Vec::new();
         for AblationConfig { name, env, .. } in ablation_configs() {
             for (k, v) in env {
-                if k != crate::memory::ablation::DISABLE_BOOSTS_VAR || name == "+hebbian" {
+                if k != DISABLE_BOOSTS_VAR {
                     continue;
                 }
+                let tokens: Vec<&str> = v.split(',').map(str::trim).collect();
+                let switched_on: Vec<&str> = DEFAULT_DISABLED
+                    .iter()
+                    .copied()
+                    .filter(|f| !tokens.iter().any(|t| t == f || *t == "all"))
+                    .collect();
                 assert!(
-                    v.split(',')
-                        .map(str::trim)
-                        .any(|t| t == "hebbian" || t == "all"),
-                    "`{name}` sets {k}={v} without `hebbian`, which switches the default-off \
-                     hebbian term back on and measures two changes at once"
+                    switched_on.len() <= 1,
+                    "`{name}` sets {k}={v}, which switches {switched_on:?} back on and \
+                     measures more than one change"
                 );
+                if let [family] = switched_on[..] {
+                    let arm = format!("+{}", family.replace('_', "-"));
+                    assert_eq!(name, arm, "`{name}` switches `{family}` on");
+                    measured.push(family);
+                }
             }
         }
+        measured.sort_unstable();
+        let mut defaults = DEFAULT_DISABLED.to_vec();
+        defaults.sort_unstable();
+        assert_eq!(
+            measured, defaults,
+            "each default-off family has its own arm"
+        );
     }
 
     #[test]

@@ -2798,6 +2798,7 @@ impl super::MemorySystem {
         // call return `true`, preserving byte-identical behaviour.
         let dials_snapshot = self.cognitive_dials.read().clone();
         let hebbian_family_on = super::ablation::is_enabled("hebbian");
+        let graph_strength_on = super::ablation::is_enabled("graph_strength");
 
         // R2 (LTR) SHADOW CAPTURE side-map. The `with_unified_score` closure
         // (re-bound each loop iteration) borrows this by reference and inserts one
@@ -3004,13 +3005,17 @@ impl super::MemorySystem {
                 let access_boost =
                     ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * access_weight;
 
-                // BRIDGE-1: graph_strength (signal 3+, proven 13% in proactive)
-                let graph_boost = hebbian_scores
-                    .get(&mem.id)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0)
-                    * 0.08;
+                // BRIDGE-1: graph_strength, the `graph_strength` ablation family.
+                let graph_boost = if graph_strength_on {
+                    hebbian_scores
+                        .get(&mem.id)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0)
+                        * 0.08
+                } else {
+                    0.0
+                };
 
                 // Signal 9: graded temporal-context contiguity (E6 TCM). When the
                 // memory carries a context_drift snapshot and a live drift state

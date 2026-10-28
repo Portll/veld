@@ -16,10 +16,19 @@
 //!   never gated. Those are in [`UPSTREAM_ONLY_FAMILIES`] so a harness arm that
 //!   names one reports the ablation as unavailable instead of measuring baseline.
 //!
+//! * [`FAMILIES`] also holds veld-only families, listed in [`VELD_ONLY_FAMILIES`].
+//!
 //! [`DEFAULT_DISABLED`] holds `hebbian`, as upstream's does (shodh-memory #321). The
 //! term adds a graph hop decay of up to 1.0, scaled by 0.1, to fused scores whose top
 //! ten spread over about 0.007, and only for memories the graph leg reached. On the
 //! LoCoMo gate, switching it off lifted nDCG@10 from 0.383 to about 0.44.
+//!
+//! It also holds `graph_strength`, the Layer-5 term that adds the same per-memory graph
+//! value scaled by 0.08. On 2026-10-24 traces it was non-zero on 66% of rows and favoured
+//! late sessions, because the graph leg then took only each entity's 20 newest episodes:
+//! a near-uniform nudge with a recency bias, from the input `hebbian` was measured
+//! harmful on. The PPR graph leg changes that input to its episode activation, so the
+//! term stays off until a run measures it there.
 
 use std::collections::HashSet;
 
@@ -33,14 +42,20 @@ pub const DISABLE_BOOSTS_VAR: &str = "SHODH_DISABLE_BOOSTS";
 ///   without it, even to the empty string, switches it on. Also switchable through
 ///   the `hebbian` cognitive-dial signal; the term runs only when both allow it.
 /// * `graph_potentiation` — retrieval-driven edge strengthening
-///   (`batch_strengthen_synapses`) in the graph leg's traversals
-///   (`traverse_from_entity_filtered`, `traverse_weighted`, `traverse_bidirectional`).
-///   Distinct from `SHODH_RECALL_READONLY`, which suppresses every recall-path write
-///   for measurement integrity; this family ablates the one mechanism.
+///   (`batch_strengthen_synapses`): the edges carrying the default graph leg's PPR walk,
+///   and those `traverse_from_entity_filtered`, `traverse_weighted` and
+///   `traverse_bidirectional` cross. Distinct from `SHODH_RECALL_READONLY`, which
+///   suppresses every recall-path write for measurement integrity; this family ablates
+///   the one mechanism.
+/// * `graph_strength` — the Layer-5 term `graph value * 0.08` in `recall.rs` (BRIDGE-1).
+///   Off by default ([`DEFAULT_DISABLED`]); veld-only.
 ///
 /// Adding a name here without a matching [`is_enabled`] call at the component's
 /// site makes the family a lie; `recall_harness::runner`'s guard test checks both.
-pub const FAMILIES: [&str; 2] = ["hebbian", "graph_potentiation"];
+pub const FAMILIES: [&str; 3] = ["hebbian", "graph_potentiation", "graph_strength"];
+
+/// Families in [`FAMILIES`] that upstream does not declare.
+pub const VELD_ONLY_FAMILIES: [&str; 1] = ["graph_strength"];
 
 /// Upstream's families that veld does not gate. An ablation naming one is
 /// unavailable in veld, and [`unavailable_reason`] says why.
@@ -69,7 +84,7 @@ pub const UPSTREAM_ONLY_FAMILIES: [&str; 21] = [
 ];
 
 /// Families disabled when `SHODH_DISABLE_BOOSTS` is unset; see the module docs.
-pub const DEFAULT_DISABLED: [&str; 1] = ["hebbian"];
+pub const DEFAULT_DISABLED: [&str; 2] = ["hebbian", "graph_strength"];
 
 /// Why an ablation of `family` cannot run in veld, or `None` if it can.
 pub fn unavailable_reason(family: &str) -> Option<&'static str> {
@@ -178,8 +193,13 @@ mod tests {
             "duplicate in UPSTREAM_ONLY_FAMILIES"
         );
         assert!(wired.is_disjoint(&upstream_only));
+        let veld_only: HashSet<&str> = VELD_ONLY_FAMILIES.iter().copied().collect();
+        assert!(
+            veld_only.is_subset(&wired),
+            "a veld-only family is not wired"
+        );
         // Upstream declares 23 families; every one is either wired or explained.
-        assert_eq!(wired.len() + upstream_only.len(), 23);
+        assert_eq!(wired.len() - veld_only.len() + upstream_only.len(), 23);
     }
 
     #[test]
@@ -193,9 +213,10 @@ mod tests {
     }
 
     #[test]
-    fn unset_env_disables_only_hebbian() {
+    fn unset_env_disables_only_the_default_families() {
         with_env(None, || {
             assert!(is_disabled("hebbian"));
+            assert!(is_disabled("graph_strength"));
             assert!(is_enabled("graph_potentiation"));
         });
     }
@@ -224,6 +245,7 @@ mod tests {
         with_env(Some(" Hebbian "), || {
             assert!(is_disabled("hebbian"));
             assert!(is_enabled("graph_potentiation"));
+            assert!(is_enabled("graph_strength"));
         });
         with_env(Some("graph_potentiation"), || {
             assert!(is_disabled("graph_potentiation"));
