@@ -2195,6 +2195,27 @@ impl super::MemorySystem {
                 }
             }
 
+            // A memory carrying a declared FilePath the query names ranks on that match; see
+            // DECLARED_PATH_MATCH_BOOST for why the overlap boost above is not enough.
+            if let Some(paths) = resolved_entities
+                .as_ref()
+                .map(|r| &r.file_paths)
+                .filter(|p| !p.is_empty())
+            {
+                let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                for id in &ids {
+                    let carries = candidates
+                        .get(id)
+                        .is_some_and(|v| v.entities_lower.iter().any(|e| paths.contains(e)));
+                    if carries {
+                        if let Some(score) = fused.get_mut(id) {
+                            *score += crate::constants::DECLARED_PATH_MATCH_BOOST;
+                        }
+                        attr.entry(id.clone()).or_default().entity_overlap = true;
+                    }
+                }
+            }
+
             // ===========================================================================
             // LAYER 4.527: BM25 SPECIFICITY DISCOUNT
             // ===========================================================================
@@ -6119,6 +6140,8 @@ pub(crate) struct ResolvedQueryEntities {
     /// Every resolved entity in query order (focal, then the other words, then path-shaped
     /// words' FilePath entities), each once: two words resolving to one entity traverse it once.
     pub(crate) all: Vec<uuid::Uuid>,
+    /// Lowercased names of the declared FilePath entities path-shaped query words resolved to.
+    pub(crate) file_paths: Vec<String>,
 }
 
 /// Resolve recall's query words against the graph. Every word goes through the exact,
@@ -6135,6 +6158,7 @@ pub(crate) fn resolve_query_entities(
 ) -> ResolvedQueryEntities {
     let mut focal: Vec<uuid::Uuid> = Vec::new();
     let mut all: Vec<uuid::Uuid> = Vec::new();
+    let mut file_paths: Vec<String> = Vec::new();
     let mut tried: HashSet<&str> = HashSet::new();
     let add = |list: &mut Vec<uuid::Uuid>, uuid: uuid::Uuid| {
         if !list.contains(&uuid) {
@@ -6181,10 +6205,18 @@ pub(crate) fn resolve_query_entities(
         if let Ok(found) = graph.find_file_paths_by_suffix(&token) {
             for entity in found {
                 add(&mut all, entity.uuid);
+                let name = entity.name.to_lowercase();
+                if !file_paths.contains(&name) {
+                    file_paths.push(name);
+                }
             }
         }
     }
-    ResolvedQueryEntities { focal, all }
+    ResolvedQueryEntities {
+        focal,
+        all,
+        file_paths,
+    }
 }
 
 /// An entity's most recent episodes as recall's graph layer uses them, read once per recall
@@ -7132,5 +7164,33 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+
+    #[test]
+    fn a_path_shaped_word_names_the_declared_file_it_resolves_to() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let mut declared = entity("commitwork:Admin/serve.mjs");
+        declared.labels = vec![EntityLabel::FilePath];
+        let serve = graph.add_entity(declared).unwrap();
+        graph.add_entity(entity("observe.mjs")).unwrap();
+
+        for query in [
+            "what changed in serve.mjs",
+            "what changed in admin/serve.mjs",
+        ] {
+            let resolved = resolve_query_entities(&graph, &[], &[], query);
+            assert_eq!(resolved.all, vec![serve], "{query}");
+            assert_eq!(
+                resolved.file_paths,
+                vec!["commitwork:admin/serve.mjs".to_string()],
+                "{query}"
+            );
+        }
+        let none = resolve_query_entities(&graph, &[], &["changed"], "what changed recently");
+        assert!(
+            none.file_paths.is_empty(),
+            "no path-shaped word, no declared file"
+        );
     }
 }
