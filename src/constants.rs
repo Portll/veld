@@ -1094,8 +1094,66 @@ pub const QUERY_ENTITY_FUZZY_MAX_CANDIDATES: usize = 32;
 /// a query that names no declared file is unchanged.
 pub const DECLARED_PATH_MATCH_BOOST: f32 = 0.20;
 
-/// Most recent episodes recall takes from each entity a graph traversal reaches
-pub const RECALL_GRAPH_EPISODES_PER_ENTITY: usize = 20;
+/// Restart probability of recall's personalized PageRank graph leg: the share of the mass
+/// each power-iteration step returns to the seeds. Ported from shodh-memory #325.
+pub const RECALL_PPR_RESTART: f32 = 0.5;
+
+/// Power-iteration steps recall's PPR runs at most; it stops earlier once the L1 change
+/// between steps falls below [`RECALL_PPR_TOLERANCE`].
+pub const RECALL_PPR_MAX_ITERATIONS: usize = 30;
+
+/// L1 change between PPR steps below which the walk has converged.
+pub const RECALL_PPR_TOLERANCE: f32 = 1e-6;
+
+/// Hops of the entity subgraph recall's PPR expands from its seeds.
+pub const RECALL_PPR_EXPAND_HOPS: usize = 3;
+
+/// Entities recall's PPR subgraph holds at most, checked as each is added. Upstream's 5000
+/// is cut to 2000: with an ontological intent naming labels, each node costs an entity read,
+/// and the mass past the strongest 2000 is too small to change which episodes the leg takes.
+pub const RECALL_PPR_MAX_NODES: usize = 2000;
+
+/// Entities whose edge index recall's PPR reads at most. Upstream bounds the walk by node
+/// count alone; this bounds the index scans on a sparse graph, where every node holds few
+/// edges and the node cap takes thousands of expansions to reach.
+pub const RECALL_PPR_MAX_EXPANSIONS: usize = 500;
+
+/// Edge records recall's PPR decodes at most. Expanding an entity decodes every edge it
+/// stores before keeping the strongest 100, so a hub costs its whole degree: 500 expansions
+/// of 200-edge entities decode 100,000 edges and name as many tie peers under the graph read
+/// lock, a cost that grows with the store's graph. An entity with more stored edges than
+/// remain is skipped without decoding.
+pub const RECALL_PPR_MAX_EDGE_READS: usize = 6000;
+
+/// Stationary flow an edge must carry for a recall to strengthen it. Flows sum to at most
+/// `1 - RECALL_PPR_RESTART`, so one recall strengthens at most 50 edges.
+pub const RECALL_PPR_POTENTIATION_MIN_FLOW: f32 = 0.01;
+
+/// Multi-seed coverage bonus of the graph leg (shodh-memory #325, G5): an episode naming
+/// `n` of the query's seed entities has its graph activation scaled by
+/// `1 + SEED_COVERAGE_BONUS × (n − 1)`. Gold for a multi-hop question names the speaker AND
+/// the topic; a hub distractor names one of them. Single-seed queries are unaffected.
+pub const SEED_COVERAGE_BONUS: f32 = 1.0;
+
+/// Activated entities, strongest first, whose episodes enter the graph leg's pool.
+pub const RECALL_GRAPH_LEG_ENTITIES: usize = 128;
+
+/// Episodes one entity contributes to the graph leg's pool at most, newest first. Above a
+/// speaker's count on the LoCoMo gate, where each speaker says 316 of the 629 turns and is
+/// named in more, so a seed's early sessions are not cut the way the old leg's 20 newest were.
+pub const RECALL_GRAPH_LEG_EPISODES_PER_ENTITY: usize = 500;
+
+/// Episodes the graph leg scores at most: each costs one candidate record read, shared with
+/// the later layers, and one cosine against the query.
+pub const RECALL_GRAPH_LEG_POOL: usize = 1000;
+
+/// Episode records the graph leg decodes at most per recall, across all its entities.
+/// Entities share episodes, so without it the strongest entities of a hub-dense store could
+/// each decode 500 episodes the pool already holds: 64,000 reads for 1000 candidates.
+pub const RECALL_GRAPH_LEG_EPISODE_READS: usize = 5000;
+
+/// Graph leg candidates handed to fusion, best first.
+pub const RECALL_GRAPH_LEG_CANDIDATES: usize = 200;
 
 /// Fused candidates compared pairwise by recall's temporal topic dedup (Layer 4.54)
 ///

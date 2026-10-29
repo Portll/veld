@@ -898,6 +898,9 @@ impl Evidence {
     }
 }
 
+/// An entity's edges with their effective strength, strongest first.
+pub type RankedEdges = Vec<(RelationshipEdge, f32)>;
+
 /// Outcome of one `strengthen_from` call.
 #[derive(Debug, Clone)]
 pub struct Strengthening {
@@ -909,6 +912,15 @@ pub struct Strengthening {
     /// 0 by default. The directional components take this same fraction of their
     /// own step, so one source counts once in every component of the edge.
     pub step: f32,
+}
+
+impl Strengthening {
+    /// A repeat from a source already on the edge that earned no step: strength,
+    /// direction, activation count and tier are as they were, and only `last_activated`
+    /// and the source's repeat count moved.
+    pub fn moves_nothing(&self) -> bool {
+        self.evidence == Evidence::RepeatSource && self.step <= 0.0
+    }
 }
 
 /// Evidence record for an edge created by a strengthening event from `source`.
@@ -1971,6 +1983,16 @@ impl RelationType {
             Self::Approves => "Approves",
             Self::Custom(s) => s.as_str(),
         }
+    }
+
+    /// Whether this relation asserts nothing about its kind, so no ontological intent can
+    /// mismatch it: the documented generics plus the co-retrieval and co-occurrence edges
+    /// recall and ingest write between any two entities.
+    pub fn is_generic(&self) -> bool {
+        matches!(
+            self,
+            Self::RelatedTo | Self::AssociatedWith | Self::CoRetrieved | Self::CoOccurs
+        )
     }
 
     /// Whether this edge asserts that its `from_entity` caused its `to_entity`.
@@ -4062,6 +4084,12 @@ impl GraphMemory {
     /// strength ordering or decay pruning: what the store holds, which is what the
     /// storage trait's listing answers on every engine.
     pub fn stored_entity_relationships(&self, entity_uuid: &Uuid) -> Result<Vec<RelationshipEdge>> {
+        self.decode_edges(&self.stored_entity_edge_ids(entity_uuid)?)
+    }
+
+    /// The ids of every stored edge that touches `entity_uuid`, in index order, read from
+    /// the entity's edge index alone: no edge record is decoded.
+    pub fn stored_entity_edge_ids(&self, entity_uuid: &Uuid) -> Result<Vec<Uuid>> {
         let prefix = format!("{entity_uuid}:");
         let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
         for (key, _) in self
@@ -4082,9 +4110,14 @@ impl GraphMemory {
                 edge_uuids.push(edge_uuid);
             }
         }
+        Ok(edge_uuids)
+    }
 
+    /// The edge records stored under `edge_uuids`, in that order; a missing or
+    /// undecodable record is left out.
+    fn decode_edges(&self, edge_uuids: &[Uuid]) -> Result<Vec<RelationshipEdge>> {
         let mut edges = Vec::with_capacity(edge_uuids.len());
-        for edge_uuid in &edge_uuids {
+        for edge_uuid in edge_uuids {
             if let Some(bytes) = self.store.get_cf(CF_RELATIONSHIPS, edge_uuid.as_bytes())? {
                 if let Ok(edge) = RelationshipEdge::decode(&bytes) {
                     edges.push(edge);
@@ -4134,8 +4167,44 @@ impl GraphMemory {
         now: DateTime<Utc>,
     ) -> Result<Vec<(RelationshipEdge, f32)>> {
         let stored = self.stored_entity_relationships(entity_uuid)?;
+        Ok(self.rank_entity_edges(entity_uuid, stored, limit, now, &mut HashMap::new()))
+    }
+
+    /// [`entity_edges_with_strength`](Self::entity_edges_with_strength) for a walk that
+    /// reads many entities under one budget. When the entity has more than `max_decodes`
+    /// stored edges it decodes none and returns `None`; otherwise it returns the edges and
+    /// how many records it read. Tie peers are named from `peer_names`, which the caller
+    /// keeps for the whole walk, so each peer entity is read once however many of the
+    /// walk's entities it neighbours.
+    pub fn entity_edges_with_strength_bounded(
+        &self,
+        entity_uuid: &Uuid,
+        limit: Option<usize>,
+        now: DateTime<Utc>,
+        max_decodes: usize,
+        peer_names: &mut HashMap<Uuid, String>,
+    ) -> Result<Option<(RankedEdges, usize)>> {
+        let ids = self.stored_entity_edge_ids(entity_uuid)?;
+        if ids.len() > max_decodes {
+            return Ok(None);
+        }
+        let stored = self.decode_edges(&ids)?;
+        let ranked = self.rank_entity_edges(entity_uuid, stored, limit, now, peer_names);
+        Ok(Some((ranked, ids.len())))
+    }
+
+    /// Order `stored`, the edges of `entity_uuid`, strongest first at `now`, queue the
+    /// decayed ones for pruning and keep the first `limit`.
+    fn rank_entity_edges(
+        &self,
+        entity_uuid: &Uuid,
+        stored: Vec<RelationshipEdge>,
+        limit: Option<usize>,
+        now: DateTime<Utc>,
+        peer_names: &mut HashMap<Uuid, String>,
+    ) -> Vec<(RelationshipEdge, f32)> {
         if stored.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let mut edges: Vec<(RelationshipEdge, f32)> = stored
             .into_iter()
@@ -4149,56 +4218,6 @@ impl GraphMemory {
         // computed once above against one `now`: recomputing them inside the comparator
         // could return different values across calls and break the total order.
         edges.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        // Phase 3.1: equal-strength runs arrive in edge-UUID order, which is random per ingest,
-        // and the limit below cuts through them on hub entities. Order each run by (peer entity
-        // name, relation type, uuid), as the degree-cap prune does, so two stores built from the
-        // same content keep the same edges. Names are looked up only inside runs of two or more.
-        {
-            let peer_of = |e: &RelationshipEdge| -> Uuid {
-                if e.from_entity == *entity_uuid {
-                    e.to_entity
-                } else {
-                    e.from_entity
-                }
-            };
-            let mut peer_names: HashMap<Uuid, String> = HashMap::new();
-            let mut start = 0;
-            while start < edges.len() {
-                let bits = edges[start].1.to_bits();
-                let mut end = start + 1;
-                while end < edges.len() && edges[end].1.to_bits() == bits {
-                    end += 1;
-                }
-                if end - start > 1 {
-                    for (e, _) in &edges[start..end] {
-                        let peer = peer_of(e);
-                        peer_names.entry(peer).or_insert_with(|| {
-                            self.get_entity(&peer)
-                                .ok()
-                                .flatten()
-                                .map(|ent| ent.name)
-                                .unwrap_or_default()
-                        });
-                    }
-                    edges[start..end].sort_by(|(a, _), (b, _)| {
-                        peer_names[&peer_of(a)]
-                            .cmp(&peer_names[&peer_of(b)])
-                            .then_with(|| {
-                                format!("{:?}", a.relation_type)
-                                    .cmp(&format!("{:?}", b.relation_type))
-                            })
-                            .then_with(|| {
-                                (b.from_entity == *entity_uuid)
-                                    .cmp(&(a.from_entity == *entity_uuid))
-                            })
-                            .then_with(|| a.uuid.cmp(&b.uuid))
-                    });
-                }
-                start = end;
-            }
-        }
-
         // Phase 3.5: Opportunistic pruning — queue edges that have decayed below
         // their tier's threshold for batch deletion on next maintenance cycle.
         // This replaces the eager full-scan apply_decay() with lazy on-read pruning.
@@ -4246,12 +4265,56 @@ impl GraphMemory {
             });
         }
 
-        // Phase 4: Truncate to limit if specified
-        if let Some(max) = limit {
-            edges.truncate(max);
+        // Phase 3.1: equal-strength runs arrive in edge-UUID order, which is random per ingest,
+        // and the limit below cuts through them on hub entities. Order each run by (peer entity
+        // name, relation type, uuid), as the degree-cap prune does, so two stores built from the
+        // same content keep the same edges. Names are looked up only inside runs of two or more
+        // that start before the limit: a run past it is cut whole, so its order cannot matter.
+        // Pruning first leaves the same survivors in the same relative order.
+        let keep = limit.unwrap_or(usize::MAX);
+        let peer_of = |e: &RelationshipEdge| -> Uuid {
+            if e.from_entity == *entity_uuid {
+                e.to_entity
+            } else {
+                e.from_entity
+            }
+        };
+        let mut start = 0;
+        while start < edges.len() && start < keep {
+            let bits = edges[start].1.to_bits();
+            let mut end = start + 1;
+            while end < edges.len() && edges[end].1.to_bits() == bits {
+                end += 1;
+            }
+            if end - start > 1 {
+                for (e, _) in &edges[start..end] {
+                    let peer = peer_of(e);
+                    peer_names.entry(peer).or_insert_with(|| {
+                        self.get_entity(&peer)
+                            .ok()
+                            .flatten()
+                            .map(|ent| ent.name)
+                            .unwrap_or_default()
+                    });
+                }
+                edges[start..end].sort_by(|(a, _), (b, _)| {
+                    peer_names[&peer_of(a)]
+                        .cmp(&peer_names[&peer_of(b)])
+                        .then_with(|| {
+                            format!("{:?}", a.relation_type).cmp(&format!("{:?}", b.relation_type))
+                        })
+                        .then_with(|| {
+                            (b.from_entity == *entity_uuid).cmp(&(a.from_entity == *entity_uuid))
+                        })
+                        .then_with(|| a.uuid.cmp(&b.uuid))
+                });
+            }
+            start = end;
         }
 
-        Ok(edges)
+        // Phase 4: Truncate to limit if specified
+        edges.truncate(keep);
+        edges
     }
 
     /// Calculate edge density for a specific entity (SHO-D5)
@@ -5747,6 +5810,10 @@ impl GraphMemory {
     /// Implements "neurons that fire together, wire together".
     ///
     /// Uses a mutex to prevent race conditions during concurrent updates (SHO-64).
+    ///
+    /// A repeat from a source already on the edge that earns no step is not written:
+    /// it would only reset the edge's decay clock, in a write the intent log does not
+    /// carry, so a replica's copy of the edge would decay on a different clock.
     pub fn strengthen_synapse(&self, edge_uuid: &Uuid, source: &str) -> Result<()> {
         // Lock with timeout to prevent deadlock on panic
         let _guard = self
@@ -5755,7 +5822,11 @@ impl GraphMemory {
             .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in strengthen_synapse"))?;
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
-            if edge.strengthen_from(source).evidence == Evidence::NewSource {
+            let strengthening = edge.strengthen_from(source);
+            if strengthening.moves_nothing() {
+                return Ok(());
+            }
+            if strengthening.evidence == Evidence::NewSource {
                 self.total_activations.fetch_add(1, Ordering::Relaxed);
             }
 
@@ -5772,7 +5843,8 @@ impl GraphMemory {
     /// More efficient than calling strengthen_synapse individually for each edge.
     /// Uses RocksDB WriteBatch for atomic multi-write and a single lock acquisition.
     ///
-    /// Returns the number of synapses successfully strengthened.
+    /// Returns the number of synapses successfully strengthened. As in
+    /// [`Self::strengthen_synapse`], a repeat that earns no step is not written or counted.
     pub fn batch_strengthen_synapses(&self, edge_uuids: &[Uuid], source: &str) -> Result<usize> {
         if edge_uuids.is_empty() {
             return Ok(0);
@@ -5801,7 +5873,11 @@ impl GraphMemory {
         for (i, result) in results.into_iter().enumerate() {
             if let Ok(Some(value)) = result {
                 if let Ok(mut edge) = RelationshipEdge::decode(&value) {
-                    if edge.strengthen_from(source).evidence == Evidence::NewSource {
+                    let strengthening = edge.strengthen_from(source);
+                    if strengthening.moves_nothing() {
+                        continue;
+                    }
+                    if strengthening.evidence == Evidence::NewSource {
                         activations += 1;
                     }
                     match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
@@ -12066,6 +12142,113 @@ mod repeat_stable_order_tests {
             ["zz-strong", "peer-00", "peer-01", "peer-02", "peer-03"],
             "strength first, then peer name; edge uuids must not choose the survivors"
         );
+    }
+
+    #[test]
+    fn a_repeat_source_that_moves_nothing_is_not_written() {
+        assert_eq!(
+            crate::constants::HEBBIAN_REPEAT_SOURCE_BOOST,
+            0.0,
+            "this test pins the zero-boost default"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let a = graph.add_entity(entity("a", 0.5)).unwrap();
+        let b = graph.add_entity(entity("b", 0.5)).unwrap();
+        let c = graph.add_entity(entity("c", 0.5)).unwrap();
+        let first = graph.add_relationship(edge(a, b, 0.3)).unwrap();
+        let second = graph.add_relationship(edge(b, c, 0.3)).unwrap();
+        let stored = |uuid: &Uuid| graph.get_relationship(uuid).unwrap().unwrap();
+
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first], "recall-a")
+                .unwrap(),
+            1
+        );
+        let after_new = stored(&first);
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first], "recall-a")
+                .unwrap(),
+            0
+        );
+        let after_repeat = stored(&first);
+        assert_eq!(after_repeat.last_activated, after_new.last_activated);
+        assert_eq!(
+            after_repeat.strengthening_sources,
+            after_new.strengthening_sources
+        );
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first, second], "recall-a")
+                .unwrap(),
+            1,
+            "the edge new to the source is written, the repeat is not"
+        );
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first], "recall-b")
+                .unwrap(),
+            1
+        );
+        assert!(stored(&first).strength > after_repeat.strength);
+
+        let before = stored(&second);
+        graph.strengthen_synapse(&second, "recall-a").unwrap();
+        assert_eq!(stored(&second).last_activated, before.last_activated);
+        graph.strengthen_synapse(&second, "recall-c").unwrap();
+        assert!(stored(&second).strength > before.strength);
+    }
+
+    #[test]
+    fn a_bounded_read_keeps_the_same_edges_names_each_peer_once_and_refuses_a_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let hub = graph.add_entity(entity("hub", 0.5)).unwrap();
+        let other = graph.add_entity(entity("other hub", 0.5)).unwrap();
+        let mut names: Vec<String> = (0..12).map(|i| format!("peer-{i:02}")).collect();
+        names.reverse();
+        for name in &names {
+            let peer = graph.add_entity(entity(name, 0.5)).unwrap();
+            graph.add_relationship(edge(hub, peer, 0.3)).unwrap();
+            graph.add_relationship(edge(other, peer, 0.3)).unwrap();
+        }
+        let now = Utc::now();
+        let pairs = |edges: Vec<(RelationshipEdge, f32)>| -> Vec<(Uuid, Uuid)> {
+            edges
+                .into_iter()
+                .map(|(e, _)| (e.from_entity, e.to_entity))
+                .collect()
+        };
+
+        let all = pairs(graph.entity_edges_with_strength(&hub, None, now).unwrap());
+        let five = pairs(
+            graph
+                .entity_edges_with_strength(&hub, Some(5), now)
+                .unwrap(),
+        );
+        assert_eq!(five, all[..5], "the limit keeps the head of the full order");
+
+        let mut peer_names = HashMap::new();
+        let (bounded, decoded) = graph
+            .entity_edges_with_strength_bounded(&hub, Some(5), now, 12, &mut peer_names)
+            .unwrap()
+            .expect("12 edges fit a budget of 12");
+        assert_eq!(decoded, 12);
+        assert_eq!(pairs(bounded), five);
+        let named = peer_names.len();
+        assert_eq!(named, 12, "the one tie run starts before the limit");
+        graph
+            .entity_edges_with_strength_bounded(&other, Some(5), now, 12, &mut peer_names)
+            .unwrap()
+            .expect("fits");
+        assert_eq!(peer_names.len(), named, "shared peers are not named twice");
+
+        assert!(graph
+            .entity_edges_with_strength_bounded(&hub, Some(5), now, 11, &mut HashMap::new())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
