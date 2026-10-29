@@ -1068,6 +1068,17 @@ pub const SPREADING_FRONTIER_CAP: usize = 200;
 /// those alone.
 pub const QUERY_ENTITY_FUZZY_MAX_CANDIDATES: usize = 32;
 
+/// Fused-score boost for a memory that carries a declared FilePath entity the query names by a
+/// path-shaped word (`serve.mjs`, `admin/serve.mjs`).
+///
+/// The entity-overlap boost gives an identifier match the same 0.10 a shared word earns, so
+/// "what changed in admin/serve.mjs" left the declared file level with every memory whose
+/// entities include "changed", and BM25 noise picked between them: on redb, 3 runs in 14 ranked
+/// a "changed" memory first (2026-10-28). Twice the per-word rate keeps the declared file
+/// ahead of word-only matches. Only paths the graph resolves to a declared FilePath count, so
+/// a query that names no declared file is unchanged.
+pub const DECLARED_PATH_MATCH_BOOST: f32 = 0.20;
+
 /// Most recent episodes recall takes from each entity a graph traversal reaches
 pub const RECALL_GRAPH_EPISODES_PER_ENTITY: usize = 20;
 

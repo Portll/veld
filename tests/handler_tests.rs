@@ -3536,30 +3536,48 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
     // The embedding is deferred too; ranked before it lands, the target has no vector.
     wait_for_background_work(&h).await;
 
-    for query in [
-        "what changed in serve.mjs",
-        "what changed in admin/serve.mjs",
-    ] {
-        let (status, body) = json_of(
-            h.app(),
-            authed_post(
-                "/api/recall",
-                json!({"user_id": user, "query": query, "limit": 5}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let ids: Vec<&str> = body["memories"]
-            .as_array()
-            .expect("memories")
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            ids.first().copied(),
-            Some(target.as_str()),
-            "{query}: {:#}",
-            body["memories"]
-        );
+    // With the reranker, then with reranking off. Off, Layer 5.3 is skipped and the fused order
+    // stands: the order a declared path keeps when no cross-encoder can score it, where the
+    // bi-encoder fallback would rank `server.mjs` beside `serve.mjs`.
+    for use_reranking in [true, false] {
+        if !use_reranking {
+            let (status, mut dials) =
+                json_of(h.app(), authed_get(&format!("/api/dials?user_id={user}"))).await;
+            assert_eq!(status, StatusCode::OK, "{dials}");
+            dials["use_reranking"] = json!(false);
+            let (status, body) = json_of(
+                h.app(),
+                authed_put("/api/dials", json!({"user_id": user, "dials": dials})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["use_reranking"], json!(false));
+        }
+        for query in [
+            "what changed in serve.mjs",
+            "what changed in admin/serve.mjs",
+        ] {
+            let (status, body) = json_of(
+                h.app(),
+                authed_post(
+                    "/api/recall",
+                    json!({"user_id": user, "query": query, "limit": 5}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let ids: Vec<&str> = body["memories"]
+                .as_array()
+                .expect("memories")
+                .iter()
+                .map(|m| m["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids.first().copied(),
+                Some(target.as_str()),
+                "{query} with use_reranking={use_reranking}: {:#}",
+                body["memories"]
+            );
+        }
     }
 }
