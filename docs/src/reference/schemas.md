@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **501** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **537** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -152,9 +152,9 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/entity/alias` | body [`AddAliasRequest`](#addaliasrequest) | `serde_json::Value` |
-| `POST` | `/api/entity/attribute` | body [`SetAttributeRequest`](#setattributerequest) | `serde_json::Value` |
-| `POST` | `/api/entity/merge` | body [`MergeEntitiesRequest`](#mergeentitiesrequest) | `serde_json::Value` |
+| `POST` | `/api/entity/alias` | body [`AddAliasRequest`](#addaliasrequest) | [`AddAliasResponse`](#addaliasresponse) |
+| `POST` | `/api/entity/attribute` | body [`SetAttributeRequest`](#setattributerequest) | [`SetAttributeResponse`](#setattributeresponse) |
+| `POST` | `/api/entity/merge` | body [`MergeEntitiesRequest`](#mergeentitiesrequest) | [`MergeEntitiesResponse`](#mergeentitiesresponse) |
 | `POST` | `/api/entity/resolve` | body [`EntityResolveRequest`](#entityresolverequest) | [`EntityResolveResponse`](#entityresolveresponse) |
 
 ### /events
@@ -168,7 +168,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/export/mif` | body [`MifExportRequest`](#mifexportrequest) | `serde_json::Value` |
+| `POST` | `/api/export/mif` | body [`MifExportRequest`](#mifexportrequest) | [`ExportMifResponse`](#exportmifresponse) |
 
 ### /external
 
@@ -229,18 +229,18 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `GET` | `/api/graph/data/{user_id}` | path `{user_id: String}` | [`GraphDataResponse`](#graphdataresponse) |
-| `POST` | `/api/graph/entities/all` | body [`GetAllEntitiesRequest`](#getallentitiesrequest) | `serde_json::Value` |
+| `POST` | `/api/graph/entities/all` | body [`GetAllEntitiesRequest`](#getallentitiesrequest) | [`GraphEntitiesResponse`](#graphentitiesresponse) |
 | `POST` | `/api/graph/entities/frequency` | body [`EntityFrequencyRequest`](#entityfrequencyrequest) | [`Frequency`](#frequency) |
-| `POST` | `/api/graph/entity/add` | body [`AddEntityRequest`](#addentityrequest) | `serde_json::Value` |
-| `DELETE` | `/api/graph/entity/delete` | body [`DeleteEntityRequest`](#deleteentityrequest) | `serde_json::Value` |
+| `POST` | `/api/graph/entity/add` | body [`AddEntityRequest`](#addentityrequest) | [`AddEntityResponse`](#addentityresponse) |
+| `DELETE` | `/api/graph/entity/delete` | body [`DeleteEntityRequest`](#deleteentityrequest) | [`DeleteEntityResponse`](#deleteentityresponse) |
 | `POST` | `/api/graph/entity/find` | body [`FindEntityRequest`](#findentityrequest) | Option&lt;[`EntityNode`](#entitynode)&gt; |
 | `POST` | `/api/graph/episode/get` | body [`GetEpisodeRequest`](#getepisoderequest) | Option&lt;[`EpisodicNode`](#episodicnode)&gt; |
-| `POST` | `/api/graph/relationship/add` | body [`AddRelationshipRequest`](#addrelationshiprequest) | `serde_json::Value` |
-| `POST` | `/api/graph/relationship/invalidate` | body [`InvalidateRelationshipRequest`](#invalidaterelationshiprequest) | `serde_json::Value` |
+| `POST` | `/api/graph/relationship/add` | body [`AddRelationshipRequest`](#addrelationshiprequest) | [`AddRelationshipResponse`](#addrelationshipresponse) |
+| `POST` | `/api/graph/relationship/invalidate` | body [`InvalidateRelationshipRequest`](#invalidaterelationshiprequest) | [`InvalidateRelationshipResponse`](#invalidaterelationshipresponse) |
 | `POST` | `/api/graph/tags/stamped-cores` | body [`StampedCoresRequest`](#stampedcoresrequest) | [`StampedCores`](#stampedcores) |
 | `POST` | `/api/graph/traverse` | body [`TraverseGraphRequest`](#traversegraphrequest) | [`GraphTraversal`](#graphtraversal) |
-| `DELETE` | `/api/graph/{user_id}/clear` | path `{user_id: String}` | `serde_json::Value` |
-| `POST` | `/api/graph/{user_id}/rebuild` | path `{user_id: String}` | `serde_json::Value` |
+| `DELETE` | `/api/graph/{user_id}/clear` | path `{user_id: String}` | [`ClearGraphResponse`](#cleargraphresponse) |
+| `POST` | `/api/graph/{user_id}/rebuild` | path `{user_id: String}` | [`RebuildGraphResponse`](#rebuildgraphresponse) |
 | `GET` | `/api/graph/{user_id}/stats` | path `{user_id: String}` | [`GraphStats`](#graphstats) |
 | `GET` | `/api/graph/{user_id}/universe` | path `{user_id: String}` | [`MemoryUniverse`](#memoryuniverse) |
 | `GET` | `/graph/view` | query [`GraphViewParams`](#graphviewparams) | `opaque` |
@@ -332,7 +332,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/api/mif/adapters` | none | `serde_json::Value` |
+| `GET` | `/api/mif/adapters` | none | [`MifAdaptersResponse`](#mifadaptersresponse) |
 
 ### /proactive_context
 
@@ -629,6 +629,16 @@ Defined in `src/handlers/prompt_gen.rs`.
 | `entity_name` | `String` | yes |  |
 | `alias` | `String` | yes |  |
 
+### AddAliasResponse
+
+Defined in `src/handlers/prompt_gen.rs`. Reply of `POST /api/entity/alias`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entity` | `String` | yes | The canonical entity name the alias now resolves to. |
+| `alias` | `String` | yes |  |
+| `status` | `String` | yes | Always `added`. |
+
 ### AddCommentRequest
 
 Defined in `src/handlers/todos.rs`. Request to add a comment to a todo
@@ -651,6 +661,16 @@ Defined in `src/handlers/mif.rs`.
 | `label` | `String` | yes |  |
 | `attributes` | `Option<HashMap<String, String>>` | no |  |
 
+### AddEntityResponse
+
+Defined in `src/handlers/mif.rs`. Reply of `POST /api/graph/entity/add`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `entity` | `String` | yes | The entity name, as sent. |
+| `label` | `String` | yes | The label applied, as its variant name. |
+
 ### AddRelationshipRequest
 
 Defined in `src/handlers/mif.rs`.
@@ -662,6 +682,18 @@ Defined in `src/handlers/mif.rs`.
 | `to_entity` | `String` | yes |  |
 | `relation_type` | `String` | yes |  |
 | `strength` | `Option<f32>` | no |  |
+
+### AddRelationshipResponse
+
+Defined in `src/handlers/mif.rs`. Reply of `POST /api/graph/relationship/add`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `from` | `String` | yes |  |
+| `to` | `String` | yes |  |
+| `type` | `String` | yes | The relation type applied, as its variant name. |
+| `strength` | `f32` | yes |  |
 
 ### AdvancedSearchRequest
 
@@ -1128,6 +1160,16 @@ Defined in `src/handlers/todos.rs`. Request to check context-triggered reminders
 | `context` | `String` | yes |  |
 | `mark_triggered` | `bool` | no | default when absent |
 
+### Classification
+
+Defined in `src/entity_hygiene.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `shelf` | [`Shelf`](#shelf) | yes |  |
+| `reason` | [`Reason`](#reason) | yes |  |
+| `proper_noun_hint` | `bool` | yes | veld's NER flag, carried for display. It decided nothing above. |
+
 ### CleanupCorruptedRequest
 
 Defined in `src/handlers/types.rs`.
@@ -1163,6 +1205,24 @@ Defined in `src/handlers/crud.rs`. Reply of `POST /api/memories/clear`.
 | `success` | `bool` | yes |  |
 | `deleted_count` | `usize` | yes |  |
 | `message` | `String` | yes |  |
+
+### ClearGraphResponse
+
+Defined in `src/handlers/graph.rs`. Reply of `DELETE /api/graph/{user_id}/clear`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `cleared` | [`ClearedGraphCounts`](#clearedgraphcounts) | yes |  |
+
+### ClearedGraphCounts
+
+Defined in `src/handlers/graph.rs`. What `DELETE /api/graph/{user_id}/clear` removed.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entities` | `usize` | yes |  |
+| `relationships` | `usize` | yes |  |
+| `episodes` | `usize` | yes |  |
 
 ### Cluster
 
@@ -1832,6 +1892,17 @@ Defined in `src/handlers/graph.rs`. Request body for `DELETE /api/graph/entity`.
 | `user_id` | `String` | yes | Owning tenant. Checked against the authenticated binding by `resolve_request_user_id`, which rejects and audits a mismatch. |
 | `entity_id` | `String` | yes | The entity's UUID. Deletion is by id, never by name: a name can collide across tenants and is user-controlled, an id cannot be guessed into. |
 
+### DeleteEntityResponse
+
+Defined in `src/handlers/graph.rs`. Reply of `DELETE /api/graph/entity/delete`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `deleted` | `bool` | yes | False when no entity had that id. |
+| `entity_id` | `String` | yes |  |
+| `user_id` | `String` | yes |  |
+
 ### DeleteMemoryResponse
 
 Defined in `src/handlers/crud.rs`. Response for memory delete operations
@@ -2022,6 +2093,17 @@ Defined in `src/memory/types.rs`. Emotional context - captures affective state d
 | `content_sentiment` | `Option<f32>` | no | default when absent; Sentiment of the content itself (not the user's reaction) Useful for distinguishing "user felt frustrated" vs "content describes frustration" |
 | `confidence` | `f32` | no | default when absent; score; Confidence in the emotional assessment (0.0 to 1.0) Lower if inferred from text, higher if explicitly stated |
 
+### EncodedExport
+
+Defined in `src/handlers/mif.rs`. A non-JSON export of `POST /api/export/mif`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `format` | `String` | yes |  |
+| `data` | `String` | yes | The adapter's output, as text. |
+| `memory_count` | `usize` | yes |  |
+| `todo_count` | `usize` | yes |  |
+
 ### EndSessionRequest
 
 Defined in `src/handlers/sessions.rs`. Request for ending a session
@@ -2155,6 +2237,16 @@ Defined in `src/graph_memory.rs`. Entity node in the knowledge graph
 | `salience` | `f32` | no | default when absent; Salience score (0.0 - 1.0): How important is this entity? Higher salience = larger gravitational well in the memory universe Factors: proper noun status, mention frequency, recency, user-defined importance |
 | `is_proper_noun` | `bool` | no | default when absent; Whether this is a proper noun (names, places, products) Proper nouns have higher base salience than common nouns |
 | `pii_classification` | [`PiiClassification`](#piiclassification) | no | default when absent; PII classification for cross-user safety. Derived from entity labels: Person → PersonalIdentity, Organization → OrganizationIdentity, otherwise Clean. |
+
+### EntityProvenance
+
+Defined in `src/handlers/graph.rs`. Per-tag provenance folded over every memory that stored the tag. Absent when no row names the tag: records written before the store existed are undetermined, not caller-authored.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `memories` | `usize` | yes |  |
+| `redacted` | `usize` | yes |  |
+| `sources` | `std::collections::BTreeMap<&'static str, usize>` | yes |  |
 
 ### EntityRef
 
@@ -2346,6 +2438,17 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 | `Command` | none |  |
 | `Observation` | none |  |
 | `Intention` | none | Prospective memory - future intention/reminder (SHO-116) Filtered from normal recall, surfaces via dedicated reminder queries or when context triggers via spreading activation |
+
+### ExportMifResponse
+
+Defined in `src/handlers/mif.rs`. Reply of `POST /api/export/mif`: the MIF document itself for `format` `veld` or `json`, else the adapter's text output wrapped with its counts.
+
+Enum, untagged: the variant's payload alone.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `Document` | Box&lt;[`MifDocument`](#mifdocument)&gt; |  |
+| `Encoded` | [`EncodedExport`](#encodedexport) |  |
 
 ### ExternalIdRecord
 
@@ -2974,6 +3077,28 @@ Defined in `src/handlers/visualization.rs`. Graph edge for d3.js visualization
 | `distinct_sources` | `usize` | yes | Distinct sources whose strengthening this edge rests on. |
 | `last_corroborated` | `Option<chrono::DateTime<chrono::Utc>>` | no | When a source new to this edge last strengthened it. |
 
+### GraphEntitiesResponse
+
+Defined in `src/handlers/graph.rs`. Reply of `POST /api/graph/entities/all`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entities` | Vec&lt;[`GraphEntityRow`](#graphentityrow)&gt; | yes | At most `limit` entities on the requested shelf. |
+| `count` | `usize` | yes | Entities returned. |
+| `total` | `usize` | yes | Entities in the graph, every shelf. |
+| `shelves` | `std::collections::BTreeMap<&'static str, usize>` | yes | Entities per shelf (`cast`, `vocabulary`, `noise`), every shelf. |
+| `witness` | `&'static str` | yes |  |
+
+### GraphEntityRow
+
+Defined in `src/handlers/graph.rs`. One entity of a `POST /api/graph/entities/all` reply: the node's own fields, its hygiene classification, and its tag provenance when `with_sources` was set.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entity` | [`EntityNode`](#entitynode) | yes | flattened into the parent |
+| `hygiene` | [`Classification`](#classification) | yes |  |
+| `provenance` | Option&lt;Option&lt;[`EntityProvenance`](#entityprovenance)&gt;&gt; | no | omitted when empty; Absent unless `with_sources`; then `null` for an entity no tag row names. |
+
 ### GraphNode
 
 Defined in `src/handlers/visualization.rs`. Graph node for d3.js visualization
@@ -3236,6 +3361,15 @@ Defined in `src/handlers/graph.rs`. Request to invalidate a relationship
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `relationship_uuid` | `String` | yes |  |
+
+### InvalidateRelationshipResponse
+
+Defined in `src/handlers/graph.rs`. Reply of `POST /api/graph/relationship/invalidate`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `message` | `String` | yes |  |
 
 ### IsolatedEntity
 
@@ -4009,6 +4143,17 @@ Defined in `src/handlers/prompt_gen.rs`.
 | `source_name` | `String` | yes |  |
 | `target_name` | `String` | yes |  |
 
+### MergeEntitiesResponse
+
+Defined in `src/handlers/prompt_gen.rs`. Reply of `POST /api/entity/merge`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `source` | `String` | yes | The entity deleted. |
+| `target` | `String` | yes | The entity its edges now point at. |
+| `edges_moved` | `usize` | yes |  |
+| `status` | `String` | yes | Always `merged`. |
+
 ### MergeMemoriesResponse
 
 Defined in `src/handlers/memory_ops.rs`. Reply of `POST /api/memory/merge`.
@@ -4030,6 +4175,74 @@ Defined in `src/handlers/memory_ops.rs`. Request to merge several memories into 
 | `separator` | `Option<String>` | no | default when absent; Separator placed between merged bodies (default `\n\n---\n\n`). |
 | `memory_type` | `Option<String>` | no | default when absent; Experience type for the merged memory (default `Context`). |
 
+### MifAdapter
+
+Defined in `src/handlers/mif.rs`. One import/export adapter.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | `String` | yes |  |
+| `format` | `String` | yes | The value to send as `format`. |
+
+### MifAdaptersResponse
+
+Defined in `src/handlers/mif.rs`. Reply of `GET /api/mif/adapters`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `adapters` | Vec&lt;[`MifAdapter`](#mifadapter)&gt; | yes |  |
+| `default_export` | `String` | yes | The `format` `POST /api/export/mif` uses when none is sent. |
+| `default_import` | `String` | yes |  |
+
+### MifDocument
+
+Defined in `src/mif/schema.rs`. MIF v2 document — the top-level interchange container.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `mif_version` | `String` | yes |  |
+| `generator` | [`MifGenerator`](#mifgenerator) | yes |  |
+| `export_meta` | [`MifExportMeta`](#mifexportmeta) | yes |  |
+| `memories` | Vec&lt;[`MifMemory`](#mifmemory)&gt; | no | default when absent |
+| `knowledge_graph` | Option&lt;[`MifKnowledgeGraph`](#mifknowledgegraph)&gt; | no | default when absent; omitted when empty |
+| `todos` | Vec&lt;[`MifTodo`](#miftodo)&gt; | no | default when absent |
+| `projects` | Vec&lt;[`MifProject`](#mifproject)&gt; | no | default when absent |
+| `reminders` | Vec&lt;[`MifReminder`](#mifreminder)&gt; | no | default when absent |
+| `vendor_extensions` | `HashMap<String, serde_json::Value>` | no | default when absent; Vendor-specific metadata. Key = vendor name (e.g., "veld"). Allows lossless round-trip of system-specific data without polluting the core schema. |
+
+### MifEmbedding
+
+Defined in `src/mif/schema.rs`. Model-tagged embedding vector for cross-system portability.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `model` | `String` | yes |  |
+| `dimensions` | `usize` | yes |  |
+| `vector` | `Vec<f32>` | yes |  |
+| `normalized` | `bool` | no | default when absent |
+
+### MifEntityRef
+
+Defined in `src/mif/schema.rs`. An entity mentioned in a memory, with its type preserved.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | `String` | yes |  |
+| `entity_type` | `String` | no | default when absent; Lowercase entity type: "person", "organization", "location", "technology", "concept", "event", "date", "product", "skill", "keyword", "unknown". |
+| `confidence` | `f32` | no | default when absent; score |
+
+### MifExportMeta
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `user_id` | `String` | yes |  |
+| `checksum` | `String` | yes |  |
+| `privacy` | Option&lt;[`MifPrivacy`](#mifprivacy)&gt; | no | default when absent; omitted when empty |
+
 ### MifExportRequest
 
 Defined in `src/handlers/mif.rs`.
@@ -4042,6 +4255,59 @@ Defined in `src/handlers/mif.rs`.
 | `since` | `Option<String>` | no | default when absent |
 | `redact_pii` | `bool` | no | default when absent |
 | `format` | `String` | no | default when absent |
+
+### MifGenerator
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | `String` | yes |  |
+| `version` | `String` | yes |  |
+
+### MifGraphEntity
+
+Defined in `src/mif/schema.rs`. A node in the knowledge graph.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `name` | `String` | yes |  |
+| `types` | `Vec<String>` | no | default when absent; Lowercase type strings: ["person"], ["technology", "concept"], etc. |
+| `attributes` | `HashMap<String, String>` | no | default when absent |
+| `summary` | `String` | no | default when absent |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `last_seen_at` | `DateTime<Utc>` | yes |  |
+
+### MifGraphEpisode
+
+Defined in `src/mif/schema.rs`. An episodic node — a temporal grouping of entities.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `name` | `String` | yes |  |
+| `content` | `String` | no | default when absent |
+| `entity_ids` | `Vec<Uuid>` | no | default when absent |
+| `source` | `String` | no | default when absent |
+| `metadata` | `HashMap<String, String>` | no | default when absent |
+| `created_at` | `DateTime<Utc>` | yes |  |
+
+### MifGraphRelationship
+
+Defined in `src/mif/schema.rs`. An edge in the knowledge graph.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `source_entity_id` | `Uuid` | yes |  |
+| `target_entity_id` | `Uuid` | yes |  |
+| `relation_type` | `String` | yes | Lowercase snake_case: "works_with", "part_of", "located_in", "causes", etc. |
+| `context` | `String` | no | default when absent |
+| `confidence` | `Option<f32>` | no | default when absent; omitted when empty; score; Normalized confidence/strength (0.0–1.0). Vendor-neutral. |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `valid_at` | `DateTime<Utc>` | yes |  |
+| `invalidated_at` | `Option<DateTime<Utc>>` | no | default when absent; omitted when empty |
 
 ### MifImportRequest
 
@@ -4062,6 +4328,138 @@ Defined in `src/handlers/mif.rs`.
 |---|---|---|---|
 | `success` | `bool` | yes |  |
 | `result` | import::[`ImportResult`](#importresult) | yes |  |
+
+### MifKnowledgeGraph
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entities` | Vec&lt;[`MifGraphEntity`](#mifgraphentity)&gt; | no | default when absent |
+| `relationships` | Vec&lt;[`MifGraphRelationship`](#mifgraphrelationship)&gt; | no | default when absent |
+| `episodes` | Vec&lt;[`MifGraphEpisode`](#mifgraphepisode)&gt; | no | default when absent |
+
+### MifMemory
+
+Defined in `src/mif/schema.rs`. A single memory in vendor-neutral form.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `content` | `String` | yes |  |
+| `memory_type` | `String` | yes | Lowercase type string: "observation", "decision", "learning", "error", "discovery", "pattern", "context", "task", "code_edit", "file_access", "search", "command", "conversation", "intention". |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `tags` | `Vec<String>` | no | default when absent |
+| `entities` | Vec&lt;[`MifEntityRef`](#mifentityref)&gt; | no | default when absent |
+| `metadata` | `HashMap<String, String>` | no | default when absent |
+| `embeddings` | Option&lt;[`MifEmbedding`](#mifembedding)&gt; | no | default when absent; omitted when empty |
+| `source` | Option&lt;[`MifSource`](#mifsource)&gt; | no | default when absent; omitted when empty |
+| `parent_id` | `Option<Uuid>` | no | default when absent; omitted when empty |
+| `related_memory_ids` | `Vec<Uuid>` | no | default when absent |
+| `related_todo_ids` | `Vec<Uuid>` | no | default when absent |
+| `agent_id` | `Option<String>` | no | default when absent; omitted when empty |
+| `external_id` | `Option<String>` | no | default when absent; omitted when empty |
+| `version` | `u32` | no | default when absent |
+
+### MifPrivacy
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `pii_detected` | `bool` | yes |  |
+| `secrets_detected` | `bool` | yes |  |
+| `redacted_fields` | `Vec<String>` | no | default when absent |
+
+### MifProject
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `name` | `String` | yes |  |
+| `prefix` | `String` | no | default when absent |
+| `description` | `Option<String>` | no | default when absent; omitted when empty |
+| `status` | `String` | no | default when absent; "active", "archived", "completed" |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `color` | `Option<String>` | no | default when absent; omitted when empty |
+| `icon` | `Option<String>` | no | default when absent; omitted when empty |
+
+### MifReminder
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `content` | `String` | yes |  |
+| `trigger` | [`MifTrigger`](#miftrigger) | yes |  |
+| `status` | `String` | yes | "pending", "triggered", "dismissed", "expired" |
+| `priority` | `u8` | no | default when absent |
+| `tags` | `Vec<String>` | no | default when absent |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `triggered_at` | `Option<DateTime<Utc>>` | no | default when absent; omitted when empty |
+| `dismissed_at` | `Option<DateTime<Utc>>` | no | default when absent; omitted when empty |
+
+### MifSource
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `source_type` | `String` | no | default when absent |
+| `session_id` | `Option<String>` | no | default when absent; omitted when empty |
+| `agent` | `Option<String>` | no | default when absent; omitted when empty |
+
+### MifTodo
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `content` | `String` | yes |  |
+| `status` | `String` | yes | "backlog", "todo", "in_progress", "blocked", "done", "cancelled" |
+| `priority` | `String` | yes | "urgent", "high", "medium", "low", "none" |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `updated_at` | `DateTime<Utc>` | yes |  |
+| `due_date` | `Option<DateTime<Utc>>` | no | default when absent; omitted when empty |
+| `completed_at` | `Option<DateTime<Utc>>` | no | default when absent; omitted when empty |
+| `project_id` | `Option<Uuid>` | no | default when absent; omitted when empty |
+| `parent_id` | `Option<Uuid>` | no | default when absent; omitted when empty |
+| `tags` | `Vec<String>` | no | default when absent |
+| `contexts` | `Vec<String>` | no | default when absent |
+| `notes` | `Option<String>` | no | default when absent; omitted when empty |
+| `blocked_on` | `Option<String>` | no | default when absent; omitted when empty |
+| `recurrence` | `Option<String>` | no | default when absent; omitted when empty |
+| `comments` | Vec&lt;[`MifTodoComment`](#miftodocomment)&gt; | no | default when absent |
+| `related_memory_ids` | `Vec<Uuid>` | no | default when absent |
+| `external_id` | `Option<String>` | no | default when absent; omitted when empty |
+
+### MifTodoComment
+
+Defined in `src/mif/schema.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `Uuid` | yes |  |
+| `content` | `String` | yes |  |
+| `comment_type` | `String` | no | default when absent; "comment", "progress", "resolution", "activity" |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `author` | `Option<String>` | no | default when absent; omitted when empty |
+
+### MifTrigger
+
+Defined in `src/mif/schema.rs`.
+
+Enum, internally tagged: the payload's fields plus `"type": <variant>`.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `time` | `{ at: DateTime<Utc> }` |  |
+| `duration` | `{ seconds: u64, from: DateTime<Utc> }` |  |
+| `context` | `{ keywords: Vec<String>, threshold: f32 }` |  |
 
 ### MigrateLegacyRequest
 
@@ -4669,6 +5067,44 @@ Defined in `src/handlers/datasets.rs`. Parametrised SELECT.
 | `where` | `Option<String>` | no |  |
 | `params` | `Vec<serde_json::Value>` | no | default when absent |
 | `limit` | `Option<u32>` | no |  |
+
+### Reason
+
+Defined in `src/entity_hygiene.rs`.
+
+Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `uuid` | none |  |
+| `runid` | none |  |
+| `timestamp` | none |  |
+| `json` | none |  |
+| `session` | none |  |
+| `lineref` | none |  |
+| `counter` | none |  |
+| `id` | none |  |
+| `hex` | none |  |
+| `url` | none |  |
+| `ref` | none |  |
+| `fragment` | none |  |
+| `number` | none |  |
+| `path` | none |  |
+| `code-ident` | none |  |
+| `filename` | none |  |
+| `vocab` | none |  |
+
+### RebuildGraphResponse
+
+Defined in `src/handlers/graph.rs`. Reply of `POST /api/graph/{user_id}/rebuild`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `processed_memories` | `usize` | yes | Memories whose entities were extracted again. |
+| `total_memories` | `usize` | yes |  |
+| `entities_created` | `usize` | yes | Entities in the graph after the rebuild. |
+| `relationships_created` | `usize` | yes | Relationships in the graph after the rebuild. |
 
 ### RebuildIndexRequest
 
@@ -5715,6 +6151,17 @@ Defined in `src/handlers/prompt_gen.rs`.
 | `entity_name` | `String` | yes |  |
 | `key` | `String` | yes |  |
 | `value` | `String` | yes |  |
+
+### SetAttributeResponse
+
+Defined in `src/handlers/prompt_gen.rs`. Reply of `POST /api/entity/attribute`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entity` | `String` | yes | The canonical entity name. |
+| `attribute` | `String` | yes |  |
+| `value` | `String` | yes |  |
+| `status` | `String` | yes | Always `set`. |
 
 ### SetBlockRequest
 

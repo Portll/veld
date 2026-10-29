@@ -477,21 +477,21 @@
       "path": "/api/entity/alias",
       "handler": "prompt_gen::add_entity_alias",
       "body": "AddAliasRequest",
-      "response": "serde_json::Value"
+      "response": "AddAliasResponse"
     },
     {
       "method": "POST",
       "path": "/api/entity/attribute",
       "handler": "prompt_gen::set_entity_attribute",
       "body": "SetAttributeRequest",
-      "response": "serde_json::Value"
+      "response": "SetAttributeResponse"
     },
     {
       "method": "POST",
       "path": "/api/entity/merge",
       "handler": "prompt_gen::merge_entities",
       "body": "MergeEntitiesRequest",
-      "response": "serde_json::Value"
+      "response": "MergeEntitiesResponse"
     },
     {
       "method": "POST",
@@ -519,7 +519,7 @@
       "path": "/api/export/mif",
       "handler": "mif::export_mif",
       "body": "MifExportRequest",
-      "response": "serde_json::Value"
+      "response": "ExportMifResponse"
     },
     {
       "method": "POST",
@@ -708,7 +708,7 @@
       "path": "/api/graph/entities/all",
       "handler": "graph::get_all_entities",
       "body": "GetAllEntitiesRequest",
-      "response": "serde_json::Value"
+      "response": "GraphEntitiesResponse"
     },
     {
       "method": "POST",
@@ -722,14 +722,14 @@
       "path": "/api/graph/entity/add",
       "handler": "mif::add_entity",
       "body": "AddEntityRequest",
-      "response": "serde_json::Value"
+      "response": "AddEntityResponse"
     },
     {
       "method": "DELETE",
       "path": "/api/graph/entity/delete",
       "handler": "graph::delete_entity",
       "body": "DeleteEntityRequest",
-      "response": "serde_json::Value"
+      "response": "DeleteEntityResponse"
     },
     {
       "method": "POST",
@@ -750,14 +750,14 @@
       "path": "/api/graph/relationship/add",
       "handler": "mif::add_relationship",
       "body": "AddRelationshipRequest",
-      "response": "serde_json::Value"
+      "response": "AddRelationshipResponse"
     },
     {
       "method": "POST",
       "path": "/api/graph/relationship/invalidate",
       "handler": "graph::invalidate_relationship",
       "body": "InvalidateRelationshipRequest",
-      "response": "serde_json::Value"
+      "response": "InvalidateRelationshipResponse"
     },
     {
       "method": "POST",
@@ -781,7 +781,7 @@
       "path_param_names": [
         "user_id"
       ],
-      "response": "serde_json::Value"
+      "response": "ClearGraphResponse"
     },
     {
       "method": "POST",
@@ -791,7 +791,7 @@
       "path_param_names": [
         "user_id"
       ],
-      "response": "serde_json::Value"
+      "response": "RebuildGraphResponse"
     },
     {
       "method": "GET",
@@ -1072,7 +1072,7 @@
       "method": "GET",
       "path": "/api/mif/adapters",
       "handler": "mif::list_adapters",
-      "response": "serde_json::Value"
+      "response": "MifAdaptersResponse"
     },
     {
       "method": "POST",
@@ -2180,6 +2180,40 @@
         }
       ]
     },
+    "AddAliasResponse": {
+      "name": "AddAliasResponse",
+      "file": "src/handlers/prompt_gen.rs",
+      "doc": "Reply of `POST /api/entity/alias`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entity",
+          "type": "String",
+          "required": true,
+          "doc": "The canonical entity name the alias now resolves to.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "alias",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "Always `added`.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "AddCommentRequest": {
       "name": "AddCommentRequest",
       "file": "src/handlers/todos.rs",
@@ -2270,6 +2304,37 @@
         }
       ]
     },
+    "AddEntityResponse": {
+      "name": "AddEntityResponse",
+      "file": "src/handlers/mif.rs",
+      "doc": "Reply of `POST /api/graph/entity/add`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "entity",
+          "type": "String",
+          "required": true,
+          "doc": "The entity name, as sent.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "label",
+          "type": "String",
+          "required": true,
+          "doc": "The label applied, as its variant name.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "AddRelationshipRequest": {
       "name": "AddRelationshipRequest",
       "file": "src/handlers/mif.rs",
@@ -2314,6 +2379,49 @@
           "refs": [
             "Option"
           ]
+        }
+      ]
+    },
+    "AddRelationshipResponse": {
+      "name": "AddRelationshipResponse",
+      "file": "src/handlers/mif.rs",
+      "doc": "Reply of `POST /api/graph/relationship/add`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "from",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "type",
+          "type": "String",
+          "required": true,
+          "doc": "The relation type applied, as its variant name.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "strength",
+          "type": "f32",
+          "required": true
         }
       ]
     },
@@ -3924,6 +4032,35 @@
         }
       ]
     },
+    "Classification": {
+      "name": "Classification",
+      "file": "src/entity_hygiene.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "shelf",
+          "type": "Shelf",
+          "required": true,
+          "refs": [
+            "Shelf"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "Reason",
+          "required": true,
+          "refs": [
+            "Reason"
+          ]
+        },
+        {
+          "name": "proper_noun_hint",
+          "type": "bool",
+          "required": true,
+          "doc": "veld's NER flag, carried for display. It decided nothing above."
+        }
+      ]
+    },
     "CleanupCorruptedRequest": {
       "name": "CleanupCorruptedRequest",
       "file": "src/handlers/types.rs",
@@ -4004,6 +4141,45 @@
           "refs": [
             "String"
           ]
+        }
+      ]
+    },
+    "ClearGraphResponse": {
+      "name": "ClearGraphResponse",
+      "file": "src/handlers/graph.rs",
+      "doc": "Reply of `DELETE /api/graph/{user_id}/clear`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "cleared",
+          "type": "ClearedGraphCounts",
+          "required": true,
+          "refs": [
+            "ClearedGraphCounts"
+          ]
+        }
+      ]
+    },
+    "ClearedGraphCounts": {
+      "name": "ClearedGraphCounts",
+      "file": "src/handlers/graph.rs",
+      "doc": "What `DELETE /api/graph/{user_id}/clear` removed.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entities",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "relationships",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "episodes",
+          "type": "usize",
+          "required": true
         }
       ]
     },
@@ -6931,6 +7107,41 @@
         }
       ]
     },
+    "DeleteEntityResponse": {
+      "name": "DeleteEntityResponse",
+      "file": "src/handlers/graph.rs",
+      "doc": "Reply of `DELETE /api/graph/entity/delete`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "deleted",
+          "type": "bool",
+          "required": true,
+          "doc": "False when no entity had that id."
+        },
+        {
+          "name": "entity_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "DeleteMemoryResponse": {
       "name": "DeleteMemoryResponse",
       "file": "src/handlers/crud.rs",
@@ -7492,6 +7703,41 @@
         }
       ]
     },
+    "EncodedExport": {
+      "name": "EncodedExport",
+      "file": "src/handlers/mif.rs",
+      "doc": "A non-JSON export of `POST /api/export/mif`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "format",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "data",
+          "type": "String",
+          "required": true,
+          "doc": "The adapter's output, as text.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "memory_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "todo_count",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
     "EndSessionRequest": {
       "name": "EndSessionRequest",
       "file": "src/handlers/sessions.rs",
@@ -8009,6 +8255,32 @@
           "doc": "PII classification for cross-user safety. Derived from entity labels: Person → PersonalIdentity, Organization → OrganizationIdentity, otherwise Clean.",
           "refs": [
             "PiiClassification"
+          ]
+        }
+      ]
+    },
+    "EntityProvenance": {
+      "name": "EntityProvenance",
+      "file": "src/handlers/graph.rs",
+      "doc": "Per-tag provenance folded over every memory that stored the tag. Absent when no row names the tag: records written before the store existed are undetermined, not caller-authored.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "memories",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "redacted",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "sources",
+          "type": "std::collections::BTreeMap<&'static str, usize>",
+          "required": true,
+          "refs": [
+            "BTreeMap"
           ]
         }
       ]
@@ -9123,6 +9395,23 @@
         {
           "name": "Intention",
           "doc": "Prospective memory - future intention/reminder (SHO-116) Filtered from normal recall, surfaces via dedicated reminder queries or when context triggers via spreading activation"
+        }
+      ]
+    },
+    "ExportMifResponse": {
+      "name": "ExportMifResponse",
+      "file": "src/handlers/mif.rs",
+      "doc": "Reply of `POST /api/export/mif`: the MIF document itself for `format` `veld` or `json`, else the adapter's text output wrapped with its counts.",
+      "kind": "enum",
+      "representation": "untagged: the variant's payload alone",
+      "variants": [
+        {
+          "name": "Document",
+          "payload": "Box<MifDocument>"
+        },
+        {
+          "name": "Encoded",
+          "payload": "EncodedExport"
         }
       ]
     },
@@ -11334,6 +11623,91 @@
         }
       ]
     },
+    "GraphEntitiesResponse": {
+      "name": "GraphEntitiesResponse",
+      "file": "src/handlers/graph.rs",
+      "doc": "Reply of `POST /api/graph/entities/all`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entities",
+          "type": "Vec<GraphEntityRow>",
+          "required": true,
+          "doc": "At most `limit` entities on the requested shelf.",
+          "refs": [
+            "Vec",
+            "GraphEntityRow"
+          ]
+        },
+        {
+          "name": "count",
+          "type": "usize",
+          "required": true,
+          "doc": "Entities returned."
+        },
+        {
+          "name": "total",
+          "type": "usize",
+          "required": true,
+          "doc": "Entities in the graph, every shelf."
+        },
+        {
+          "name": "shelves",
+          "type": "std::collections::BTreeMap<&'static str, usize>",
+          "required": true,
+          "doc": "Entities per shelf (`cast`, `vocabulary`, `noise`), every shelf.",
+          "refs": [
+            "BTreeMap"
+          ]
+        },
+        {
+          "name": "witness",
+          "type": "&'static str",
+          "required": true
+        }
+      ]
+    },
+    "GraphEntityRow": {
+      "name": "GraphEntityRow",
+      "file": "src/handlers/graph.rs",
+      "doc": "One entity of a `POST /api/graph/entities/all` reply: the node's own fields, its hygiene classification, and its tag provenance when `with_sources` was set.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entity",
+          "type": "EntityNode",
+          "required": true,
+          "notes": [
+            "flattened into the parent"
+          ],
+          "refs": [
+            "EntityNode"
+          ]
+        },
+        {
+          "name": "hygiene",
+          "type": "Classification",
+          "required": true,
+          "refs": [
+            "Classification"
+          ]
+        },
+        {
+          "name": "provenance",
+          "type": "Option<Option<EntityProvenance>>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Absent unless `with_sources`; then `null` for an entity no tag row names.",
+          "refs": [
+            "Option",
+            "Option",
+            "EntityProvenance"
+          ]
+        }
+      ]
+    },
     "GraphNode": {
       "name": "GraphNode",
       "file": "src/handlers/visualization.rs",
@@ -12249,6 +12623,27 @@
         },
         {
           "name": "relationship_uuid",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "InvalidateRelationshipResponse": {
+      "name": "InvalidateRelationshipResponse",
+      "file": "src/handlers/graph.rs",
+      "doc": "Reply of `POST /api/graph/relationship/invalidate`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "message",
           "type": "String",
           "required": true,
           "refs": [
@@ -15301,6 +15696,46 @@
         }
       ]
     },
+    "MergeEntitiesResponse": {
+      "name": "MergeEntitiesResponse",
+      "file": "src/handlers/prompt_gen.rs",
+      "doc": "Reply of `POST /api/entity/merge`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "source",
+          "type": "String",
+          "required": true,
+          "doc": "The entity deleted.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "target",
+          "type": "String",
+          "required": true,
+          "doc": "The entity its edges now point at.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "edges_moved",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "Always `merged`.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "MergeMemoriesResponse": {
       "name": "MergeMemoriesResponse",
       "file": "src/handlers/memory_ops.rs",
@@ -15384,6 +15819,299 @@
         }
       ]
     },
+    "MifAdapter": {
+      "name": "MifAdapter",
+      "file": "src/handlers/mif.rs",
+      "doc": "One import/export adapter.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "format",
+          "type": "String",
+          "required": true,
+          "doc": "The value to send as `format`.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifAdaptersResponse": {
+      "name": "MifAdaptersResponse",
+      "file": "src/handlers/mif.rs",
+      "doc": "Reply of `GET /api/mif/adapters`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "adapters",
+          "type": "Vec<MifAdapter>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "MifAdapter"
+          ]
+        },
+        {
+          "name": "default_export",
+          "type": "String",
+          "required": true,
+          "doc": "The `format` `POST /api/export/mif` uses when none is sent.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "default_import",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifDocument": {
+      "name": "MifDocument",
+      "file": "src/mif/schema.rs",
+      "doc": "MIF v2 document — the top-level interchange container.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "mif_version",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "generator",
+          "type": "MifGenerator",
+          "required": true,
+          "refs": [
+            "MifGenerator"
+          ]
+        },
+        {
+          "name": "export_meta",
+          "type": "MifExportMeta",
+          "required": true,
+          "refs": [
+            "MifExportMeta"
+          ]
+        },
+        {
+          "name": "memories",
+          "type": "Vec<MifMemory>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifMemory"
+          ]
+        },
+        {
+          "name": "knowledge_graph",
+          "type": "Option<MifKnowledgeGraph>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "MifKnowledgeGraph"
+          ]
+        },
+        {
+          "name": "todos",
+          "type": "Vec<MifTodo>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifTodo"
+          ]
+        },
+        {
+          "name": "projects",
+          "type": "Vec<MifProject>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifProject"
+          ]
+        },
+        {
+          "name": "reminders",
+          "type": "Vec<MifReminder>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifReminder"
+          ]
+        },
+        {
+          "name": "vendor_extensions",
+          "type": "HashMap<String, serde_json::Value>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Vendor-specific metadata. Key = vendor name (e.g., \"veld\"). Allows lossless round-trip of system-specific data without polluting the core schema.",
+          "refs": [
+            "HashMap",
+            "String",
+            "Value"
+          ]
+        }
+      ]
+    },
+    "MifEmbedding": {
+      "name": "MifEmbedding",
+      "file": "src/mif/schema.rs",
+      "doc": "Model-tagged embedding vector for cross-system portability.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "model",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "dimensions",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "vector",
+          "type": "Vec<f32>",
+          "required": true,
+          "refs": [
+            "Vec"
+          ]
+        },
+        {
+          "name": "normalized",
+          "type": "bool",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ]
+        }
+      ]
+    },
+    "MifEntityRef": {
+      "name": "MifEntityRef",
+      "file": "src/mif/schema.rs",
+      "doc": "An entity mentioned in a memory, with its type preserved.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "entity_type",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Lowercase entity type: \"person\", \"organization\", \"location\", \"technology\", \"concept\", \"event\", \"date\", \"product\", \"skill\", \"keyword\", \"unknown\".",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "confidence",
+          "type": "f32",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "score"
+          ]
+        }
+      ]
+    },
+    "MifExportMeta": {
+      "name": "MifExportMeta",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "checksum",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "privacy",
+          "type": "Option<MifPrivacy>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "MifPrivacy"
+          ]
+        }
+      ]
+    },
     "MifExportRequest": {
       "name": "MifExportRequest",
       "file": "src/handlers/mif.rs",
@@ -15442,6 +16170,286 @@
           ],
           "refs": [
             "String"
+          ]
+        }
+      ]
+    },
+    "MifGenerator": {
+      "name": "MifGenerator",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "version",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifGraphEntity": {
+      "name": "MifGraphEntity",
+      "file": "src/mif/schema.rs",
+      "doc": "A node in the knowledge graph.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "types",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Lowercase type strings: [\"person\"], [\"technology\", \"concept\"], etc.",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "attributes",
+          "type": "HashMap<String, String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "HashMap",
+            "String",
+            "String"
+          ]
+        },
+        {
+          "name": "summary",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "last_seen_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        }
+      ]
+    },
+    "MifGraphEpisode": {
+      "name": "MifGraphEpisode",
+      "file": "src/mif/schema.rs",
+      "doc": "An episodic node — a temporal grouping of entities.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "entity_ids",
+          "type": "Vec<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "source",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "metadata",
+          "type": "HashMap<String, String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "HashMap",
+            "String",
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        }
+      ]
+    },
+    "MifGraphRelationship": {
+      "name": "MifGraphRelationship",
+      "file": "src/mif/schema.rs",
+      "doc": "An edge in the knowledge graph.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "source_entity_id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "target_entity_id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "relation_type",
+          "type": "String",
+          "required": true,
+          "doc": "Lowercase snake_case: \"works_with\", \"part_of\", \"located_in\", \"causes\", etc.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "context",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "confidence",
+          "type": "Option<f32>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty",
+            "score"
+          ],
+          "doc": "Normalized confidence/strength (0.0–1.0). Vendor-neutral.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "valid_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "invalidated_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
           ]
         }
       ]
@@ -15506,6 +16514,779 @@
           "refs": [
             "ImportResult"
           ]
+        }
+      ]
+    },
+    "MifKnowledgeGraph": {
+      "name": "MifKnowledgeGraph",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entities",
+          "type": "Vec<MifGraphEntity>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifGraphEntity"
+          ]
+        },
+        {
+          "name": "relationships",
+          "type": "Vec<MifGraphRelationship>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifGraphRelationship"
+          ]
+        },
+        {
+          "name": "episodes",
+          "type": "Vec<MifGraphEpisode>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifGraphEpisode"
+          ]
+        }
+      ]
+    },
+    "MifMemory": {
+      "name": "MifMemory",
+      "file": "src/mif/schema.rs",
+      "doc": "A single memory in vendor-neutral form.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "memory_type",
+          "type": "String",
+          "required": true,
+          "doc": "Lowercase type string: \"observation\", \"decision\", \"learning\", \"error\", \"discovery\", \"pattern\", \"context\", \"task\", \"code_edit\", \"file_access\", \"search\", \"command\", \"conversation\", \"intention\".",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "tags",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "entities",
+          "type": "Vec<MifEntityRef>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifEntityRef"
+          ]
+        },
+        {
+          "name": "metadata",
+          "type": "HashMap<String, String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "HashMap",
+            "String",
+            "String"
+          ]
+        },
+        {
+          "name": "embeddings",
+          "type": "Option<MifEmbedding>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "MifEmbedding"
+          ]
+        },
+        {
+          "name": "source",
+          "type": "Option<MifSource>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "MifSource"
+          ]
+        },
+        {
+          "name": "parent_id",
+          "type": "Option<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "related_memory_ids",
+          "type": "Vec<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "related_todo_ids",
+          "type": "Vec<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "agent_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "external_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "version",
+          "type": "u32",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ]
+        }
+      ]
+    },
+    "MifPrivacy": {
+      "name": "MifPrivacy",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "pii_detected",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "secrets_detected",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "redacted_fields",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifProject": {
+      "name": "MifProject",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "prefix",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "description",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "\"active\", \"archived\", \"completed\"",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "color",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "icon",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifReminder": {
+      "name": "MifReminder",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "trigger",
+          "type": "MifTrigger",
+          "required": true,
+          "refs": [
+            "MifTrigger"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "\"pending\", \"triggered\", \"dismissed\", \"expired\"",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "priority",
+          "type": "u8",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ]
+        },
+        {
+          "name": "tags",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "triggered_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "dismissed_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        }
+      ]
+    },
+    "MifSource": {
+      "name": "MifSource",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "source_type",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "session_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "agent",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifTodo": {
+      "name": "MifTodo",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "\"backlog\", \"todo\", \"in_progress\", \"blocked\", \"done\", \"cancelled\"",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "priority",
+          "type": "String",
+          "required": true,
+          "doc": "\"urgent\", \"high\", \"medium\", \"low\", \"none\"",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "updated_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "due_date",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "completed_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "project_id",
+          "type": "Option<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "parent_id",
+          "type": "Option<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "tags",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "contexts",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "notes",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "blocked_on",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "recurrence",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "comments",
+          "type": "Vec<MifTodoComment>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "MifTodoComment"
+          ]
+        },
+        {
+          "name": "related_memory_ids",
+          "type": "Vec<Uuid>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Vec",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "external_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifTodoComment": {
+      "name": "MifTodoComment",
+      "file": "src/mif/schema.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "content",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "comment_type",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "\"comment\", \"progress\", \"resolution\", \"activity\"",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "author",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "MifTrigger": {
+      "name": "MifTrigger",
+      "file": "src/mif/schema.rs",
+      "kind": "enum",
+      "representation": "internally tagged: the payload's fields plus `\"type\": <variant>`",
+      "variants": [
+        {
+          "name": "time",
+          "payload": "{ at: DateTime<Utc> }"
+        },
+        {
+          "name": "duration",
+          "payload": "{ seconds: u64, from: DateTime<Utc> }"
+        },
+        {
+          "name": "context",
+          "payload": "{ keywords: Vec<String>, threshold: f32 }"
         }
       ]
     },
@@ -18004,6 +19785,101 @@
           "refs": [
             "Option"
           ]
+        }
+      ]
+    },
+    "Reason": {
+      "name": "Reason",
+      "file": "src/entity_hygiene.rs",
+      "kind": "enum",
+      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "variants": [
+        {
+          "name": "uuid"
+        },
+        {
+          "name": "runid"
+        },
+        {
+          "name": "timestamp"
+        },
+        {
+          "name": "json"
+        },
+        {
+          "name": "session"
+        },
+        {
+          "name": "lineref"
+        },
+        {
+          "name": "counter"
+        },
+        {
+          "name": "id"
+        },
+        {
+          "name": "hex"
+        },
+        {
+          "name": "url"
+        },
+        {
+          "name": "ref"
+        },
+        {
+          "name": "fragment"
+        },
+        {
+          "name": "number"
+        },
+        {
+          "name": "path"
+        },
+        {
+          "name": "code-ident"
+        },
+        {
+          "name": "filename"
+        },
+        {
+          "name": "vocab"
+        }
+      ]
+    },
+    "RebuildGraphResponse": {
+      "name": "RebuildGraphResponse",
+      "file": "src/handlers/graph.rs",
+      "doc": "Reply of `POST /api/graph/{user_id}/rebuild`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "processed_memories",
+          "type": "usize",
+          "required": true,
+          "doc": "Memories whose entities were extracted again."
+        },
+        {
+          "name": "total_memories",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "entities_created",
+          "type": "usize",
+          "required": true,
+          "doc": "Entities in the graph after the rebuild."
+        },
+        {
+          "name": "relationships_created",
+          "type": "usize",
+          "required": true,
+          "doc": "Relationships in the graph after the rebuild."
         }
       ]
     },
@@ -22535,6 +24411,48 @@
           "name": "value",
           "type": "String",
           "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "SetAttributeResponse": {
+      "name": "SetAttributeResponse",
+      "file": "src/handlers/prompt_gen.rs",
+      "doc": "Reply of `POST /api/entity/attribute`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entity",
+          "type": "String",
+          "required": true,
+          "doc": "The canonical entity name.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "attribute",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "value",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "Always `set`.",
           "refs": [
             "String"
           ]
