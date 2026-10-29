@@ -36,8 +36,8 @@ use crate::embeddings::{
 #[cfg(feature = "multi-tenant")]
 use crate::extensions::maintenance;
 use crate::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
-    LtpStatus, RelationType, RelationshipEdge,
+    recognised_tag_label, EdgeTier, EntityExtractor, EntityLabel, EntityNode, EpisodeSource,
+    EpisodicNode, GraphMemory, GraphStats, LtpStatus, RelationType, RelationshipEdge,
 };
 use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
@@ -4549,9 +4549,11 @@ impl MultiUserMemoryManager {
             declared.iter().map(|d| d.name.to_lowercase()).collect();
 
         // The middle branch below reads `experience.entities`, which lists every tag, derived
-        // keywords included, so only the other two branches hold names NER produced.
-        let extracted_by_ner =
-            !experience.ner_entities.is_empty() || experience.entities.is_empty();
+        // keywords included, so only the other two branches hold names NER produced. Under the
+        // tag-admission gate the middle branch yields nothing.
+        let extracted_by_ner = admission.tag_admission
+            || !experience.ner_entities.is_empty()
+            || experience.entities.is_empty();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -4576,6 +4578,12 @@ impl MultiUserMemoryManager {
                     end: record.end_char.unwrap_or(record.text.len()),
                 })
                 .collect()
+        } else if !experience.entities.is_empty() && admission.tag_admission {
+            // The writer's NER pass ran and kept no span. `entities` holds its tags, YAKE
+            // keyphrases included, and a tag is not a span (upstream #509 removed this
+            // branch). Re-running NER here would restore the PER/LOC spans
+            // `drop_person_location_in_code` removed from code.
+            Vec::new()
         } else if !experience.entities.is_empty() {
             tracing::debug!(
                 "Using {} pre-extracted entity names (no NER types available)",
@@ -4680,37 +4688,75 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
-        // Build tag entity nodes
+        // Tag nodes. A node is a claim that its name denotes a thing, and a tag is the
+        // memory's search metadata: caller tags, every NER surface and up to ten YAKE
+        // keyphrases. Upstream #509 admits a tag only on an authority, and so does this gate:
+        // the writer named it (a caller tag or declared entity in the provenance ledger), or a
+        // curated naming convention recognises it (`recognised_tag_label`). A surface NER
+        // typed is skipped outright: the NER node is that entity, and its twin would add an
+        // unfiltered Technology guess under the same name. Without a ledger row a tag's
+        // authorship is undetermined, so only the naming conventions admit it. A tag no
+        // authority recognises stays a keyword for BM25 and `recall_by_tags`.
+        let ner_claimed: std::collections::HashSet<String> = ner_entities
+            .iter()
+            .map(|(name, _)| name.trim().to_lowercase())
+            .collect();
+        let writer_named: std::collections::HashSet<String> = tag_sources
+            .map(|sources| {
+                sources
+                    .tags
+                    .iter()
+                    .filter(|t| {
+                        !t.redacted && matches!(t.source, TagSource::Caller | TagSource::Declared)
+                    })
+                    .map(|t| t.tag.trim().to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
         let tag_entities: Vec<(String, EntityNode)> = experience
             .tags
             .iter()
             .filter_map(|tag| {
                 let tag_name = tag.trim();
                 let lower = tag_name.to_lowercase();
-                if tag_name.len() >= 2
-                    && !stop_words.contains(lower.as_str())
-                    && !declared_names.contains(&lower)
+                if tag_name.len() < 2
+                    || stop_words.contains(lower.as_str())
+                    || declared_names.contains(&lower)
                 {
-                    Some((
-                        tag_name.to_string(),
-                        EntityNode {
-                            uuid: uuid::Uuid::new_v4(),
-                            name: tag_name.to_string(),
-                            labels: vec![EntityLabel::Technology],
-                            created_at: now,
-                            last_seen_at: now,
-                            mention_count: 1,
-                            summary: String::new(),
-                            attributes: HashMap::new(),
-                            name_embedding: None,
-                            salience: 0.6,
-                            is_proper_noun: false,
-                            pii_classification: Default::default(),
-                        },
-                    ))
-                } else {
-                    None
+                    return None;
                 }
+                let (label, salience) = if admission.tag_admission {
+                    if ner_claimed.contains(&lower) {
+                        return None;
+                    }
+                    let label = match recognised_tag_label(tag_name) {
+                        Some(label) => label,
+                        // Asserted to exist, of no recognised type.
+                        None if writer_named.contains(&lower) => EntityLabel::Concept,
+                        None => return None,
+                    };
+                    let salience = EntityExtractor::calculate_base_salience(&label, false);
+                    (label, salience)
+                } else {
+                    (EntityLabel::Technology, 0.6)
+                };
+                Some((
+                    tag_name.to_string(),
+                    EntityNode {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: tag_name.to_string(),
+                        labels: vec![label],
+                        created_at: now,
+                        last_seen_at: now,
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: HashMap::new(),
+                        name_embedding: None,
+                        salience,
+                        is_proper_noun: false,
+                        pii_classification: Default::default(),
+                    },
+                ))
             })
             .collect();
 
@@ -5823,6 +5869,8 @@ fn env_switch(name: &str, default: bool) -> bool {
 struct GraphAdmission {
     /// The NER confidence floor and verb-noise list at graph insertion.
     ner_noise_gate: bool,
+    /// A tag becomes a node only on an authority, and never beside the NER node it twins.
+    tag_admission: bool,
 }
 
 impl GraphAdmission {
@@ -5830,6 +5878,7 @@ impl GraphAdmission {
         use crate::constants as c;
         Self {
             ner_noise_gate: env_switch(c::NER_GRAPH_NOISE_GATE_ENV, true),
+            tag_admission: env_switch(c::GRAPH_TAG_ADMISSION_ENV, true),
         }
     }
 }
@@ -5980,6 +6029,137 @@ mod ner_span_admission_tests {
             assert!(admitted_with(&noise, false), "{noise:?}");
         }
     }
+}
+
+#[cfg(test)]
+mod graph_admission_tests {
+    use super::*;
+    use crate::memory::tag_sources::{SourcedTag, TAG_SOURCES_SCHEMA};
+    use crate::memory::types::NerEntityRecord;
+
+    const USER: &str = "graph-admission";
+
+    fn manager(base: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: base.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(base.to_path_buf(), config).expect("manager")
+    }
+
+    fn person(name: &str) -> NerEntityRecord {
+        NerEntityRecord {
+            text: name.to_string(),
+            entity_type: "PER".to_string(),
+            confidence: 0.8,
+            start_char: None,
+            end_char: None,
+        }
+    }
+
+    fn ledger(tags: &[(&str, TagSource)]) -> TagSources {
+        TagSources {
+            v: TAG_SOURCES_SCHEMA,
+            tags: tags
+                .iter()
+                .map(|(tag, source)| SourcedTag {
+                    tag: tag.to_string(),
+                    source: *source,
+                    redacted: false,
+                })
+                .collect(),
+            redacted: Default::default(),
+        }
+    }
+
+    /// Every gate off, so a test can switch on the one it measures.
+    fn legacy() -> GraphAdmission {
+        let mut admission = GraphAdmission::from_env();
+        admission.ner_noise_gate = false;
+        admission.tag_admission = false;
+        admission
+    }
+
+    fn tagged_turn() -> (Experience, TagSources) {
+        let tags = ["kestrel", "rocksdb", "support group", "Caroline"];
+        let experience = Experience {
+            content: "Caroline told the kestrel club about rocksdb at the support group.".into(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            entities: tags.iter().map(|t| t.to_string()).collect(),
+            ner_entities: vec![person("Caroline")],
+            ..Default::default()
+        };
+        let sources = ledger(&[
+            ("kestrel", TagSource::Caller),
+            ("rocksdb", TagSource::Yake),
+            ("support group", TagSource::Yake),
+            ("Caroline", TagSource::Ner),
+        ]);
+        (experience, sources)
+    }
+
+    fn labels(mgr: &MultiUserMemoryManager, name: &str) -> Option<Vec<EntityLabel>> {
+        let graph = mgr.get_user_graph(USER).expect("graph");
+        let graph = graph.read();
+        graph
+            .find_entity_by_name_strict(name)
+            .expect("lookup")
+            .map(|e| e.labels)
+    }
+
+    #[test]
+    fn a_tag_becomes_a_node_only_on_an_authority_and_never_beside_its_ner_twin() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let (experience, sources) = tagged_turn();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(
+            USER,
+            &experience,
+            &id,
+            &[],
+            Some(&sources),
+            GraphAdmission::from_env(),
+        )
+        .unwrap();
+
+        assert_eq!(labels(&mgr, "kestrel"), Some(vec![EntityLabel::Concept]));
+        assert_eq!(labels(&mgr, "rocksdb"), Some(vec![EntityLabel::Database]));
+        assert_eq!(labels(&mgr, "support group"), None, "a YAKE keyphrase");
+        assert_eq!(labels(&mgr, "Caroline"), Some(vec![EntityLabel::Person]));
+    }
+
+    #[test]
+    fn without_a_ledger_row_only_a_naming_convention_admits_a_tag() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let (experience, _) = tagged_turn();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(USER, &experience, &id, &[], None, GraphAdmission::from_env())
+            .unwrap();
+
+        assert_eq!(labels(&mgr, "kestrel"), None);
+        assert_eq!(labels(&mgr, "rocksdb"), Some(vec![EntityLabel::Database]));
+    }
+
+    #[test]
+    fn with_tag_admission_off_every_tag_is_a_technology_node() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let (experience, sources) = tagged_turn();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(USER, &experience, &id, &[], Some(&sources), legacy())
+            .unwrap();
+
+        assert_eq!(
+            labels(&mgr, "support group"),
+            Some(vec![EntityLabel::Technology])
+        );
+        let caroline = labels(&mgr, "Caroline").expect("node");
+        assert!(caroline.contains(&EntityLabel::Technology), "{caroline:?}");
+    }
+
 }
 
 /// Annotate a query with NER-extracted entity names.

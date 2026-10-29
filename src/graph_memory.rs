@@ -525,6 +525,113 @@ impl EntityLabel {
     }
 }
 
+/// The ontological class a curated naming convention recognises in `tag`, or `None`.
+///
+/// Ported verbatim from upstream shodh-memory #509 (a292546f). Each rule recognises a
+/// convention only artifacts follow: a named product (`rocksdb`), a file (`config.toml`), a
+/// service (`auth-service`). A tag no rule recognises is a keyword: it describes the memory
+/// without naming anything, and it stays in `tags` for search and `recall_by_tags` without
+/// becoming a graph node (see `process_experience_into_graph_declared`).
+///
+/// Every rule matches a whole tag or a whole trailing token, never a bare substring:
+/// upstream's `contains("config")` once made the prose phrase "stobar configuration" a
+/// Configuration entity. Deployment-phase words ("production", "staging", "dev", "ci") are
+/// absent on purpose: they are English common nouns that denote no referent off a
+/// deployment log.
+pub fn recognised_tag_label(tag: &str) -> Option<EntityLabel> {
+    let lower = tag.to_lowercase();
+
+    /// Whether `lower` is `word`, or ends with `word` after a `-`, `_` or space
+    /// ("deploy-workflow" matches "workflow"; "workflows" does not).
+    fn is_trailing_token(lower: &str, word: &str) -> bool {
+        if lower == word {
+            return true;
+        }
+        lower
+            .strip_suffix(word)
+            .is_some_and(|prefix| prefix.ends_with(['-', '_', ' ']))
+    }
+
+    if matches!(
+        lower.as_str(),
+        "kubernetes" | "k8s" | "docker" | "aws" | "gcp" | "azure"
+    ) {
+        return Some(EntityLabel::Environment);
+    }
+
+    if is_trailing_token(&lower, "pipeline")
+        || is_trailing_token(&lower, "workflow")
+        || lower == "ci-cd"
+        || lower == "cicd"
+    {
+        return Some(EntityLabel::Pipeline);
+    }
+
+    if matches!(
+        lower.as_str(),
+        "rocksdb"
+            | "postgres"
+            | "postgresql"
+            | "redis"
+            | "sqlite"
+            | "mongodb"
+            | "mysql"
+            | "dynamodb"
+            | "s3"
+            | "cassandra"
+            | "elasticsearch"
+    ) || lower.ends_with("db")
+        || lower.ends_with("-db")
+        || lower.ends_with("_db")
+    {
+        return Some(EntityLabel::Database);
+    }
+
+    // Suffix-only, so "my-api-docs" is not a service.
+    if lower.ends_with("-service")
+        || lower.ends_with("_service")
+        || lower.ends_with("-api")
+        || lower.ends_with("_api")
+        || lower.ends_with("-server")
+        || lower.ends_with("_server")
+        || lower.ends_with("-daemon")
+    {
+        return Some(EntityLabel::Service);
+    }
+
+    // Before the module rules: README.md is a document, not a module.
+    if lower.ends_with(".md")
+        || is_trailing_token(&lower, "readme")
+        || is_trailing_token(&lower, "runbook")
+        || lower.ends_with("-rfc")
+        || lower.ends_with("-spec")
+    {
+        return Some(EntityLabel::Document);
+    }
+
+    if lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".env")
+        || lower.ends_with(".json")
+        || is_trailing_token(&lower, "config")
+    {
+        return Some(EntityLabel::Configuration);
+    }
+
+    if lower.ends_with(".rs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".js")
+        || lower.ends_with(".py")
+        || lower.ends_with("-lib")
+        || lower.ends_with("_lib")
+    {
+        return Some(EntityLabel::Module);
+    }
+
+    None
+}
+
 /// Memory tier for edge consolidation
 ///
 /// Based on hippocampal-cortical memory consolidation research:
@@ -11088,6 +11195,44 @@ mod tests {
             extract_directed_predicate("Vornak did not cause Meslin.", "Vornak", "Meslin"),
             None
         );
+    }
+
+    #[test]
+    fn recognised_tag_label_maps_naming_conventions() {
+        assert_eq!(recognised_tag_label("rocksdb"), Some(EntityLabel::Database));
+        assert_eq!(
+            recognised_tag_label("metrics-service"),
+            Some(EntityLabel::Service)
+        );
+        assert_eq!(recognised_tag_label("README"), Some(EntityLabel::Document));
+        assert_eq!(
+            recognised_tag_label("config.toml"),
+            Some(EntityLabel::Configuration)
+        );
+        assert_eq!(recognised_tag_label("router.rs"), Some(EntityLabel::Module));
+        assert_eq!(recognised_tag_label("ci-cd"), Some(EntityLabel::Pipeline));
+        assert_eq!(
+            recognised_tag_label("kubernetes"),
+            Some(EntityLabel::Environment)
+        );
+    }
+
+    #[test]
+    fn recognised_tag_label_abstains_on_prose() {
+        for prose in [
+            "production",
+            "development",
+            "staging",
+            "container",
+            "stobar configuration",
+            "empty weight",
+            "support group",
+            "painting",
+            "workflows",
+            "62-kalyani-group.txt",
+        ] {
+            assert_eq!(recognised_tag_label(prose), None, "{prose:?}");
+        }
     }
 
     #[test]

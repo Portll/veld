@@ -344,6 +344,11 @@ pub const NER_VERB_NOISE: &[&str] = &[
 /// both off. On by default.
 pub const NER_GRAPH_NOISE_GATE_ENV: &str = "VELD_GRAPH_NER_NOISE_GATE";
 
+/// Env switch for the tag-admission gate (upstream #509): a tag becomes a graph node only when
+/// the writer named it or `recognised_tag_label` recognises it, and never when NER typed the
+/// same surface. `0` or `false` restores every tag as a Technology node. On by default.
+pub const GRAPH_TAG_ADMISSION_ENV: &str = "VELD_GRAPH_TAG_ADMISSION";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay
