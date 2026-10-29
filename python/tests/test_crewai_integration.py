@@ -45,7 +45,9 @@ def _load_module():
 
 M = _load_module() if HAVE_CREWAI else None
 
-BASE = "http://veld.test:3030"
+# Loopback, so the plain-HTTP warning stays out of every test but its own. Port 9
+# (discard) has no veld behind it: a request that escaped the stub would fail.
+BASE = "http://127.0.0.1:9"
 
 
 class FakeResponse:
@@ -160,6 +162,34 @@ class TestConstruction(unittest.TestCase):
         self.assertNotIn("api_key", memory.model_dump())
         self.assertNotIn("secret-key-5521", repr(memory))
         self.assertNotIn("secret-key-5521", memory.model_dump_json())
+
+    def _http_warnings(self, server_url, env=None):
+        environ = {k: v for k, v in os.environ.items() if k != "VELD_ALLOW_HTTP"}
+        environ.update(env or {})
+        with mock.patch.dict(os.environ, environ, clear=True):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                M.VeldCrewMemory(api_key="k", server_url=server_url)
+        return [str(w.message) for w in caught if "clear text" in str(w.message)]
+
+    def test_plain_http_to_a_remote_host_warns(self):
+        messages = self._http_warnings("http://veld.example.com:3030")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("VELD_ALLOW_HTTP=true", messages[0])
+        self.assertEqual(len(self._http_warnings("HTTP://10.0.0.5:3030")), 1)
+
+    def test_https_and_loopback_do_not_warn(self):
+        for url in (
+            "https://veld.example.com",
+            "http://127.0.0.1:3030",
+            "http://localhost:3030",
+            "http://[::1]:3030",
+            "http://0.0.0.0:3030",
+        ):
+            self.assertEqual(self._http_warnings(url), [], url)
+
+    def test_allow_http_suppresses_the_warning(self):
+        self.assertEqual(self._http_warnings("http://veld.example.com", {"VELD_ALLOW_HTTP": "true"}), [])
 
     def test_storage_cannot_be_set(self):
         with self.assertRaises(ValueError):

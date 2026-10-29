@@ -80,6 +80,9 @@ server, the LangChain adapter) wrote. `forget` and `reset` delete only memories 
 
 ## Errors
 
+- Construction warns when `server_url` is plain `http://` to a host other than this machine
+  (`127.0.0.1`, `localhost`, `::1`, `0.0.0.0`), since the API key would travel in clear text.
+  Use `https://`, or set `VELD_ALLOW_HTTP=true` to silence it.
 - A failed recall warns and returns no matches, so the task runs without memory.
 - `remember`, `forget`, `reset`, `update` and the listing methods raise
   `VeldRequestError`, with `status` (HTTP status) and `code` (veld's error code, such as

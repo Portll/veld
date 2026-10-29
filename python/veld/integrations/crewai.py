@@ -35,7 +35,7 @@ import re
 import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 try:
     from crewai.memory.types import MemoryMatch, MemoryRecord, ScopeInfo
@@ -83,6 +83,15 @@ _LIST_PAGE = 1_000
 # private, suspected or out-of-category matches still leaves `limit` results.
 _RECALL_OVERSAMPLE = 2
 _FRACTION_PAST_MICROS = re.compile(r"(\.\d{6})\d+")
+# Hosts where plain HTTP keeps the API key on this machine (the Vercel AI SDK
+# client's isLocalHost list).
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _sends_key_in_clear(server_url: str) -> bool:
+    """Whether requests to ``server_url`` carry the API key unencrypted off this machine."""
+    parts = urlsplit(server_url)
+    return parts.scheme.lower() == "http" and (parts.hostname or "") not in _LOCAL_HOSTS
 
 
 class VeldRequestError(Exception):
@@ -577,6 +586,10 @@ class VeldCrewMemory(Memory):
     ``MemorySaveFailedEvent``. ``forget``, ``reset``, ``update`` and the listing
     methods raise ``VeldRequestError``.
 
+    Construction warns when ``server_url`` is plain ``http://`` to a host other
+    than this machine, since the API key would travel in clear text; set
+    VELD_ALLOW_HTTP=true to silence it.
+
     Attributes:
         server_url: URL of the veld server.
         user_id: Veld user the memories belong to.
@@ -646,6 +659,11 @@ class VeldCrewMemory(Memory):
                 "API key required. Pass api_key parameter or set VELD_API_KEY env var."
             )
         self.server_url = self.server_url.rstrip("/")
+        if _sends_key_in_clear(self.server_url) and os.environ.get("VELD_ALLOW_HTTP") != "true":
+            warnings.warn(
+                "Using HTTP for a non-localhost veld server sends the API key in clear text. "
+                "Use an https:// URL, or set VELD_ALLOW_HTTP=true to suppress this warning."
+            )
         self._http = _VeldHTTP(self.server_url, self.api_key, self.timeout)
         self.storage = _VeldStore(self._http, self.user_id, self.memory_type, self.source_type)
         super().model_post_init(__context)
