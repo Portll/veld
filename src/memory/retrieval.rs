@@ -116,6 +116,15 @@ pub struct RetrievalEngine {
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
 }
 
+/// What a full re-embed did. `rewritten` holds every memory whose stored record changed,
+/// which a journaling caller MUST journal as an `Update`, or followers keep the old vectors.
+#[derive(Debug, Clone, Default)]
+pub struct ReembedReport {
+    pub reembedded: usize,
+    pub failed: usize,
+    pub rewritten: Vec<MemoryId>,
+}
+
 /// What retiring a space removed.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RetireReport {
@@ -2835,13 +2844,13 @@ impl RetrievalEngine {
     /// Uses `reindex_memory()` which soft-deletes old vectors and creates new ones.
     /// Safe to call while the system is serving queries (reads from stale vectors
     /// until the new ones are indexed).
-    pub fn reembed_all(&self) -> Result<(usize, usize)> {
+    pub fn reembed_all(&self) -> Result<ReembedReport> {
         let all_ids = self.storage.get_all_ids()?;
         let total = all_ids.len();
 
         if total == 0 {
             tracing::info!("No memories to re-embed");
-            return Ok((0, 0));
+            return Ok(ReembedReport::default());
         }
 
         tracing::info!(
@@ -2851,6 +2860,7 @@ impl RetrievalEngine {
         let start_time = std::time::Instant::now();
         let mut reembedded = 0;
         let mut failed = 0;
+        let mut rewritten = Vec::new();
 
         for (i, memory_id) in all_ids.iter().enumerate() {
             match self.storage.get(memory_id) {
@@ -2869,6 +2879,7 @@ impl RetrievalEngine {
                         failed += 1;
                         continue;
                     }
+                    rewritten.push(memory_id.clone());
 
                     // Re-index: removes old vectors, creates new ones with context prefix
                     match self.reindex_memory(&memory) {
@@ -2911,7 +2922,11 @@ impl RetrievalEngine {
             total
         );
 
-        Ok((reembedded, failed))
+        Ok(ReembedReport {
+            reembedded,
+            failed,
+            rewritten,
+        })
     }
 
     // NOTE: Memory graph functionality has been consolidated into GraphMemory

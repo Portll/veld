@@ -6060,6 +6060,9 @@ pub struct MaintenanceResult {
     pub facts_extracted: usize,
     /// Number of existing facts reinforced (dedup hit) during consolidation
     pub facts_reinforced: usize,
+    /// Stored records rewritten since the previous cycle (compression). A journaling caller
+    /// MUST journal an `Update` for each, or followers keep the old content.
+    pub rewritten: Vec<MemoryId>,
 }
 
 /// Signal emitted when an edge tier promotion occurs during strengthen().
