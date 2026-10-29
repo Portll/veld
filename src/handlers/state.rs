@@ -4935,6 +4935,9 @@ impl MultiUserMemoryManager {
         let mut declared_weight: Vec<Option<f32>> = Vec::new();
         // Per entry: a derived entity already at the degree cap takes no new edges.
         let mut at_cap: Vec<bool> = Vec::new();
+        // Per entry: the episodes that have mentioned the entity, this one included (the
+        // document frequency of the PMI gate). Declared entries are exempt and hold 1.
+        let mut mentions: Vec<usize> = Vec::new();
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
@@ -4947,9 +4950,18 @@ impl MultiUserMemoryManager {
                             false
                         }
                     };
+                    let mention_count = match graph_guard.get_entity(&uuid) {
+                        Ok(Some(node)) => node.mention_count,
+                        Ok(None) => 1,
+                        Err(e) => {
+                            tracing::debug!("Mention count read failed for {}: {}", name, e);
+                            1
+                        }
+                    };
                     entity_uuids.push((name, uuid));
                     declared_weight.push(None);
                     at_cap.push(hub);
+                    mentions.push(mention_count);
                 }
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
             }
@@ -4960,6 +4972,7 @@ impl MultiUserMemoryManager {
                     entity_uuids.push((name, uuid));
                     declared_weight.push(Some(weight));
                     at_cap.push(false);
+                    mentions.push(1);
                 }
                 Err(e) => tracing::debug!("Failed to add declared entity {}: {}", name, e),
             }
@@ -4999,6 +5012,8 @@ impl MultiUserMemoryManager {
                 tracing::warn!("Failed to add episode: {}", e);
             }
         }
+        // N of the PMI gate: the user's episodes, this one included.
+        let total_episodes = graph_guard.total_episode_count().max(1) as f32;
 
         // Create relationships between co-occurring entities
         // Pre-compute truncated context once (avoids re-allocating per edge)
@@ -5054,6 +5069,7 @@ impl MultiUserMemoryManager {
             .collect();
 
         let mut hub_edges_skipped = 0u64;
+        let mut pmi_gated = 0usize;
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
                 // Two names `add_entity` resolved to one node (a case, stem or concept merge)
@@ -5092,6 +5108,22 @@ impl MultiUserMemoryManager {
                     }
                     None => RelationType::RelatedTo,
                 };
+                // PMI gate (upstream #336/#364): a generic edge whose pair co-occurs no more
+                // than chance is never born. At birth the pair has co-occurred once, so
+                // PMI = log2(N / (df_i * df_j)). A typed edge, a fragment bridge and an edge to
+                // a declared entity carry grounding the statistic lacks and are kept.
+                if admission.pmi_gate
+                    && declared_strength.is_none()
+                    && !fragment_of_comention[i]
+                    && !fragment_of_comention[j]
+                    && matches!(relation_type, RelationType::RelatedTo | RelationType::CoOccurs)
+                {
+                    let df = mentions[i].max(1) as f32 * mentions[j].max(1) as f32;
+                    if (total_episodes / df).log2() < admission.pmi_gate_min {
+                        pmi_gated += 1;
+                        continue;
+                    }
+                }
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
                     from_entity,
@@ -5141,6 +5173,13 @@ impl MultiUserMemoryManager {
                     .map(|((name, _), _)| name.as_str())
                     .collect::<Vec<_>>(),
                 "Skipped co-occurrence edges on entities already at the degree cap"
+            );
+        }
+        if pmi_gated > 0 {
+            tracing::debug!(
+                memory_id = %memory_id.0,
+                pmi_gated,
+                "Co-occurrence edges not born: the pair co-occurs no more than chance"
             );
         }
         // Lock released here
@@ -5893,6 +5932,9 @@ struct GraphAdmission {
     /// A derived entity of higher degree accretes no new edge. Held under
     /// [`crate::constants::MAX_ENTITY_DEGREE`], where every new edge only buys a prune.
     hub_degree_max: usize,
+    /// A generic edge is born only when its pair's PMI reaches `pmi_gate_min`.
+    pmi_gate: bool,
+    pmi_gate_min: f32,
 }
 
 impl GraphAdmission {
@@ -5904,6 +5946,8 @@ impl GraphAdmission {
             verb_entities: env_switch(c::GRAPH_VERB_ENTITIES_ENV, false),
             hub_degree_max: env_number(c::GRAPH_HUB_DEGREE_MAX_ENV, c::GRAPH_HUB_DEGREE_MAX)
                 .min(c::MAX_ENTITY_DEGREE - 1),
+            pmi_gate: env_switch(c::GRAPH_PMI_GATE_ENV, true),
+            pmi_gate_min: env_number(c::GRAPH_PMI_GATE_MIN_ENV, c::GRAPH_PMI_GATE_MIN),
         }
     }
 }
@@ -6142,6 +6186,7 @@ mod graph_admission_tests {
         // Except verb nodes: they would join every memory through "met".
         admission.verb_entities = false;
         admission.hub_degree_max = crate::constants::MAX_ENTITY_DEGREE - 1;
+        admission.pmi_gate = false;
         admission
     }
 
@@ -6286,6 +6331,30 @@ mod graph_admission_tests {
             write_people(&mgr, &["Hubert", "Delphine"], admission);
             assert_eq!(joined(&mgr, "Hubert", "Delphine"), joined_after);
             assert!(joined(&mgr, "Hubert", "Celia"), "edges below the cap stay");
+        }
+    }
+
+    /// Xavier and Yusuf are each in three of five episodes: together they are likelier by
+    /// chance than not, so no edge is born. Each still joins the newcomer Zelda.
+    #[test]
+    fn a_pair_that_cooccurs_no_more_than_chance_is_not_joined() {
+        let mut gated = legacy();
+        gated.pmi_gate = true;
+        for (admission, pair_joined) in [(gated, false), (legacy(), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            for people in [
+                ["Xavier", "Abel"],
+                ["Xavier", "Amos"],
+                ["Yusuf", "Bruno"],
+                ["Yusuf", "Boris"],
+            ] {
+                write_people(&mgr, &people, admission);
+            }
+            write_people(&mgr, &["Xavier", "Yusuf", "Zelda"], admission);
+            assert_eq!(joined(&mgr, "Xavier", "Yusuf"), pair_joined);
+            assert!(joined(&mgr, "Xavier", "Zelda"));
+            assert!(joined(&mgr, "Yusuf", "Zelda"));
         }
     }
 }
