@@ -4914,7 +4914,15 @@ fn verb_stem_to_relation_types(stem: &str) -> Vec<RelationType> {
         }
 
         // Causal relationships
-        "caus" | "result" | "lead" => vec![RelationType::Causes, RelationType::ResultsIn],
+        // Triggers is the type the causal cue extractor gives "caused", "led to" and
+        // "because of"; outside this set the ontology penalty would dampen those edges.
+        "caus" | "result" | "lead" => {
+            vec![
+                RelationType::Causes,
+                RelationType::ResultsIn,
+                RelationType::Triggers,
+            ]
+        }
 
         // Ownership / structural
         "own" | "belong" | "possess" => vec![RelationType::OwnedBy, RelationType::PartOf],
@@ -6778,5 +6786,26 @@ mod tests {
                 pair[1].0
             );
         }
+    }
+
+    #[test]
+    fn a_causal_verb_asks_for_every_relation_the_cue_extractor_writes() {
+        for stem in ["caus", "lead", "result"] {
+            let wanted = verb_stem_to_relation_types(stem);
+            for causal in [
+                RelationType::Causes,
+                RelationType::ResultsIn,
+                RelationType::Triggers,
+            ] {
+                assert!(wanted.contains(&causal), "{stem} misses {causal:?}");
+            }
+        }
+        let (relation, _) = crate::graph_memory::extract_directed_predicate(
+            "The storm caused the outage.",
+            "storm",
+            "outage",
+        )
+        .expect("a causal cue");
+        assert!(verb_stem_to_relation_types("caus").contains(&relation));
     }
 }
