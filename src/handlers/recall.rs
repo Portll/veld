@@ -566,6 +566,14 @@ pub struct RecallByTagsRequest {
     /// answer for the writer's own tag of the same name.
     #[serde(default)]
     pub include_derived: bool,
+    /// The write-time NER records and co-occurrence pairs the graph was built from: per-token
+    /// type, span and confidence, about 39 KB per memory on the live store and three quarters
+    /// of a tag-recall response. Readers of the text do not need them.
+    #[serde(default)]
+    pub include_annotations: bool,
+    /// The memory's rich context (conversation, project, environment, repo).
+    #[serde(default)]
+    pub include_context: bool,
 }
 
 /// Recall memories by date range
@@ -2986,6 +2994,13 @@ pub async fn recall_by_tags(
             if !req.include_embeddings {
                 m.experience.embeddings = None;
                 m.experience.embeddings_secondary = None;
+            }
+            if !req.include_annotations {
+                m.experience.ner_entities = Vec::new();
+                m.experience.cooccurrence_pairs = Vec::new();
+            }
+            if !req.include_context {
+                m.experience.context = None;
             }
             m
         })
