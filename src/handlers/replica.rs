@@ -447,7 +447,7 @@ mod tests {
 
     use super::*;
     use crate::handlers::test_helpers::{
-        get, get_unauthenticated, post_json, TestHarness, TEST_API_KEY,
+        delete, get, get_unauthenticated, post_json, put_json, TestHarness, TEST_API_KEY,
     };
     use crate::intent_log::{payload, IntentPayload};
     use crate::memory::types::{Experience, Memory, MemoryId};
@@ -595,6 +595,265 @@ mod tests {
         }
         let memory = harness.state().get_user_memory(USER).unwrap();
         assert_eq!(memory.read().stored_count(), 0, "nothing reached the store");
+    }
+
+    /// What any write would move: the records stored and the journal's next LSN.
+    fn footprint(harness: &TestHarness) -> (usize, u64) {
+        let state = harness.state();
+        let records = state
+            .get_user_memory(USER)
+            .unwrap()
+            .read()
+            .get_all_memories()
+            .unwrap()
+            .len();
+        let head = state
+            .get_user_journaled_writer(USER)
+            .unwrap()
+            .lock()
+            .log()
+            .next_lsn()
+            .0;
+        (records, head)
+    }
+
+    async fn assert_refused_as_a_write(harness: &TestHarness, request: HttpRequest<Body>) {
+        let what = format!("{} {}", request.method(), request.uri());
+        let (status, headers, body) = call(harness, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{what}: {body}");
+        assert_eq!(body["code"], READ_ONLY_REPLICA, "{what}: {body}");
+        assert!(headers.get(RETRY_AFTER).is_some(), "{what}");
+    }
+
+    #[tokio::test]
+    async fn a_client_write_lands_once_the_follower_is_unfollowed() {
+        let harness = TestHarness::new();
+        let remember = || {
+            post_json(
+                "/api/remember",
+                &json!({"user_id": USER, "content": "the slipway reopens on Monday"}),
+            )
+        };
+        follow(&harness);
+        assert_refused_as_a_write(&harness, remember()).await;
+        let before = footprint(&harness);
+
+        harness.state().replication.unfollow();
+        let (status, headers, body) = call(&harness, remember()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(headers.get(LAG_HEADER).is_none() && headers.get(CONTACT_AGE_HEADER).is_none());
+        let after = footprint(&harness);
+        assert_eq!(after.0, before.0 + 1, "the memory was stored");
+        assert!(after.1 > before.1, "and journaled");
+    }
+
+    #[tokio::test]
+    async fn a_follower_refuses_put_and_delete_writes() {
+        let harness = TestHarness::new();
+        let id = remember_directly(&harness, "the tug berths at pier four").0;
+        follow(&harness);
+        let before = footprint(&harness);
+        let requests = [
+            put_json(
+                &format!("/api/memory/{id}?user_id={USER}"),
+                &json!({"user_id": USER, "content": "the tug berths at pier five"}),
+            ),
+            delete(&format!("/api/memory/{id}?user_id={USER}")),
+            delete(&format!("/api/forget/{id}?user_id={USER}")),
+            delete(&format!("/api/users/{USER}")),
+            put_json("/api/dials", &json!({"rerank_k": 5})),
+            put_json(
+                &format!("/api/context/blocks/persona?user_id={USER}"),
+                &json!({"user_id": USER, "content": "prefers short answers"}),
+            ),
+            delete(&format!("/api/context/blocks/persona?user_id={USER}")),
+        ];
+        for request in requests {
+            assert_refused_as_a_write(&harness, request).await;
+        }
+        assert_eq!(footprint(&harness), before);
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        let kept = memory.read().get_memory(&MemoryId(id)).unwrap();
+        assert_eq!(kept.experience.content, "the tug berths at pier four");
+    }
+
+    #[tokio::test]
+    async fn a_follower_refuses_a_mif_import_and_a_backup_restore() {
+        let harness = TestHarness::new();
+        remember_directly(&harness, "the dredger works the channel at low tide");
+        follow(&harness);
+        let before = footprint(&harness);
+        let (status, _, exported) = call(
+            &harness,
+            post_json("/api/export/mif", &json!({"user_id": USER})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "an export is a read: {exported}");
+        assert_eq!(
+            exported["not_replicated"],
+            json!(["todos", "projects", "reminders"]),
+            "the export says which of its stores are this instance's own"
+        );
+
+        assert_refused_as_a_write(
+            &harness,
+            post_json(
+                "/api/import/mif",
+                &json!({"user_id": USER, "skip_duplicates": false, "data": exported}),
+            ),
+        )
+        .await;
+        assert_refused_as_a_write(
+            &harness,
+            post_json(
+                "/api/backup/restore",
+                &json!({"user_id": USER, "backup_id": 1}),
+            ),
+        )
+        .await;
+        assert_eq!(footprint(&harness), before);
+    }
+
+    /// Every route the table lets through on a follower, with a request each handler
+    /// can take, leaves the records and the journal as they were.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn on_a_follower_no_read_or_local_route_moves_a_record_or_the_journal() {
+        use crate::handlers::admin::{ADMIN_API_KEY_ENV, ADMIN_API_KEY_HEADER, ADMIN_ENV_LOCK};
+        use axum::http::header::CONTENT_TYPE;
+        const ADMIN_KEY: &str = "replica-sweep-admin-key";
+        let _env = ADMIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(ADMIN_API_KEY_ENV, ADMIN_KEY);
+
+        let harness = TestHarness::new();
+        let id = remember_directly(&harness, "the harbour crane is serviced every spring").0;
+        remember_directly(&harness, "the harbour master keeps the crane log");
+        follow(&harness);
+        let before = footprint(&harness);
+        let now = chrono::Utc::now();
+        let shared = json!({
+            "user_id": USER,
+            "query": "harbour crane",
+            "query_text": "harbour crane",
+            "context": "who services the harbour crane",
+            "goal": "brief the crane crew",
+            "tags": ["harbour"],
+            "start": (now - chrono::Duration::days(1)).to_rfc3339(),
+            "end": now.to_rfc3339(),
+            "memory_id": id,
+            "limit": 5,
+        });
+        let body_for = |path: &str| -> serde_json::Value {
+            let extra = match path {
+                "/api/admin/storage/export" => return json!({"user": USER, "name": "sweep"}),
+                "/api/memories" => json!({"tags": "harbour"}),
+                "/api/storage/uncompressed" => json!({"days_old": 0}),
+                "/api/backup/verify" => json!({"backup_id": 1}),
+                "/api/backup/purge" | "/api/backups/purge" => json!({"keep_count": 5}),
+                "/api/search/multimodal" | "/api/search/robotics" => json!({"mode": "hybrid"}),
+                "/api/search/advanced" => json!({"entity_name": "harbour"}),
+                _ => json!({}),
+            };
+            let mut body = shared.clone();
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            body
+        };
+
+        // Requests this harness cannot make succeed; each still passes the guard. No
+        // user-auth store and no sleep-time orchestrator are set up, the monitor is a
+        // WebSocket upgrade, the planner takes its own query language, and no memory
+        // carries the external id asked for. The admin export opens the engine's files
+        // beside the live store, which redb, one open per database, refuses.
+        let serves_redb = harness.state().server_config().effective_storage_backend
+            == crate::config::StorageBackend::Redb;
+        let unanswerable = |template: &str| {
+            ["/api/user_auth/", "/api/sleep_time/", "/api/query/"]
+                .iter()
+                .any(|prefix| template.starts_with(prefix))
+                || matches!(
+                    template,
+                    "/api/context/monitor" | "/api/memory/by-external-id"
+                )
+                || (serves_redb && template == "/api/admin/storage/export")
+        };
+        // Bound to the tenant as a tenant key would be: the UI routes need a binding.
+        let router = harness
+            .router()
+            .layer(axum::Extension(crate::auth::AuthenticatedUser {
+                user_id: USER.to_string(),
+            }));
+        let mut unexpected = Vec::new();
+        for (method, template, access) in ROUTES {
+            // Following and unfollowing change the very role under test.
+            let role_control = template.starts_with("/api/admin/replication/") && *method == "POST";
+            if !matches!(access, Read | Local) || role_control {
+                continue;
+            }
+            let method = if *method == "ANY" { "GET" } else { *method };
+            let path = template
+                .replace("{memory_id}", &id.to_string())
+                .replace("{user_id}", USER)
+                .replace("{ticket}", "no-such-ticket")
+                .replace("{*path}", "no-such-path");
+            let request = HttpRequest::builder()
+                .method(method)
+                .uri(format!("{path}?user_id={USER}&external_id=crane-log"))
+                .header("x-api-key", TEST_API_KEY)
+                .header(ADMIN_API_KEY_HEADER, ADMIN_KEY)
+                .header(CONTENT_TYPE, "application/json")
+                .body(if method == "GET" {
+                    Body::empty()
+                } else {
+                    Body::from(body_for(template).to_string())
+                })
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            // An event stream never ends; its headers are the whole answer.
+            let streams = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+            let code = if streams {
+                None
+            } else {
+                let bytes =
+                    tokio::time::timeout(Duration::from_secs(60), response.into_body().collect())
+                        .await
+                        .unwrap_or_else(|_| panic!("{method} {template} did not answer"))
+                        .unwrap()
+                        .to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|b| b["code"].as_str().map(str::to_string))
+            };
+            assert!(
+                !matches!(code.as_deref(), Some(READ_ONLY_REPLICA | NOT_REPLICATED)),
+                "{method} {template} is {access:?} but was refused"
+            );
+            assert_eq!(
+                footprint(&harness),
+                before,
+                "{method} {template} ({status}) wrote on a follower"
+            );
+            if !status.is_success() && !unanswerable(template) {
+                unexpected.push(format!("{method} {template} {status}"));
+            }
+        }
+        std::env::remove_var(ADMIN_API_KEY_ENV);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            footprint(&harness),
+            before,
+            "a write landed after its reply"
+        );
+        assert!(harness.state().replication.is_following());
+        assert!(
+            unexpected.is_empty(),
+            "routes the sweep's requests did not exercise: {unexpected:#?}"
+        );
     }
 
     #[tokio::test]
