@@ -4981,9 +4981,6 @@ impl MultiUserMemoryManager {
         let mut declared_weight: Vec<Option<f32>> = Vec::new();
         // Per entry: a derived entity already at the degree cap takes no new edges.
         let mut at_cap: Vec<bool> = Vec::new();
-        // Per entry: the episodes that have mentioned the entity, this one included (the
-        // document frequency of the PMI gate). Declared entries are exempt and hold 1.
-        let mut mentions: Vec<usize> = Vec::new();
         // Per entry: selectivity from the last heavy maintenance cycle, None when unscored.
         // Declared entries are exempt and hold None.
         let mut selectivity: Vec<Option<f32>> = Vec::new();
@@ -5007,19 +5004,10 @@ impl MultiUserMemoryManager {
                             false
                         }
                     };
-                    let mention_count = match graph_guard.get_entity(&uuid) {
-                        Ok(Some(node)) => node.mention_count,
-                        Ok(None) => 1,
-                        Err(e) => {
-                            tracing::debug!("Mention count read failed for {}: {}", name, e);
-                            1
-                        }
-                    };
                     selectivity.push(graph_guard.entity_selectivity(&uuid));
                     entity_uuids.push((name, uuid));
                     declared_weight.push(None);
                     at_cap.push(hub);
-                    mentions.push(mention_count);
                     primary_label.push(label);
                 }
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
@@ -5036,7 +5024,6 @@ impl MultiUserMemoryManager {
                     entity_uuids.push((name, uuid));
                     declared_weight.push(Some(weight));
                     at_cap.push(false);
-                    mentions.push(1);
                     selectivity.push(None);
                     primary_label.push(label);
                 }
@@ -5079,7 +5066,31 @@ impl MultiUserMemoryManager {
             }
         }
         // N of the PMI gate: the user's episodes, this one included.
-        let total_episodes = graph_guard.total_episode_count().max(1) as f32;
+        let total = graph_guard.total_episode_count().max(1);
+        let total_episodes = total as f32;
+        // Its df: the live episodes linking each entity, this one included, from the
+        // entity->episode index. `mention_count` overcounts, since an upsert's rebuild
+        // re-mentions every entity of the episode it replaces, and repeated upserts could push
+        // an entity past every partner's PMI floor. Read only for entries the gate can see: a
+        // hub past the cap takes no edge and a declared entity is exempt.
+        let mentions: Vec<usize> = (0..entity_uuids.len())
+            .map(|k| {
+                if !admission.pmi_gate || at_cap[k] || declared_weight[k].is_some() {
+                    return 1;
+                }
+                graph_guard
+                    .entity_episode_count(&entity_uuids[k].1)
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(
+                            "Episode count read failed for {}: {}",
+                            entity_uuids[k].0,
+                            e
+                        );
+                        1
+                    })
+                    .clamp(1, total)
+            })
+            .collect();
 
         // Create relationships between co-occurring entities
         // Pre-compute truncated context once (avoids re-allocating per edge)
@@ -6612,6 +6623,44 @@ mod graph_admission_tests {
             joined(&mgr, "Xavier", "Zelda"),
             "a rare newcomer is still joined"
         );
+    }
+
+    /// An upsert rebuilds its episode and re-mentions every entity in it. Five rebuilds left
+    /// Xavier's `mention_count` at six against two episodes, which put every new partner under
+    /// the PMI floor; the episode count leaves him as rare as one write did.
+    #[test]
+    fn rebuilding_an_episode_does_not_make_its_entities_common() {
+        let mut gated = legacy();
+        gated.pmi_gate = true;
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let experience = Experience {
+            content: "Xavier and Abel met.".into(),
+            ner_entities: vec![person("Xavier"), person("Abel")],
+            ..Default::default()
+        };
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(USER, &experience, &id, &[], None, gated)
+            .unwrap();
+        for _ in 0..5 {
+            mgr.rebuild_experience_graph(USER, &experience, &id)
+                .unwrap();
+        }
+        let graph = mgr.get_user_graph(USER).unwrap();
+        let xavier = graph
+            .read()
+            .find_entity_by_name_strict("Xavier")
+            .unwrap()
+            .expect("node");
+        assert!(
+            xavier.mention_count >= 6,
+            "precondition: {}",
+            xavier.mention_count
+        );
+        assert_eq!(graph.read().entity_episode_count(&xavier.uuid).unwrap(), 1);
+
+        write_people(&mgr, &["Xavier", "Yusuf"], gated);
+        assert!(joined(&mgr, "Xavier", "Yusuf"));
     }
 
     /// Two star hubs, each joined to three one-edge leaves, score selectivity 0 once a

@@ -4167,6 +4167,20 @@ impl GraphMemory {
         Ok(())
     }
 
+    /// Episodes that link an entity now, counted from the entity→episode index without loading
+    /// them: the entity's document frequency. Unlike `mention_count`, which every `add_entity`
+    /// raises, it does not grow when an upsert rebuilds an episode, and it falls when an
+    /// episode is deleted.
+    pub fn entity_episode_count(&self, entity_uuid: &Uuid) -> Result<usize> {
+        let prefix = format!("{entity_uuid}:");
+        Ok(self
+            .store
+            .scan_cf(CF_ENTITY_EPISODES, Some(prefix.as_bytes()), None)?
+            .iter()
+            .take_while(|(key, _)| key.starts_with(prefix.as_bytes()))
+            .count())
+    }
+
     /// Number of edges indexed against an entity, counted from the entity→edge index without
     /// loading the edges.
     pub fn entity_degree(&self, entity_uuid: &Uuid) -> Result<usize> {
