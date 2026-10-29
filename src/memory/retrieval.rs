@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::introspection::ConsolidationEventBuffer;
+use super::recall::order_score_ties_by_content;
 use super::storage::SearchCriteria;
 use super::types::*;
 use crate::constants::{
@@ -1531,7 +1532,7 @@ impl RetrievalEngine {
         // but whose best single chunk only scores 0.3 should outrank a memory with
         // one chunk at 0.35 and nothing else. When a memory has multiple high-scoring
         // chunks, this is evidence of distributed relevance across the content.
-        let mut memory_ids: Vec<(MemoryId, f32)> = all_chunk_scores
+        let memory_ids: Vec<(MemoryId, f32)> = all_chunk_scores
             .into_iter()
             .map(|(id, mut scores)| {
                 scores.sort_by(|a, b| b.total_cmp(a));
@@ -1545,11 +1546,8 @@ impl RetrievalEngine {
                 (id, agg)
             })
             .collect();
-        // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
 
-        Ok(memory_ids)
+        Ok(self.rank_by_similarity(memory_ids, limit))
     }
 
     /// Search secondary Vamana index only (768d Nomic embeddings)
@@ -1595,12 +1593,7 @@ impl RetrievalEngine {
             }
         }
 
-        // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
-
-        Ok(memory_ids)
+        Ok(self.rank_by_similarity(best_scores.into_iter().collect(), limit))
     }
 
     /// Search the *primary* Vamana index using a query text encoded with the
@@ -1611,8 +1604,8 @@ impl RetrievalEngine {
     /// caller's fallback.
     ///
     /// Mirrors `search_ids_secondary`: distance is inverted to similarity,
-    /// duplicate `MemoryId`s are kept at max similarity, ties are broken by id
-    /// for deterministic ordering.
+    /// duplicate `MemoryId`s are kept at max similarity, ties are ordered by
+    /// content.
     pub fn search_ids_aligned(
         &self,
         query_text: &str,
@@ -1653,12 +1646,26 @@ impl RetrievalEngine {
             }
         }
 
-        // Tie-break by MemoryId for deterministic rank order (RH-10).
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
+        Ok(self.rank_by_similarity(best_scores.into_iter().collect(), limit))
+    }
 
-        Ok(memory_ids)
+    /// A vector leg in similarity order, cut to `limit`. Equal similarities order by content
+    /// (RH-10, [`order_score_ties_by_content`]), so neither the ranks nor the cut depend on the
+    /// ids the memories were minted with.
+    fn rank_by_similarity(
+        &self,
+        mut ranked: Vec<(MemoryId, f32)>,
+        limit: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        order_score_ties_by_content(&mut ranked, &|id| {
+            self.storage
+                .get(id)
+                .ok()
+                .map(|memory| memory.experience.content)
+        });
+        ranked.truncate(limit);
+        ranked
     }
 
     /// Get memory from storage by ID
@@ -1726,13 +1733,7 @@ impl RetrievalEngine {
             }
         }
 
-        // Convert to vec and sort by similarity descending (highest first).
-        // Tie-break by MemoryId for deterministic rank order across runs/CPUs (RH-10).
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
-
-        Ok(memory_ids)
+        Ok(self.rank_by_similarity(best_scores.into_iter().collect(), limit))
     }
 
     /// Search for memories using multiple retrieval modes (zero-copy with Arc)
