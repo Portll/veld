@@ -399,6 +399,17 @@ pub const GRAPH_SELECTIVITY_SKIP_ENV: &str = "VELD_GRAPH_SELECTIVITY_SKIP";
 /// `CURVATURE_MIN_EDGES`): below it the degree distribution has no spread to read.
 pub const CURVATURE_MIN_EDGES: usize = 10;
 
+/// Env switch for label-pair typing (upstream #259/#260): a co-occurrence edge the sentence does
+/// not type takes the relation its endpoints' labels imply (`Person`-`Location` is `LocatedIn`,
+/// `Person`-`Organization` is `WorksAt`; see `graph_memory::infer_relation_type_for_pair`).
+/// `0` or `false` leaves such edges `RelatedTo`. On by default.
+pub const GRAPH_LABEL_PAIR_TYPING_ENV: &str = "VELD_GRAPH_LABEL_PAIR_TYPING";
+
+/// Env switch typing two people `Knows` by label alone: `1` or `true` turns it on. Off by
+/// default, as upstream keeps it: a typed edge is eligible for the ontological penalties a
+/// generic one is spared, and conversational corpora are mostly person pairs.
+pub const GRAPH_PERSON_PERSON_KNOWS_ENV: &str = "SHODH_PERSON_PERSON_KNOWS";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay

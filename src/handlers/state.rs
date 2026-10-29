@@ -4964,9 +4964,17 @@ impl MultiUserMemoryManager {
         // Per entry: selectivity from the last heavy maintenance cycle, None when unscored.
         // Declared entries are exempt and hold None.
         let mut selectivity: Vec<Option<f32>> = Vec::new();
+        // Per entry: the label this memory gave the entity, which types its edges by label
+        // pair. The stored node may carry more, merged from other memories.
+        let mut primary_label: Vec<EntityLabel> = Vec::new();
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
+            let label = entity
+                .labels
+                .first()
+                .cloned()
+                .unwrap_or(EntityLabel::Concept);
             match graph_guard.add_entity(entity) {
                 Ok(uuid) => {
                     let hub = match graph_guard.entity_degree(&uuid) {
@@ -4989,11 +4997,17 @@ impl MultiUserMemoryManager {
                     declared_weight.push(None);
                     at_cap.push(hub);
                     mentions.push(mention_count);
+                    primary_label.push(label);
                 }
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
             }
         }
         for (name, entity, weight) in declared_nodes {
+            let label = entity
+                .labels
+                .first()
+                .cloned()
+                .unwrap_or(EntityLabel::Concept);
             match graph_guard.add_entity(entity) {
                 Ok(uuid) => {
                     entity_uuids.push((name, uuid));
@@ -5001,6 +5015,7 @@ impl MultiUserMemoryManager {
                     at_cap.push(false);
                     mentions.push(1);
                     selectivity.push(None);
+                    primary_label.push(label);
                 }
                 Err(e) => tracing::debug!("Failed to add declared entity {}: {}", name, e),
             }
@@ -5140,7 +5155,22 @@ impl MultiUserMemoryManager {
                 } else {
                     None
                 };
-                let relation_type = match cue_hit {
+                // Typing chain, upstream's order: the sentence's cue, then the label pair
+                // (upstream #259/#260). A fragment of a co-mentioned name is never typed.
+                let label_hit = if cue_hit.is_none()
+                    && admission.label_pair_typing
+                    && !fragment_of_comention[i]
+                    && !fragment_of_comention[j]
+                {
+                    crate::graph_memory::infer_relation_type_for_pair(
+                        &primary_label[i],
+                        &primary_label[j],
+                        admission.person_person_knows,
+                    )
+                } else {
+                    None
+                };
+                let relation_type = match cue_hit.or(label_hit) {
                     Some((rt, a_is_source)) => {
                         if !a_is_source {
                             std::mem::swap(&mut from_entity, &mut to_entity);
@@ -5982,6 +6012,10 @@ struct GraphAdmission {
     pmi_gate_min: f32,
     /// No edge between two entities a heavy cycle scored as low-selectivity hubs.
     selectivity_skip: bool,
+    /// An edge the sentence does not type takes the type its label pair implies.
+    label_pair_typing: bool,
+    /// Two people are typed `Knows` (off: upstream).
+    person_person_knows: bool,
 }
 
 impl GraphAdmission {
@@ -5996,6 +6030,8 @@ impl GraphAdmission {
             pmi_gate: env_switch(c::GRAPH_PMI_GATE_ENV, true),
             pmi_gate_min: env_number(c::GRAPH_PMI_GATE_MIN_ENV, c::GRAPH_PMI_GATE_MIN),
             selectivity_skip: env_switch(c::GRAPH_SELECTIVITY_SKIP_ENV, true),
+            label_pair_typing: env_switch(c::GRAPH_LABEL_PAIR_TYPING_ENV, true),
+            person_person_knows: env_switch(c::GRAPH_PERSON_PERSON_KNOWS_ENV, false),
         }
     }
 }
@@ -6236,6 +6272,7 @@ mod graph_admission_tests {
         admission.hub_degree_max = crate::constants::MAX_ENTITY_DEGREE - 1;
         admission.pmi_gate = false;
         admission.selectivity_skip = false;
+        admission.label_pair_typing = false;
         admission
     }
 
@@ -6433,6 +6470,49 @@ mod graph_admission_tests {
             assert_eq!(graph.read().compute_entity_selectivity().unwrap(), 8);
             write_people(&mgr, &["Hubert", "Horace"], admission);
             assert_eq!(joined(&mgr, "Hubert", "Horace"), hubs_joined);
+        }
+    }
+
+    /// The place is listed first; the edge still points from the person.
+    #[test]
+    fn an_untyped_pair_takes_the_relation_its_labels_imply() {
+        let place = NerEntityRecord {
+            text: "Boston".to_string(),
+            entity_type: "LOC".to_string(),
+            confidence: 0.8,
+            start_char: None,
+            end_char: None,
+        };
+        for (typing, expected) in [
+            (true, RelationType::LocatedIn),
+            (false, RelationType::RelatedTo),
+        ] {
+            let mut admission = GraphAdmission::from_env();
+            admission.label_pair_typing = typing;
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            let experience = Experience {
+                content: "Boston is where Caroline lives now.".into(),
+                ner_entities: vec![place.clone(), person("Caroline")],
+                ..Default::default()
+            };
+            let id = MemoryId(uuid::Uuid::new_v4());
+            mgr.build_experience_graph(USER, &experience, &id, &[], None, admission)
+                .unwrap();
+
+            let graph = mgr.get_user_graph(USER).unwrap();
+            let graph = graph.read();
+            let caroline = graph
+                .find_entity_by_name_strict("Caroline")
+                .unwrap()
+                .unwrap()
+                .uuid;
+            let edges = graph.get_all_relationships().unwrap();
+            assert_eq!(edges.len(), 1, "{edges:?}");
+            assert_eq!(edges[0].relation_type, expected);
+            if typing {
+                assert_eq!(edges[0].from_entity, caroline);
+            }
         }
     }
 }
