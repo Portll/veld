@@ -9,13 +9,13 @@
       "method": "GET",
       "path": "/api/ab/summary",
       "handler": "ab_testing::get_ab_summary",
-      "response": "serde_json::Value"
+      "response": "AbSummaryResponse"
     },
     {
       "method": "GET",
       "path": "/api/ab/tests",
       "handler": "ab_testing::list_ab_tests",
-      "response": "serde_json::Value"
+      "response": "AbTestListResponse"
     },
     {
       "method": "POST",
@@ -42,7 +42,7 @@
       "path_param_names": [
         "test_id"
       ],
-      "response": "serde_json::Value"
+      "response": "AbTestDetailResponse"
     },
     {
       "method": "GET",
@@ -52,7 +52,7 @@
       "path_param_names": [
         "test_id"
       ],
-      "response": "serde_json::Value"
+      "response": "AbTestAnalysisResponse"
     },
     {
       "method": "POST",
@@ -63,7 +63,7 @@
       "path_param_names": [
         "test_id"
       ],
-      "response": "serde_json::Value"
+      "response": "AbRecordResponse"
     },
     {
       "method": "POST",
@@ -73,7 +73,7 @@
       "path_param_names": [
         "test_id"
       ],
-      "response": "serde_json::Value"
+      "response": "AbTestCompleteResponse"
     },
     {
       "method": "POST",
@@ -84,7 +84,7 @@
       "path_param_names": [
         "test_id"
       ],
-      "response": "serde_json::Value"
+      "response": "AbRecordResponse"
     },
     {
       "method": "POST",
@@ -95,7 +95,7 @@
       "path_param_names": [
         "test_id"
       ],
-      "response": "serde_json::Value"
+      "response": "AbImpressionResponse"
     },
     {
       "method": "POST",
@@ -347,7 +347,7 @@
       "path": "/api/context/status",
       "handler": "health::update_context_status",
       "body": "ContextStatusRequest",
-      "response": "serde_json::Value"
+      "response": "ContextStatusUpdateResponse"
     },
     {
       "method": "GET",
@@ -360,7 +360,7 @@
       "path": "/api/context_status",
       "handler": "health::update_context_status",
       "body": "ContextStatusRequest",
-      "response": "serde_json::Value"
+      "response": "ContextStatusUpdateResponse"
     },
     {
       "method": "POST",
@@ -456,7 +456,7 @@
       "method": "GET",
       "path": "/api/dials/schema",
       "handler": "dials::get_dials_schema",
-      "response": "serde_json::Value"
+      "response": "DialsSchemaResponse"
     },
     {
       "method": "GET",
@@ -470,7 +470,7 @@
       "path": "/api/embeddings/backlog/drain",
       "handler": "consolidation::drain_embedding_backlog",
       "body": "DrainEmbeddingBacklogRequest",
-      "response": "serde_json::Value"
+      "response": "DrainBacklogResponse"
     },
     {
       "method": "POST",
@@ -596,7 +596,7 @@
       "path": "/api/file_answer",
       "handler": "remember::file_answer",
       "body": "FileAnswerRequest",
-      "response": "serde_json::Value"
+      "response": "FileAnswerResponse"
     },
     {
       "method": "GET",
@@ -818,14 +818,14 @@
       "path": "/api/health/index",
       "handler": "health::health_index_user",
       "query": "HashMap<String, String>",
-      "response": "serde_json::Value"
+      "response": "UserIndexHealthResponse"
     },
     {
       "method": "GET",
       "path": "/api/health/ready",
       "handler": "health::health_ready_user",
       "query": "HashMap<String, String>",
-      "response": "serde_json::Value"
+      "response": "UserReadyResponse"
     },
     {
       "method": "POST",
@@ -846,7 +846,7 @@
       "path": "/api/index/reembed",
       "handler": "consolidation::reembed_all",
       "body": "RebuildIndexRequest",
-      "response": "serde_json::Value"
+      "response": "ReembedResponse"
     },
     {
       "method": "POST",
@@ -2085,19 +2085,19 @@
       "method": "GET",
       "path": "/health/index",
       "handler": "health::health_index",
-      "response": "serde_json::Value"
+      "response": "IndexHealthResponse"
     },
     {
       "method": "GET",
       "path": "/health/live",
       "handler": "health::health_live",
-      "response": "serde_json::Value"
+      "response": "LiveResponse"
     },
     {
       "method": "GET",
       "path": "/health/ready",
       "handler": "health::health_ready",
-      "response": "serde_json::Value"
+      "response": "ReadyResponse"
     },
     {
       "method": "GET",
@@ -2109,16 +2109,54 @@
       "method": "POST",
       "path": "/webhook/github",
       "handler": "integrations::github_webhook",
-      "response": "serde_json::Value"
+      "response": "WebhookResponse"
     },
     {
       "method": "POST",
       "path": "/webhook/linear",
       "handler": "integrations::linear_webhook",
-      "response": "serde_json::Value"
+      "response": "WebhookResponse"
     }
   ],
   "types": {
+    "ABTestManagerSummary": {
+      "name": "ABTestManagerSummary",
+      "file": "src/ab_testing.rs",
+      "doc": "Summary of test manager state",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "total_active",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "draft",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "running",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "paused",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "completed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "archived",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
     "ABTestResponse": {
       "name": "ABTestResponse",
       "file": "src/handlers/ab_testing.rs",
@@ -2146,6 +2184,552 @@
           "refs": [
             "String"
           ]
+        }
+      ]
+    },
+    "AbImpressionResponse": {
+      "name": "AbImpressionResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `POST /api/ab/tests/{test_id}/impression`: `variant` on success (`null` when the user has no assignment), else `message`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "variant",
+          "type": "Option<Option<String>>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "`Control` or `Treatment`.",
+          "refs": [
+            "Option",
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "message",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbRecordResponse": {
+      "name": "AbRecordResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `POST /api/ab/tests/{test_id}/click` and `.../feedback`: `message` only on failure.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "message",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbSummaryResponse": {
+      "name": "AbSummaryResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `GET /api/ab/summary`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "summary",
+          "type": "ab_testing::ABTestManagerSummary",
+          "required": true,
+          "refs": [
+            "ABTestManagerSummary"
+          ]
+        },
+        {
+          "name": "expired_tests",
+          "type": "Vec<String>",
+          "required": true,
+          "doc": "Tests this call archived for running past `max_duration_hours`.",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestAnalysis": {
+      "name": "AbTestAnalysis",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "The statistics of one test, as `analyze` and `complete` report them.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "is_significant",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "confidence_level",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "chi_squared",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "p_value",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "winner",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "`Control` or `Treatment`; absent while neither arm is ahead significantly.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "relative_improvement",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "control_ctr",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "treatment_ctr",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "confidence_interval",
+          "type": "(f64, f64)",
+          "required": true
+        },
+        {
+          "name": "recommendations",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestAnalysisResponse": {
+      "name": "AbTestAnalysisResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `GET /api/ab/tests/{test_id}/analyze`: `test_id` and `analysis` on success, else `message`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "test_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "analysis",
+          "type": "Option<AbTestAnalysis>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "AbTestAnalysis"
+          ]
+        },
+        {
+          "name": "message",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestCompleteResponse": {
+      "name": "AbTestCompleteResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `POST /api/ab/tests/{test_id}/complete`: `test_id` and `results` on success, else `message`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "test_id",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "results",
+          "type": "Option<AbTestAnalysis>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "AbTestAnalysis"
+          ]
+        },
+        {
+          "name": "message",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestDetail": {
+      "name": "AbTestDetail",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "A test as `GET /api/ab/tests/{test_id}` reports it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "description",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "`Draft`, `Running`, `Paused`, `Completed` or `Archived`.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "traffic_split",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "min_impressions",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "max_duration_hours",
+          "type": "Option<u64>",
+          "required": false,
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "control_weights",
+          "type": "relevance::LearnedSignalWeights",
+          "required": true,
+          "refs": [
+            "LearnedSignalWeights"
+          ]
+        },
+        {
+          "name": "treatment_weights",
+          "type": "relevance::LearnedSignalWeights",
+          "required": true,
+          "refs": [
+            "LearnedSignalWeights"
+          ]
+        },
+        {
+          "name": "control_metrics",
+          "type": "AbVariantMetrics",
+          "required": true,
+          "refs": [
+            "AbVariantMetrics"
+          ]
+        },
+        {
+          "name": "treatment_metrics",
+          "type": "AbVariantMetrics",
+          "required": true,
+          "refs": [
+            "AbVariantMetrics"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "started_at",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "RFC 3339.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "completed_at",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "RFC 3339.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestDetailResponse": {
+      "name": "AbTestDetailResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `GET /api/ab/tests/{test_id}`: `test` when it exists, else `message`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "test",
+          "type": "Option<AbTestDetail>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "AbTestDetail"
+          ]
+        },
+        {
+          "name": "message",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestListItem": {
+      "name": "AbTestListItem",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "One test of a `GET /api/ab/tests` reply.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "description",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "`Draft`, `Running`, `Paused`, `Completed` or `Archived`.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "traffic_split",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "control_impressions",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "treatment_impressions",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "created_at",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "AbTestListResponse": {
+      "name": "AbTestListResponse",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "Reply of `GET /api/ab/tests`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "tests",
+          "type": "Vec<AbTestListItem>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "AbTestListItem"
+          ]
+        },
+        {
+          "name": "summary",
+          "type": "ab_testing::ABTestManagerSummary",
+          "required": true,
+          "refs": [
+            "ABTestManagerSummary"
+          ]
+        }
+      ]
+    },
+    "AbVariantMetrics": {
+      "name": "AbVariantMetrics",
+      "file": "src/handlers/ab_testing.rs",
+      "doc": "One arm's counters, with its click-through rate.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "impressions",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "clicks",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "ctr",
+          "type": "f64",
+          "required": true,
+          "doc": "`clicks / impressions`, 0 when there were no impressions."
+        },
+        {
+          "name": "positive_feedback",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "negative_feedback",
+          "type": "u64",
+          "required": true
         }
       ]
     },
@@ -5946,6 +6530,23 @@
         }
       ]
     },
+    "ContextStatusUpdateResponse": {
+      "name": "ContextStatusUpdateResponse",
+      "file": "src/handlers/health.rs",
+      "doc": "Reply of `POST /api/context/status`: `Updated` with 200, `Rejected` with 400 for a `session_id` over 128 characters or 503 when 10 000 sessions are already tracked.",
+      "kind": "enum",
+      "representation": "untagged: the variant's payload alone",
+      "variants": [
+        {
+          "name": "Updated",
+          "payload": "{ success: bool, percent_used: u8 }"
+        },
+        {
+          "name": "Rejected",
+          "payload": "{ error: String }"
+        }
+      ]
+    },
     "ContextSummaryRequest": {
       "name": "ContextSummaryRequest",
       "file": "src/handlers/recall.rs",
@@ -7380,6 +7981,52 @@
         }
       ]
     },
+    "DialSlider": {
+      "name": "DialSlider",
+      "file": "src/handlers/dials.rs",
+      "doc": "The ranges of one recall slider.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "&'static str",
+          "required": true,
+          "doc": "The `CognitiveDials` field the slider sets."
+        },
+        {
+          "name": "group",
+          "type": "&'static str",
+          "required": true
+        },
+        {
+          "name": "label",
+          "type": "&'static str",
+          "required": true
+        },
+        {
+          "name": "default",
+          "type": "f64",
+          "required": true
+        },
+        {
+          "name": "recommended",
+          "type": "[f64; 2]",
+          "required": true,
+          "doc": "`[low, high]` of the recommended band."
+        },
+        {
+          "name": "absolute",
+          "type": "[f64; 2]",
+          "required": true,
+          "doc": "`[low, high]` the slider track spans."
+        },
+        {
+          "name": "step",
+          "type": "f64",
+          "required": true
+        }
+      ]
+    },
     "DialsQuery": {
       "name": "DialsQuery",
       "file": "src/handlers/dials.rs",
@@ -7392,6 +8039,23 @@
           "required": true,
           "refs": [
             "String"
+          ]
+        }
+      ]
+    },
+    "DialsSchemaResponse": {
+      "name": "DialsSchemaResponse",
+      "file": "src/handlers/dials.rs",
+      "doc": "Reply of `GET /api/dials/schema`: one entry per recall slider.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "sliders",
+          "type": "Vec<DialSlider>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "DialSlider"
           ]
         }
       ]
@@ -7480,6 +8144,31 @@
         }
       ]
     },
+    "DrainBacklogResponse": {
+      "name": "DrainBacklogResponse",
+      "file": "src/handlers/consolidation.rs",
+      "doc": "Reply of `POST /api/embeddings/backlog/drain`. `reconciled` is `null` unless the request set `reconcile`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "reconciled",
+          "type": "Option<crate::memory::embedding_backlog::ReconcileReport>",
+          "required": false,
+          "refs": [
+            "Option",
+            "ReconcileReport"
+          ]
+        },
+        {
+          "name": "drained",
+          "type": "crate::memory::embedding_backlog::DrainReport",
+          "required": true,
+          "refs": [
+            "DrainReport"
+          ]
+        }
+      ]
+    },
     "DrainEmbeddingBacklogRequest": {
       "name": "DrainEmbeddingBacklogRequest",
       "file": "src/handlers/consolidation.rs",
@@ -7507,6 +8196,50 @@
           "required": false,
           "notes": [
             "default when absent"
+          ]
+        }
+      ]
+    },
+    "DrainReport": {
+      "name": "DrainReport",
+      "file": "src/memory/embedding_backlog.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "attempted",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "drained",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "dropped",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "failed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "remaining",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "stopped",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
           ]
         }
       ]
@@ -10222,6 +10955,43 @@
         }
       ]
     },
+    "FileAnswerResponse": {
+      "name": "FileAnswerResponse",
+      "file": "src/handlers/remember.rs",
+      "doc": "Reply of `POST /api/file_answer`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "doc": "The memory written.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "is_derived",
+          "type": "bool",
+          "required": true,
+          "doc": "Always true: an answer is a derived memory."
+        },
+        {
+          "name": "cited_sources",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
     "FileListResponse": {
       "name": "FileListResponse",
       "file": "src/handlers/files.rs",
@@ -11494,6 +12264,29 @@
         }
       ]
     },
+    "GraphCounts": {
+      "name": "GraphCounts",
+      "file": "src/handlers/health.rs",
+      "doc": "Node and edge counts of a tenant's graph.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entity_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "relationship_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "episode_count",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
     "GraphDataResponse": {
       "name": "GraphDataResponse",
       "file": "src/handlers/visualization.rs",
@@ -12115,6 +12908,94 @@
           "required": false,
           "notes": [
             "default when absent"
+          ]
+        }
+      ]
+    },
+    "IndexCoverage": {
+      "name": "IndexCoverage",
+      "file": "src/handlers/health.rs",
+      "doc": "Populations, not error counts: a memory stored and never indexed is unretrievable and raises nothing for a counter to see.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "stored",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "vector_indexed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "lexically_indexed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "shortfall",
+          "type": "bool",
+          "required": true,
+          "doc": "True when either index holds fewer memories than the store."
+        }
+      ]
+    },
+    "IndexHealthResponse": {
+      "name": "IndexHealthResponse",
+      "file": "src/handlers/health.rs",
+      "doc": "Reply of `GET /health/index`: vector-index health summed over the cached tenants.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "&'static str",
+          "required": true,
+          "doc": "Always `ok`."
+        },
+        {
+          "name": "users_checked",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "total_vectors",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "total_incremental_inserts",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "users_needing_rebuild_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "users_with_index_shortfall_count",
+          "type": "usize",
+          "required": true,
+          "doc": "Tenants with memories stored but not in the vector or lexical index."
+        },
+        {
+          "name": "users_coverage_unreadable_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "rebuild_threshold",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "timestamp",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
+            "String"
           ]
         }
       ]
@@ -14360,6 +15241,29 @@
           ],
           "refs": [
             "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "LiveResponse": {
+      "name": "LiveResponse",
+      "file": "src/handlers/health.rs",
+      "doc": "Reply of `GET /health/live`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "&'static str",
+          "required": true,
+          "doc": "Always `alive`."
+        },
+        {
+          "name": "timestamp",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
             "String"
           ]
         }
@@ -19788,6 +20692,72 @@
         }
       ]
     },
+    "ReadyResponse": {
+      "name": "ReadyResponse",
+      "file": "src/handlers/health.rs",
+      "doc": "Reply of `GET /health/ready`. `reason` and `hard_latched_stores` appear only while a store's write latch is hard-set, with the 503 that goes with it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "&'static str",
+          "required": true,
+          "doc": "`ready`, `not_ready` or `degraded`."
+        },
+        {
+          "name": "version",
+          "type": "&'static str",
+          "required": true
+        },
+        {
+          "name": "effective_storage_backend",
+          "type": "&'static str",
+          "required": true
+        },
+        {
+          "name": "users_in_cache",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "tenant_open_waiters",
+          "type": "usize",
+          "required": true,
+          "doc": "Requests waiting for a tenant store to open."
+        },
+        {
+          "name": "timestamp",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "Option<&'static str>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "hard_latched_stores",
+          "type": "Option<usize>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option"
+          ]
+        }
+      ]
+    },
     "Reason": {
       "name": "Reason",
       "file": "src/entity_hygiene.rs",
@@ -20956,6 +21926,43 @@
         }
       ]
     },
+    "ReconcileReport": {
+      "name": "ReconcileReport",
+      "file": "src/memory/embedding_backlog.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "stored",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "indexed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "enqueued",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "dropped_indexed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "dropped_gone",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "pending",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
     "RecordClickRequest": {
       "name": "RecordClickRequest",
       "file": "src/handlers/ab_testing.rs",
@@ -21182,6 +22189,31 @@
             "Option",
             "String"
           ]
+        }
+      ]
+    },
+    "ReembedResponse": {
+      "name": "ReembedResponse",
+      "file": "src/handlers/consolidation.rs",
+      "doc": "Reply of `POST /api/index/reembed`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "reembedded",
+          "type": "usize",
+          "required": true,
+          "doc": "Memories embedded again."
+        },
+        {
+          "name": "failed",
+          "type": "usize",
+          "required": true,
+          "doc": "Memories whose embedding failed; they keep their previous vector."
         }
       ]
     },
@@ -23595,6 +24627,29 @@
           "notes": [
             "default when absent"
           ]
+        }
+      ]
+    },
+    "SecondaryIndexSummary": {
+      "name": "SecondaryIndexSummary",
+      "file": "src/handlers/health.rs",
+      "doc": "The secondary index, as `GET /api/health/index` summarises it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "total_vectors",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "needs_rebuild",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "deletion_ratio",
+          "type": "f32",
+          "required": true
         }
       ]
     },
@@ -27779,6 +28834,306 @@
         }
       ]
     },
+    "UserIndexHealth": {
+      "name": "UserIndexHealth",
+      "file": "src/handlers/health.rs",
+      "doc": "Vector-index health of one tenant.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "total_vectors",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "incremental_inserts",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "deletion_ratio",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "needs_rebuild",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "needs_compaction",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "secondary",
+          "type": "Option<UserSecondaryIndexHealth>",
+          "required": false,
+          "doc": "`null` when there is no secondary index.",
+          "refs": [
+            "Option",
+            "UserSecondaryIndexHealth"
+          ]
+        }
+      ]
+    },
+    "UserIndexHealthResponse": {
+      "name": "UserIndexHealthResponse",
+      "file": "src/handlers/health.rs",
+      "doc": "Reply of `GET /api/health/index`: one tenant's index coverage and health.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "doc": "Always `ok`.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "index_coverage",
+          "type": "IndexCoverage",
+          "required": true,
+          "refs": [
+            "IndexCoverage"
+          ]
+        },
+        {
+          "name": "total_vectors",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "incremental_inserts",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "needs_rebuild",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "rebuild_threshold",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "degradation_percent",
+          "type": "f64",
+          "required": true,
+          "doc": "`incremental_inserts` as a percentage of `rebuild_threshold`, capped at 100."
+        },
+        {
+          "name": "secondary",
+          "type": "Option<SecondaryIndexSummary>",
+          "required": false,
+          "doc": "`null` when there is no secondary index.",
+          "refs": [
+            "Option",
+            "SecondaryIndexSummary"
+          ]
+        },
+        {
+          "name": "timestamp",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "UserMemoryCounts": {
+      "name": "UserMemoryCounts",
+      "file": "src/handlers/health.rs",
+      "doc": "Memory counts of one tenant.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "total_memories",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "working_memory_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "session_memory_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "long_term_memory_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "vector_index_count",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
+    "UserReadyResponse": {
+      "name": "UserReadyResponse",
+      "file": "src/handlers/health.rs",
+      "doc": "Reply of `GET /api/health/ready`. The counters are present only when the tenant is cached and its store is not locked; `reason` says why they are absent.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "&'static str",
+          "required": true,
+          "doc": "`ready` or `not_ready`: the server, not the tenant."
+        },
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "user_ready",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "cached",
+          "type": "bool",
+          "required": true,
+          "doc": "Whether the tenant's store is open in memory."
+        },
+        {
+          "name": "exists_on_disk",
+          "type": "Option<bool>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Only when not cached.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "Option<&'static str>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "memory_stats",
+          "type": "Option<UserMemoryCounts>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "UserMemoryCounts"
+          ]
+        },
+        {
+          "name": "index_health",
+          "type": "Option<UserIndexHealth>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "UserIndexHealth"
+          ]
+        },
+        {
+          "name": "graph_stats",
+          "type": "Option<Option<GraphCounts>>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Present with the counters; `null` when the tenant has no graph.",
+          "refs": [
+            "Option",
+            "Option",
+            "GraphCounts"
+          ]
+        },
+        {
+          "name": "timestamp",
+          "type": "String",
+          "required": true,
+          "doc": "RFC 3339.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "UserSecondaryIndexHealth": {
+      "name": "UserSecondaryIndexHealth",
+      "file": "src/handlers/health.rs",
+      "doc": "Health of a tenant's secondary vector index.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "total_vectors",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "incremental_inserts",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "deletion_ratio",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "needs_rebuild",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "needs_compaction",
+          "type": "bool",
+          "required": true
+        }
+      ]
+    },
     "UserTodoStats": {
       "name": "UserTodoStats",
       "file": "src/memory/todos.rs",
@@ -28135,6 +29490,90 @@
           "name": "why",
           "type": "bool",
           "required": true
+        }
+      ]
+    },
+    "WebhookResponse": {
+      "name": "WebhookResponse",
+      "file": "src/handlers/integrations.rs",
+      "doc": "Reply of `POST /webhook/linear` and `POST /webhook/github`.",
+      "kind": "enum",
+      "representation": "untagged: the variant's payload alone",
+      "variants": [
+        {
+          "name": "Stored",
+          "payload": "WebhookStored",
+          "doc": "`status` is `success`: the event was written as a memory."
+        },
+        {
+          "name": "Acknowledged",
+          "payload": "{ status: String, action: String }",
+          "doc": "`status` is `acknowledged`: the event needs no memory (a removal)."
+        },
+        {
+          "name": "Ignored",
+          "payload": "{ status: String, reason: String }",
+          "doc": "`status` is `ignored`: an event type the webhook does not process."
+        }
+      ]
+    },
+    "WebhookStored": {
+      "name": "WebhookStored",
+      "file": "src/handlers/integrations.rs",
+      "doc": "The memory a webhook event was written to.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "external_id",
+          "type": "String",
+          "required": true,
+          "doc": "`linear:<identifier>` or `github:<owner>/<repo>#<number>`.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "was_update",
+          "type": "bool",
+          "required": true,
+          "doc": "True when a memory with that `external_id` already existed and was updated."
+        },
+        {
+          "name": "action",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "event_type",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "GitHub only: `issues` or `pull_request`.",
+          "refs": [
+            "Option",
+            "String"
+          ]
         }
       ]
     },

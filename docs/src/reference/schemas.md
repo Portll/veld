@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **537** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **570** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -18,16 +18,16 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/api/ab/summary` | none | `serde_json::Value` |
-| `GET` | `/api/ab/tests` | none | `serde_json::Value` |
+| `GET` | `/api/ab/summary` | none | [`AbSummaryResponse`](#absummaryresponse) |
+| `GET` | `/api/ab/tests` | none | [`AbTestListResponse`](#abtestlistresponse) |
 | `POST` | `/api/ab/tests` | body [`CreateABTestRequest`](#createabtestrequest) | [`ABTestResponse`](#abtestresponse) |
 | `DELETE` | `/api/ab/tests/{test_id}` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
-| `GET` | `/api/ab/tests/{test_id}` | path `{test_id: String}` | `serde_json::Value` |
-| `GET` | `/api/ab/tests/{test_id}/analyze` | path `{test_id: String}` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/click` | body [`RecordClickRequest`](#recordclickrequest); path `{test_id: String}` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/complete` | path `{test_id: String}` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/feedback` | body [`RecordFeedbackRequest`](#recordfeedbackrequest); path `{test_id: String}` | `serde_json::Value` |
-| `POST` | `/api/ab/tests/{test_id}/impression` | body [`RecordImpressionRequest`](#recordimpressionrequest); path `{test_id: String}` | `serde_json::Value` |
+| `GET` | `/api/ab/tests/{test_id}` | path `{test_id: String}` | [`AbTestDetailResponse`](#abtestdetailresponse) |
+| `GET` | `/api/ab/tests/{test_id}/analyze` | path `{test_id: String}` | [`AbTestAnalysisResponse`](#abtestanalysisresponse) |
+| `POST` | `/api/ab/tests/{test_id}/click` | body [`RecordClickRequest`](#recordclickrequest); path `{test_id: String}` | [`AbRecordResponse`](#abrecordresponse) |
+| `POST` | `/api/ab/tests/{test_id}/complete` | path `{test_id: String}` | [`AbTestCompleteResponse`](#abtestcompleteresponse) |
+| `POST` | `/api/ab/tests/{test_id}/feedback` | body [`RecordFeedbackRequest`](#recordfeedbackrequest); path `{test_id: String}` | [`AbRecordResponse`](#abrecordresponse) |
+| `POST` | `/api/ab/tests/{test_id}/impression` | body [`RecordImpressionRequest`](#recordimpressionrequest); path `{test_id: String}` | [`AbImpressionResponse`](#abimpressionresponse) |
 | `POST` | `/api/ab/tests/{test_id}/pause` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
 | `POST` | `/api/ab/tests/{test_id}/resume` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
 | `POST` | `/api/ab/tests/{test_id}/start` | path `{test_id: String}` | [`ABTestResponse`](#abtestresponse) |
@@ -106,14 +106,14 @@ The request and response shape of every HTTP route, read from the handler signat
 | `GET` | `/api/context/monitor` | none | `opaque` |
 | `GET` | `/api/context/sse` | none | `Sse<impl futures::Stream<Item = Result<Event, Infallible>>>` |
 | `GET` | `/api/context/status` | none | Vec&lt;[`ContextStatus`](#contextstatus)&gt; |
-| `POST` | `/api/context/status` | body [`ContextStatusRequest`](#contextstatusrequest) | `serde_json::Value` |
+| `POST` | `/api/context/status` | body [`ContextStatusRequest`](#contextstatusrequest) | [`ContextStatusUpdateResponse`](#contextstatusupdateresponse) |
 
 ### /context_status
 
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `GET` | `/api/context_status` | none | Vec&lt;[`ContextStatus`](#contextstatus)&gt; |
-| `POST` | `/api/context_status` | body [`ContextStatusRequest`](#contextstatusrequest) | `serde_json::Value` |
+| `POST` | `/api/context_status` | body [`ContextStatusRequest`](#contextstatusrequest) | [`ContextStatusUpdateResponse`](#contextstatusupdateresponse) |
 
 ### /context_summary
 
@@ -139,14 +139,14 @@ The request and response shape of every HTTP route, read from the handler signat
 |---|---|---|---|
 | `GET` | `/api/dials` | query [`DialsQuery`](#dialsquery) | [`CognitiveDials`](#cognitivedials) |
 | `PUT` | `/api/dials` | body [`SetDialsRequest`](#setdialsrequest) | [`CognitiveDials`](#cognitivedials) |
-| `GET` | `/api/dials/schema` | none | `serde_json::Value` |
+| `GET` | `/api/dials/schema` | none | [`DialsSchemaResponse`](#dialsschemaresponse) |
 
 ### /embeddings
 
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `GET` | `/api/embeddings/backlog` | query [`EmbeddingBacklogQuery`](#embeddingbacklogquery) | crate::memory::embedding_backlog::[`BacklogReport`](#backlogreport) |
-| `POST` | `/api/embeddings/backlog/drain` | body [`DrainEmbeddingBacklogRequest`](#drainembeddingbacklogrequest) | `serde_json::Value` |
+| `POST` | `/api/embeddings/backlog/drain` | body [`DrainEmbeddingBacklogRequest`](#drainembeddingbacklogrequest) | [`DrainBacklogResponse`](#drainbacklogresponse) |
 
 ### /entity
 
@@ -194,7 +194,7 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/file_answer` | body [`FileAnswerRequest`](#fileanswerrequest) | `serde_json::Value` |
+| `POST` | `/api/file_answer` | body [`FileAnswerRequest`](#fileanswerrequest) | [`FileAnswerResponse`](#fileanswerresponse) |
 
 ### /files
 
@@ -249,12 +249,12 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `GET` | `/api/health/index` | query `HashMap<String, String>` | `serde_json::Value` |
-| `GET` | `/api/health/ready` | query `HashMap<String, String>` | `serde_json::Value` |
+| `GET` | `/api/health/index` | query `HashMap<String, String>` | [`UserIndexHealthResponse`](#userindexhealthresponse) |
+| `GET` | `/api/health/ready` | query `HashMap<String, String>` | [`UserReadyResponse`](#userreadyresponse) |
 | `GET` | `/health` | none | [`HealthResponse`](#healthresponse) |
-| `GET` | `/health/index` | none | `serde_json::Value` |
-| `GET` | `/health/live` | none | `serde_json::Value` |
-| `GET` | `/health/ready` | none | `serde_json::Value` |
+| `GET` | `/health/index` | none | [`IndexHealthResponse`](#indexhealthresponse) |
+| `GET` | `/health/live` | none | [`LiveResponse`](#liveresponse) |
+| `GET` | `/health/ready` | none | [`ReadyResponse`](#readyresponse) |
 
 ### /import
 
@@ -267,7 +267,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `POST` | `/api/index/rebuild` | body [`RebuildIndexRequest`](#rebuildindexrequest) | [`RebuildIndexResponse`](#rebuildindexresponse) |
-| `POST` | `/api/index/reembed` | body [`RebuildIndexRequest`](#rebuildindexrequest) | `serde_json::Value` |
+| `POST` | `/api/index/reembed` | body [`RebuildIndexRequest`](#rebuildindexrequest) | [`ReembedResponse`](#reembedresponse) |
 | `POST` | `/api/index/repair` | body [`RepairIndexRequest`](#repairindexrequest) | [`RepairIndexResponse`](#repairindexresponse) |
 | `POST` | `/api/index/verify` | body [`VerifyIndexRequest`](#verifyindexrequest) | memory::[`IndexIntegrityReport`](#indexintegrityreport) |
 
@@ -592,8 +592,8 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/webhook/github` | none | `serde_json::Value` |
-| `POST` | `/webhook/linear` | none | `serde_json::Value` |
+| `POST` | `/webhook/github` | none | [`WebhookResponse`](#webhookresponse) |
+| `POST` | `/webhook/linear` | none | [`WebhookResponse`](#webhookresponse) |
 
 ### /wiki
 
@@ -609,6 +609,19 @@ The request and response shape of every HTTP route, read from the handler signat
 
 ## Types
 
+### ABTestManagerSummary
+
+Defined in `src/ab_testing.rs`. Summary of test manager state
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `total_active` | `usize` | yes |  |
+| `draft` | `usize` | yes |  |
+| `running` | `usize` | yes |  |
+| `paused` | `usize` | yes |  |
+| `completed` | `usize` | yes |  |
+| `archived` | `usize` | yes |  |
+
 ### ABTestResponse
 
 Defined in `src/handlers/ab_testing.rs`. Response for A/B test operations
@@ -618,6 +631,142 @@ Defined in `src/handlers/ab_testing.rs`. Response for A/B test operations
 | `success` | `bool` | yes |  |
 | `test_id` | `Option<String>` | no |  |
 | `message` | `String` | yes |  |
+
+### AbImpressionResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `POST /api/ab/tests/{test_id}/impression`: `variant` on success (`null` when the user has no assignment), else `message`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `variant` | `Option<Option<String>>` | no | omitted when empty; `Control` or `Treatment`. |
+| `message` | `Option<String>` | no | omitted when empty |
+
+### AbRecordResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `POST /api/ab/tests/{test_id}/click` and `.../feedback`: `message` only on failure.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `message` | `Option<String>` | no | omitted when empty |
+
+### AbSummaryResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `GET /api/ab/summary`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `summary` | ab_testing::[`ABTestManagerSummary`](#abtestmanagersummary) | yes |  |
+| `expired_tests` | `Vec<String>` | yes | Tests this call archived for running past `max_duration_hours`. |
+
+### AbTestAnalysis
+
+Defined in `src/handlers/ab_testing.rs`. The statistics of one test, as `analyze` and `complete` report them.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `is_significant` | `bool` | yes |  |
+| `confidence_level` | `f64` | yes |  |
+| `chi_squared` | `f64` | yes |  |
+| `p_value` | `f64` | yes |  |
+| `winner` | `Option<String>` | no | `Control` or `Treatment`; absent while neither arm is ahead significantly. |
+| `relative_improvement` | `f64` | yes |  |
+| `control_ctr` | `f64` | yes |  |
+| `treatment_ctr` | `f64` | yes |  |
+| `confidence_interval` | `(f64, f64)` | yes |  |
+| `recommendations` | `Vec<String>` | yes |  |
+
+### AbTestAnalysisResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `GET /api/ab/tests/{test_id}/analyze`: `test_id` and `analysis` on success, else `message`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `test_id` | `Option<String>` | no | omitted when empty |
+| `analysis` | Option&lt;[`AbTestAnalysis`](#abtestanalysis)&gt; | no | omitted when empty |
+| `message` | `Option<String>` | no | omitted when empty |
+
+### AbTestCompleteResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `POST /api/ab/tests/{test_id}/complete`: `test_id` and `results` on success, else `message`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `test_id` | `Option<String>` | no | omitted when empty |
+| `results` | Option&lt;[`AbTestAnalysis`](#abtestanalysis)&gt; | no | omitted when empty |
+| `message` | `Option<String>` | no | omitted when empty |
+
+### AbTestDetail
+
+Defined in `src/handlers/ab_testing.rs`. A test as `GET /api/ab/tests/{test_id}` reports it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `name` | `String` | yes |  |
+| `description` | `String` | yes |  |
+| `status` | `String` | yes | `Draft`, `Running`, `Paused`, `Completed` or `Archived`. |
+| `traffic_split` | `f32` | yes |  |
+| `min_impressions` | `u64` | yes |  |
+| `max_duration_hours` | `Option<u64>` | no |  |
+| `control_weights` | relevance::[`LearnedSignalWeights`](#learnedsignalweights) | yes |  |
+| `treatment_weights` | relevance::[`LearnedSignalWeights`](#learnedsignalweights) | yes |  |
+| `control_metrics` | [`AbVariantMetrics`](#abvariantmetrics) | yes |  |
+| `treatment_metrics` | [`AbVariantMetrics`](#abvariantmetrics) | yes |  |
+| `created_at` | `String` | yes | RFC 3339. |
+| `started_at` | `Option<String>` | no | RFC 3339. |
+| `completed_at` | `Option<String>` | no | RFC 3339. |
+
+### AbTestDetailResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `GET /api/ab/tests/{test_id}`: `test` when it exists, else `message`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `test` | Option&lt;[`AbTestDetail`](#abtestdetail)&gt; | no | omitted when empty |
+| `message` | `Option<String>` | no | omitted when empty |
+
+### AbTestListItem
+
+Defined in `src/handlers/ab_testing.rs`. One test of a `GET /api/ab/tests` reply.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `name` | `String` | yes |  |
+| `description` | `String` | yes |  |
+| `status` | `String` | yes | `Draft`, `Running`, `Paused`, `Completed` or `Archived`. |
+| `traffic_split` | `f32` | yes |  |
+| `control_impressions` | `u64` | yes |  |
+| `treatment_impressions` | `u64` | yes |  |
+| `created_at` | `String` | yes | RFC 3339. |
+
+### AbTestListResponse
+
+Defined in `src/handlers/ab_testing.rs`. Reply of `GET /api/ab/tests`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `tests` | Vec&lt;[`AbTestListItem`](#abtestlistitem)&gt; | yes |  |
+| `summary` | ab_testing::[`ABTestManagerSummary`](#abtestmanagersummary) | yes |  |
+
+### AbVariantMetrics
+
+Defined in `src/handlers/ab_testing.rs`. One arm's counters, with its click-through rate.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `impressions` | `u64` | yes |  |
+| `clicks` | `u64` | yes |  |
+| `ctr` | `f64` | yes | `clicks / impressions`, 0 when there were no impressions. |
+| `positive_feedback` | `u64` | yes |  |
+| `negative_feedback` | `u64` | yes |  |
 
 ### AddAliasRequest
 
@@ -1609,6 +1758,17 @@ Defined in `src/handlers/health.rs`. Context status request from Claude Code sta
 | `current_dir` | `Option<String>` | no |  |
 | `model` | `Option<String>` | no |  |
 
+### ContextStatusUpdateResponse
+
+Defined in `src/handlers/health.rs`. Reply of `POST /api/context/status`: `Updated` with 200, `Rejected` with 400 for a `session_id` over 128 characters or 503 when 10 000 sessions are already tracked.
+
+Enum, untagged: the variant's payload alone.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `Updated` | `{ success: bool, percent_used: u8 }` |  |
+| `Rejected` | `{ error: String }` |  |
+
 ### ContextSummaryRequest
 
 Defined in `src/handlers/recall.rs`. Context summary request
@@ -1980,6 +2140,20 @@ Defined in `src/handlers/recall.rs`. Entity detected in the query context
 | `name` | `String` | yes |  |
 | `entity_type` | `String` | yes |  |
 
+### DialSlider
+
+Defined in `src/handlers/dials.rs`. The ranges of one recall slider.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `&'static str` | yes | The `CognitiveDials` field the slider sets. |
+| `group` | `&'static str` | yes |  |
+| `label` | `&'static str` | yes |  |
+| `default` | `f64` | yes |  |
+| `recommended` | `[f64; 2]` | yes | `[low, high]` of the recommended band. |
+| `absolute` | `[f64; 2]` | yes | `[low, high]` the slider track spans. |
+| `step` | `f64` | yes |  |
+
 ### DialsQuery
 
 Defined in `src/handlers/dials.rs`. Query for `GET /api/dials`.
@@ -1987,6 +2161,14 @@ Defined in `src/handlers/dials.rs`. Query for `GET /api/dials`.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
+
+### DialsSchemaResponse
+
+Defined in `src/handlers/dials.rs`. Reply of `GET /api/dials/schema`: one entry per recall slider.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `sliders` | Vec&lt;[`DialSlider`](#dialslider)&gt; | yes |  |
 
 ### DismissReminderRequest
 
@@ -2009,6 +2191,15 @@ Defined in `src/memory/types.rs`. Document-specific context
 | `citations` | `Vec<String>` | yes | Citations/references |
 | `categories` | `Vec<String>` | yes | Document tags/categories |
 
+### DrainBacklogResponse
+
+Defined in `src/handlers/consolidation.rs`. Reply of `POST /api/embeddings/backlog/drain`. `reconciled` is `null` unless the request set `reconcile`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `reconciled` | Option&lt;crate::memory::embedding_backlog::[`ReconcileReport`](#reconcilereport)&gt; | no |  |
+| `drained` | crate::memory::embedding_backlog::[`DrainReport`](#drainreport) | yes |  |
+
 ### DrainEmbeddingBacklogRequest
 
 Defined in `src/handlers/consolidation.rs`.
@@ -2018,6 +2209,19 @@ Defined in `src/handlers/consolidation.rs`.
 | `user_id` | `String` | yes |  |
 | `limit` | `Option<usize>` | no |  |
 | `reconcile` | `bool` | no | default when absent |
+
+### DrainReport
+
+Defined in `src/memory/embedding_backlog.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `attempted` | `usize` | yes |  |
+| `drained` | `usize` | yes |  |
+| `dropped` | `usize` | yes |  |
+| `failed` | `usize` | yes |  |
+| `remaining` | `usize` | yes |  |
+| `stopped` | `Option<String>` | no | omitted when empty |
 
 ### DropDatasetResponse
 
@@ -2693,6 +2897,17 @@ Defined in `src/handlers/remember.rs`. Request to file a synthesised answer as a
 | `cited_sources` | `Vec<String>` | no | default when absent; Memory ids that fed the synthesis. Recorded as `src:<id>` tags. |
 | `memory_type` | `Option<String>` | no | default when absent; Optional experience type (default `Learning`). |
 
+### FileAnswerResponse
+
+Defined in `src/handlers/remember.rs`. Reply of `POST /api/file_answer`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `id` | `String` | yes | The memory written. |
+| `is_derived` | `bool` | yes | Always true: an answer is a derived memory. |
+| `cited_sources` | `Vec<String>` | yes |  |
+
 ### FileListResponse
 
 Defined in `src/handlers/files.rs`. Response for file list operations
@@ -3041,6 +3256,16 @@ Defined in `src/memory/facets.rs`. A reference to a goal a record served.
 | `id` | `String` | yes | Stable identifier — a Plan record id, or a free-form name until goals get a first-class record kind. |
 | `label` | `Option<String>` | no | Optional human-readable label. |
 
+### GraphCounts
+
+Defined in `src/handlers/health.rs`. Node and edge counts of a tenant's graph.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entity_count` | `usize` | yes |  |
+| `relationship_count` | `usize` | yes |  |
+| `episode_count` | `usize` | yes |  |
+
 ### GraphDataResponse
 
 Defined in `src/handlers/visualization.rs`. Graph data response for d3.js
@@ -3218,6 +3443,33 @@ Defined in `src/handlers/files.rs`. Request to scan/index a codebase
 | `user_id` | `String` | yes |  |
 | `codebase_path` | `String` | yes |  |
 | `force` | `bool` | no | default when absent |
+
+### IndexCoverage
+
+Defined in `src/handlers/health.rs`. Populations, not error counts: a memory stored and never indexed is unretrievable and raises nothing for a counter to see.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `stored` | `usize` | yes |  |
+| `vector_indexed` | `usize` | yes |  |
+| `lexically_indexed` | `usize` | yes |  |
+| `shortfall` | `bool` | yes | True when either index holds fewer memories than the store. |
+
+### IndexHealthResponse
+
+Defined in `src/handlers/health.rs`. Reply of `GET /health/index`: vector-index health summed over the cached tenants.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | `&'static str` | yes | Always `ok`. |
+| `users_checked` | `usize` | yes |  |
+| `total_vectors` | `usize` | yes |  |
+| `total_incremental_inserts` | `usize` | yes |  |
+| `users_needing_rebuild_count` | `usize` | yes |  |
+| `users_with_index_shortfall_count` | `usize` | yes | Tenants with memories stored but not in the vector or lexical index. |
+| `users_coverage_unreadable_count` | `usize` | yes |  |
+| `rebuild_threshold` | `usize` | yes |  |
+| `timestamp` | `String` | yes | RFC 3339. |
 
 ### IndexIntegrityReport
 
@@ -3823,6 +4075,15 @@ Defined in `src/handlers/todos.rs`. Request to list todos with filters
 | `parent_id` | `Option<String>` | no | default when absent |
 | `query` | `Option<String>` | no | default when absent |
 | `priority` | `Option<String>` | no | default when absent |
+
+### LiveResponse
+
+Defined in `src/handlers/health.rs`. Reply of `GET /health/live`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | `&'static str` | yes | Always `alive`. |
+| `timestamp` | `String` | yes | RFC 3339. |
 
 ### LockBlockRequest
 
@@ -5068,6 +5329,21 @@ Defined in `src/handlers/datasets.rs`. Parametrised SELECT.
 | `params` | `Vec<serde_json::Value>` | no | default when absent |
 | `limit` | `Option<u32>` | no |  |
 
+### ReadyResponse
+
+Defined in `src/handlers/health.rs`. Reply of `GET /health/ready`. `reason` and `hard_latched_stores` appear only while a store's write latch is hard-set, with the 503 that goes with it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | `&'static str` | yes | `ready`, `not_ready` or `degraded`. |
+| `version` | `&'static str` | yes |  |
+| `effective_storage_backend` | `&'static str` | yes |  |
+| `users_in_cache` | `usize` | yes |  |
+| `tenant_open_waiters` | `usize` | yes | Requests waiting for a tenant store to open. |
+| `timestamp` | `String` | yes | RFC 3339. |
+| `reason` | `Option<&'static str>` | no | omitted when empty |
+| `hard_latched_stores` | `Option<usize>` | no | omitted when empty |
+
 ### Reason
 
 Defined in `src/entity_hygiene.rs`.
@@ -5323,6 +5599,19 @@ Defined in `src/handlers/types.rs`. Todo returned in recall results
 | `due_date` | `Option<String>` | no |  |
 | `score` | `f32` | yes |  |
 
+### ReconcileReport
+
+Defined in `src/memory/embedding_backlog.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `stored` | `usize` | yes |  |
+| `indexed` | `usize` | yes |  |
+| `enqueued` | `usize` | yes |  |
+| `dropped_indexed` | `usize` | yes |  |
+| `dropped_gone` | `usize` | yes |  |
+| `pending` | `usize` | yes |  |
+
 ### RecordClickRequest
 
 Defined in `src/handlers/ab_testing.rs`. Request to record a click
@@ -5405,6 +5694,16 @@ Defined in `src/memory/facets.rs`. A detected recurrence pattern. Free-form for 
 |---|---|---|---|
 | `period` | `Option<String>` | no | e.g. `"weekly"`, `"daily"`, `"monthly"`. |
 | `description` | `Option<String>` | no | Free-form description of the recurrence rule. |
+
+### ReembedResponse
+
+Defined in `src/handlers/consolidation.rs`. Reply of `POST /api/index/reembed`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `reembedded` | `usize` | yes | Memories embedded again. |
+| `failed` | `usize` | yes | Memories whose embedding failed; they keep their previous vector. |
 
 ### RefinerMode
 
@@ -5956,6 +6255,16 @@ Defined in `src/handlers/files.rs`. Request to search files
 | `user_id` | `String` | yes |  |
 | `query` | `String` | yes |  |
 | `limit` | `usize` | no | default when absent |
+
+### SecondaryIndexSummary
+
+Defined in `src/handlers/health.rs`. The secondary index, as `GET /api/health/index` summarises it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `total_vectors` | `usize` | yes |  |
+| `needs_rebuild` | `bool` | yes |  |
+| `deletion_ratio` | `f32` | yes |  |
 
 ### SeedRequest
 
@@ -7025,6 +7334,79 @@ Defined in `src/memory/types.rs`. User-specific context
 | `goals` | `Vec<String>` | yes | User's goals/objectives |
 | `learning_style` | `Option<String>` | no | User's learning style |
 
+### UserIndexHealth
+
+Defined in `src/handlers/health.rs`. Vector-index health of one tenant.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `total_vectors` | `usize` | yes |  |
+| `incremental_inserts` | `usize` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+| `deletion_ratio` | `f32` | yes |  |
+| `needs_rebuild` | `bool` | yes |  |
+| `needs_compaction` | `bool` | yes |  |
+| `secondary` | Option&lt;[`UserSecondaryIndexHealth`](#usersecondaryindexhealth)&gt; | no | `null` when there is no secondary index. |
+
+### UserIndexHealthResponse
+
+Defined in `src/handlers/health.rs`. Reply of `GET /api/health/index`: one tenant's index coverage and health.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | `String` | yes | Always `ok`. |
+| `user_id` | `String` | yes |  |
+| `index_coverage` | [`IndexCoverage`](#indexcoverage) | yes |  |
+| `total_vectors` | `usize` | yes |  |
+| `incremental_inserts` | `usize` | yes |  |
+| `needs_rebuild` | `bool` | yes |  |
+| `rebuild_threshold` | `usize` | yes |  |
+| `degradation_percent` | `f64` | yes | `incremental_inserts` as a percentage of `rebuild_threshold`, capped at 100. |
+| `secondary` | Option&lt;[`SecondaryIndexSummary`](#secondaryindexsummary)&gt; | no | `null` when there is no secondary index. |
+| `timestamp` | `String` | yes | RFC 3339. |
+
+### UserMemoryCounts
+
+Defined in `src/handlers/health.rs`. Memory counts of one tenant.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `total_memories` | `usize` | yes |  |
+| `working_memory_count` | `usize` | yes |  |
+| `session_memory_count` | `usize` | yes |  |
+| `long_term_memory_count` | `usize` | yes |  |
+| `vector_index_count` | `usize` | yes |  |
+
+### UserReadyResponse
+
+Defined in `src/handlers/health.rs`. Reply of `GET /api/health/ready`. The counters are present only when the tenant is cached and its store is not locked; `reason` says why they are absent.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | `&'static str` | yes | `ready` or `not_ready`: the server, not the tenant. |
+| `user_id` | `String` | yes |  |
+| `user_ready` | `bool` | yes |  |
+| `cached` | `bool` | yes | Whether the tenant's store is open in memory. |
+| `exists_on_disk` | `Option<bool>` | no | omitted when empty; Only when not cached. |
+| `reason` | `Option<&'static str>` | no | omitted when empty |
+| `memory_stats` | Option&lt;[`UserMemoryCounts`](#usermemorycounts)&gt; | no | omitted when empty |
+| `index_health` | Option&lt;[`UserIndexHealth`](#userindexhealth)&gt; | no | omitted when empty |
+| `graph_stats` | Option&lt;Option&lt;[`GraphCounts`](#graphcounts)&gt;&gt; | no | omitted when empty; Present with the counters; `null` when the tenant has no graph. |
+| `timestamp` | `String` | yes | RFC 3339. |
+
+### UserSecondaryIndexHealth
+
+Defined in `src/handlers/health.rs`. Health of a tenant's secondary vector index.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `total_vectors` | `usize` | yes |  |
+| `incremental_inserts` | `usize` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+| `deletion_ratio` | `f32` | yes |  |
+| `needs_rebuild` | `bool` | yes |  |
+| `needs_compaction` | `bool` | yes |  |
+
 ### UserTodoStats
 
 Defined in `src/memory/todos.rs`. Overall todo stats for a user
@@ -7149,6 +7531,31 @@ Defined in `src/memory/facets.rs`. Which W-facets are populated and reliable for
 | `when` | `bool` | yes |  |
 | `who` | `bool` | yes |  |
 | `why` | `bool` | yes |  |
+
+### WebhookResponse
+
+Defined in `src/handlers/integrations.rs`. Reply of `POST /webhook/linear` and `POST /webhook/github`.
+
+Enum, untagged: the variant's payload alone.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `Stored` | [`WebhookStored`](#webhookstored) | `status` is `success`: the event was written as a memory. |
+| `Acknowledged` | `{ status: String, action: String }` | `status` is `acknowledged`: the event needs no memory (a removal). |
+| `Ignored` | `{ status: String, reason: String }` | `status` is `ignored`: an event type the webhook does not process. |
+
+### WebhookStored
+
+Defined in `src/handlers/integrations.rs`. The memory a webhook event was written to.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | `String` | yes |  |
+| `id` | `String` | yes |  |
+| `external_id` | `String` | yes | `linear:<identifier>` or `github:<owner>/<repo>#<number>`. |
+| `was_update` | `bool` | yes | True when a memory with that `external_id` already existed and was updated. |
+| `action` | `String` | yes |  |
+| `event_type` | `Option<String>` | no | omitted when empty; GitHub only: `issues` or `pull_request`. |
 
 ### WhatFacet
 

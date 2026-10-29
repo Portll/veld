@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::state::MultiUserMemoryManager;
@@ -114,14 +114,42 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 /// Liveness probe - indicates if process is alive and not deadlocked
 /// Returns 200 OK if service is running (minimal check, always succeeds if reachable)
-pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_live() -> (StatusCode, Json<LiveResponse>) {
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "alive",
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
+        Json(LiveResponse {
+            status: "alive",
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }),
     )
+}
+
+/// Reply of `GET /health/live`.
+#[derive(Debug, Serialize)]
+pub struct LiveResponse {
+    /// Always `alive`.
+    pub status: &'static str,
+    /// RFC 3339.
+    pub timestamp: String,
+}
+
+/// Reply of `GET /health/ready`. `reason` and `hard_latched_stores` appear only while a
+/// store's write latch is hard-set, with the 503 that goes with it.
+#[derive(Debug, Serialize)]
+pub struct ReadyResponse {
+    /// `ready`, `not_ready` or `degraded`.
+    pub status: &'static str,
+    pub version: &'static str,
+    pub effective_storage_backend: &'static str,
+    pub users_in_cache: usize,
+    /// Requests waiting for a tenant store to open.
+    pub tenant_open_waiters: usize,
+    /// RFC 3339.
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hard_latched_stores: Option<usize>,
 }
 
 /// Readiness probe — system-level only. **PUBLIC, unauthenticated.**
@@ -134,33 +162,91 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 /// any unauthenticated caller. The structural rule is: nothing on the public
 /// router reads `?user_id=` for per-tenant data — see `PUBLIC_PATHS` in
 /// `router.rs` and the `public_router_has_no_per_user_handlers` test.
-pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
     let tenant_open_waiters = state.tenant_open_waiters();
     let (status_code, status_str, hard_stores) =
         ready_decision(state.is_ready(), crate::storage::write_latch::global());
 
-    let users_in_cache = state.users_in_cache();
-    let mut body = serde_json::json!({
-        "status": status_str,
-        "version": env!("VELD_VERSION_FULL"),
-        "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
-        "users_in_cache": users_in_cache,
-        "tenant_open_waiters": tenant_open_waiters,
-        "timestamp": chrono::Utc::now().to_rfc3339()
-    });
-    if hard_stores > 0 {
-        if let Some(object) = body.as_object_mut() {
-            object.insert(
-                "reason".to_string(),
-                serde_json::json!("storage_write_latched"),
-            );
-            object.insert(
-                "hard_latched_stores".to_string(),
-                serde_json::json!(hard_stores),
-            );
-        }
-    }
+    let latched = hard_stores > 0;
+    let body = ReadyResponse {
+        status: status_str,
+        version: env!("VELD_VERSION_FULL"),
+        effective_storage_backend: state.server_config().effective_storage_backend.as_str(),
+        users_in_cache: state.users_in_cache(),
+        tenant_open_waiters,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        reason: latched.then_some("storage_write_latched"),
+        hard_latched_stores: latched.then_some(hard_stores),
+    };
     (status_code, Json(body))
+}
+
+/// Reply of `GET /api/health/ready`. The counters are present only when the tenant is
+/// cached and its store is not locked; `reason` says why they are absent.
+#[derive(Debug, Serialize)]
+pub struct UserReadyResponse {
+    /// `ready` or `not_ready`: the server, not the tenant.
+    pub status: &'static str,
+    pub user_id: String,
+    pub user_ready: bool,
+    /// Whether the tenant's store is open in memory.
+    pub cached: bool,
+    /// Only when not cached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exists_on_disk: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_stats: Option<UserMemoryCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_health: Option<UserIndexHealth>,
+    /// Present with the counters; `null` when the tenant has no graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_stats: Option<Option<GraphCounts>>,
+    /// RFC 3339.
+    pub timestamp: String,
+}
+
+/// Memory counts of one tenant.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserMemoryCounts {
+    pub total_memories: usize,
+    pub working_memory_count: usize,
+    pub session_memory_count: usize,
+    pub long_term_memory_count: usize,
+    pub vector_index_count: usize,
+}
+
+/// Vector-index health of one tenant.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserIndexHealth {
+    pub total_vectors: usize,
+    pub incremental_inserts: usize,
+    pub deleted_count: usize,
+    pub deletion_ratio: f32,
+    pub needs_rebuild: bool,
+    pub needs_compaction: bool,
+    /// `null` when there is no secondary index.
+    pub secondary: Option<UserSecondaryIndexHealth>,
+}
+
+/// Health of a tenant's secondary vector index.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserSecondaryIndexHealth {
+    pub total_vectors: usize,
+    pub incremental_inserts: usize,
+    pub deleted_count: usize,
+    pub deletion_ratio: f32,
+    pub needs_rebuild: bool,
+    pub needs_compaction: bool,
+}
+
+/// Node and edge counts of a tenant's graph.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GraphCounts {
+    pub entity_count: usize,
+    pub relationship_count: usize,
+    pub episode_count: usize,
 }
 
 /// Per-user readiness probe — **authenticated**. Tenant binding is enforced
@@ -173,7 +259,7 @@ pub async fn health_ready_user(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+) -> Result<(StatusCode, Json<UserReadyResponse>), AppError> {
     let user_id = resolve_request_user_id(
         params.get("user_id").map(String::as_str),
         authenticated_user.as_ref().map(|extension| &extension.0),
@@ -193,33 +279,40 @@ pub async fn health_ready_user(
         let exists_on_disk = state.list_users().contains(&user_id);
         return Ok((
             status_code,
-            Json(serde_json::json!({
-                "status": status_str,
-                "user_id": user_id,
-                "user_ready": false,
-                "cached": false,
-                "exists_on_disk": exists_on_disk,
-                "reason": if exists_on_disk {
+            Json(UserReadyResponse {
+                status: status_str,
+                user_id,
+                user_ready: false,
+                cached: false,
+                exists_on_disk: Some(exists_on_disk),
+                reason: Some(if exists_on_disk {
                     "user exists but is not loaded in cache"
                 } else {
                     "user does not exist"
-                },
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
+                }),
+                memory_stats: None,
+                index_health: None,
+                graph_stats: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            }),
         ));
     };
 
     let Some(guard) = memory.try_read() else {
         return Ok((
             status_code,
-            Json(serde_json::json!({
-                "status": status_str,
-                "user_id": user_id,
-                "user_ready": true,
-                "cached": true,
-                "reason": "memory system is locked (concurrent operation in progress)",
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
+            Json(UserReadyResponse {
+                status: status_str,
+                user_id,
+                user_ready: true,
+                cached: true,
+                exists_on_disk: None,
+                reason: Some("memory system is locked (concurrent operation in progress)"),
+                memory_stats: None,
+                index_health: None,
+                graph_stats: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            }),
         ));
     };
 
@@ -231,52 +324,110 @@ pub async fn health_ready_user(
         .graph_memories
         .get(&user_id)
         .or_else(|| guard.graph_memory().cloned());
-    let graph_stats = if let Some(graph) = graph {
+    let graph_stats = graph.map(|graph| {
         let g = graph.read();
         let gs = g.get_stats().unwrap_or_default();
-        serde_json::json!({
-            "entity_count": gs.entity_count,
-            "relationship_count": gs.relationship_count,
-            "episode_count": gs.episode_count
-        })
-    } else {
-        serde_json::json!(null)
-    };
+        GraphCounts {
+            entity_count: gs.entity_count,
+            relationship_count: gs.relationship_count,
+            episode_count: gs.episode_count,
+        }
+    });
 
     Ok((
         status_code,
-        Json(serde_json::json!({
-            "status": status_str,
-            "user_id": user_id,
-            "user_ready": true,
-            "cached": true,
-            "memory_stats": {
-                "total_memories": stats.total_memories,
-                "working_memory_count": stats.working_memory_count,
-                "session_memory_count": stats.session_memory_count,
-                "long_term_memory_count": stats.long_term_memory_count,
-                "vector_index_count": stats.vector_index_count,
-            },
-            "index_health": {
-                "total_vectors": index_health.total_vectors,
-                "incremental_inserts": index_health.incremental_inserts,
-                "deleted_count": index_health.deleted_count,
-                "deletion_ratio": index_health.deletion_ratio,
-                "needs_rebuild": index_health.needs_rebuild,
-                "needs_compaction": index_health.needs_compaction,
-                "secondary": index_health.secondary.as_ref().map(|s| serde_json::json!({
-                    "total_vectors": s.total_vectors,
-                    "incremental_inserts": s.incremental_inserts,
-                    "deleted_count": s.deleted_count,
-                    "deletion_ratio": s.deletion_ratio,
-                    "needs_rebuild": s.needs_rebuild,
-                    "needs_compaction": s.needs_compaction,
-                })),
-            },
-            "graph_stats": graph_stats,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
+        Json(UserReadyResponse {
+            status: status_str,
+            user_id,
+            user_ready: true,
+            cached: true,
+            exists_on_disk: None,
+            reason: None,
+            memory_stats: Some(UserMemoryCounts {
+                total_memories: stats.total_memories,
+                working_memory_count: stats.working_memory_count,
+                session_memory_count: stats.session_memory_count,
+                long_term_memory_count: stats.long_term_memory_count,
+                vector_index_count: stats.vector_index_count,
+            }),
+            index_health: Some(UserIndexHealth {
+                total_vectors: index_health.total_vectors,
+                incremental_inserts: index_health.incremental_inserts,
+                deleted_count: index_health.deleted_count,
+                deletion_ratio: index_health.deletion_ratio,
+                needs_rebuild: index_health.needs_rebuild,
+                needs_compaction: index_health.needs_compaction,
+                secondary: index_health
+                    .secondary
+                    .as_ref()
+                    .map(|s| UserSecondaryIndexHealth {
+                        total_vectors: s.total_vectors,
+                        incremental_inserts: s.incremental_inserts,
+                        deleted_count: s.deleted_count,
+                        deletion_ratio: s.deletion_ratio,
+                        needs_rebuild: s.needs_rebuild,
+                        needs_compaction: s.needs_compaction,
+                    }),
+            }),
+            graph_stats: Some(graph_stats),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }),
     ))
+}
+
+/// Reply of `GET /health/index`: vector-index health summed over the cached tenants.
+#[derive(Debug, Serialize)]
+pub struct IndexHealthResponse {
+    /// Always `ok`.
+    pub status: &'static str,
+    pub users_checked: usize,
+    pub total_vectors: usize,
+    pub total_incremental_inserts: usize,
+    pub users_needing_rebuild_count: usize,
+    /// Tenants with memories stored but not in the vector or lexical index.
+    pub users_with_index_shortfall_count: usize,
+    pub users_coverage_unreadable_count: usize,
+    pub rebuild_threshold: usize,
+    /// RFC 3339.
+    pub timestamp: String,
+}
+
+/// Reply of `GET /api/health/index`: one tenant's index coverage and health.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserIndexHealthResponse {
+    /// Always `ok`.
+    pub status: String,
+    pub user_id: String,
+    pub index_coverage: IndexCoverage,
+    pub total_vectors: usize,
+    pub incremental_inserts: usize,
+    pub needs_rebuild: bool,
+    pub rebuild_threshold: usize,
+    /// `incremental_inserts` as a percentage of `rebuild_threshold`, capped at 100.
+    pub degradation_percent: f64,
+    /// `null` when there is no secondary index.
+    pub secondary: Option<SecondaryIndexSummary>,
+    /// RFC 3339.
+    pub timestamp: String,
+}
+
+/// Populations, not error counts: a memory stored and never indexed is unretrievable and
+/// raises nothing for a counter to see.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IndexCoverage {
+    pub stored: usize,
+    pub vector_indexed: usize,
+    pub lexically_indexed: usize,
+    /// True when either index holds fewer memories than the store.
+    pub shortfall: bool,
+}
+
+/// The secondary index, as `GET /api/health/index` summarises it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SecondaryIndexSummary {
+    pub total_vectors: usize,
+    pub needs_rebuild: bool,
+    pub deletion_ratio: f32,
 }
 
 /// Vector index health — aggregate-only. **PUBLIC, unauthenticated.**
@@ -286,7 +437,9 @@ pub async fn health_ready_user(
 /// failure path) has been moved behind auth in `health_index_user`. Same
 /// disclosure class as the readiness probe: enumerating cached user IDs and
 /// returning rebuild-threshold ratios is per-tenant metadata.
-pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_index(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<IndexHealthResponse>) {
     // Read health across cached users only — never trigger lazy init from a
     // public probe (otherwise every probe opens RocksDB for every on-disk
     // user, exhausting FDs).
@@ -320,18 +473,18 @@ pub async fn health_index(State(state): State<AppState>) -> (StatusCode, Json<se
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "users_checked": users_checked,
-            "total_vectors": total_vectors,
-            "total_incremental_inserts": total_incremental,
-            "users_needing_rebuild_count": users_needing_rebuild,
-            "users_with_index_shortfall_count": users_with_shortfall,
+        Json(IndexHealthResponse {
+            status: "ok",
+            users_checked,
+            total_vectors,
+            total_incremental_inserts: total_incremental,
+            users_needing_rebuild_count: users_needing_rebuild,
+            users_with_index_shortfall_count: users_with_shortfall,
             // Kept for existing clients: a maintained count is never unreadable.
-            "users_coverage_unreadable_count": 0,
-            "rebuild_threshold": crate::vector_db::vamana::REBUILD_THRESHOLD,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
+            users_coverage_unreadable_count: 0,
+            rebuild_threshold: crate::vector_db::vamana::REBUILD_THRESHOLD,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }),
     )
 }
 
@@ -342,7 +495,7 @@ pub async fn health_index_user(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+) -> Result<(StatusCode, Json<UserIndexHealthResponse>), AppError> {
     let user_id = resolve_request_user_id(
         params.get("user_id").map(String::as_str),
         authenticated_user.as_ref().map(|extension| &extension.0),
@@ -358,33 +511,34 @@ pub async fn health_index_user(
     // unretrievable and raises nothing for a counter to see.
     let coverage = guard.index_coverage().map_err(AppError::Internal)?;
     let (stored, vector_indexed, lexically_indexed) = coverage;
+    let degradation_percent = if health.rebuild_threshold > 0 {
+        (health.incremental_inserts as f64 / health.rebuild_threshold as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
     Ok((
         StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "user_id": user_id,
-            "index_coverage": {
-                "stored": stored,
-                "vector_indexed": vector_indexed,
-                "lexically_indexed": lexically_indexed,
-                "shortfall": vector_indexed < stored || lexically_indexed < stored,
+        Json(UserIndexHealthResponse {
+            status: "ok".to_string(),
+            user_id,
+            index_coverage: IndexCoverage {
+                stored,
+                vector_indexed,
+                lexically_indexed,
+                shortfall: vector_indexed < stored || lexically_indexed < stored,
             },
-            "total_vectors": health.total_vectors,
-            "incremental_inserts": health.incremental_inserts,
-            "needs_rebuild": health.needs_rebuild,
-            "rebuild_threshold": health.rebuild_threshold,
-            "degradation_percent": if health.rebuild_threshold > 0 {
-                (health.incremental_inserts as f64 / health.rebuild_threshold as f64 * 100.0).min(100.0)
-            } else {
-                0.0
-            },
-            "secondary": health.secondary.as_ref().map(|s| serde_json::json!({
-                "total_vectors": s.total_vectors,
-                "needs_rebuild": s.needs_rebuild,
-                "deletion_ratio": s.deletion_ratio,
-            })),
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
+            total_vectors: health.total_vectors,
+            incremental_inserts: health.incremental_inserts,
+            needs_rebuild: health.needs_rebuild,
+            rebuild_threshold: health.rebuild_threshold,
+            degradation_percent,
+            secondary: health.secondary.as_ref().map(|s| SecondaryIndexSummary {
+                total_vectors: s.total_vectors,
+                needs_rebuild: s.needs_rebuild,
+                deletion_ratio: s.deletion_ratio,
+            }),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }),
     ))
 }
 
@@ -464,14 +618,14 @@ pub struct ContextStatusRequest {
 pub async fn update_context_status(
     State(state): State<AppState>,
     Json(req): Json<ContextStatusRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> (StatusCode, Json<ContextStatusUpdateResponse>) {
     // Validate session_id length to prevent abuse
     if req.session_id.len() > 128 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "session_id must be 128 characters or fewer"
-            })),
+            Json(ContextStatusUpdateResponse::Rejected {
+                error: "session_id must be 128 characters or fewer".to_string(),
+            }),
         );
     }
 
@@ -485,9 +639,9 @@ pub async fn update_context_status(
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "too many active context sessions"
-            })),
+            Json(ContextStatusUpdateResponse::Rejected {
+                error: "too many active context sessions".to_string(),
+            }),
         );
     }
 
@@ -531,11 +685,20 @@ pub async fn update_context_status(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "success": true,
-            "percent_used": percent_used
-        })),
+        Json(ContextStatusUpdateResponse::Updated {
+            success: true,
+            percent_used,
+        }),
     )
+}
+
+/// Reply of `POST /api/context/status`: `Updated` with 200, `Rejected` with 400 for a
+/// `session_id` over 128 characters or 503 when 10 000 sessions are already tracked.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContextStatusUpdateResponse {
+    Updated { success: bool, percent_used: u8 },
+    Rejected { error: String },
 }
 
 /// Get all active context sessions (auto-cleans stale sessions > 5 mins old)

@@ -3,6 +3,7 @@
 //! Handlers for Linear and GitHub webhook integrations and bulk sync.
 
 use axum::{extract::State, http::HeaderMap, response::Json};
+use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -13,13 +14,40 @@ use std::sync::Arc;
 
 type AppState = Arc<MultiUserMemoryManager>;
 
+/// Reply of `POST /webhook/linear` and `POST /webhook/github`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebhookResponse {
+    /// `status` is `success`: the event was written as a memory.
+    Stored(WebhookStored),
+    /// `status` is `acknowledged`: the event needs no memory (a removal).
+    Acknowledged { status: String, action: String },
+    /// `status` is `ignored`: an event type the webhook does not process.
+    Ignored { status: String, reason: String },
+}
+
+/// The memory a webhook event was written to.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebhookStored {
+    pub status: String,
+    pub id: String,
+    /// `linear:<identifier>` or `github:<owner>/<repo>#<number>`.
+    pub external_id: String,
+    /// True when a memory with that `external_id` already existed and was updated.
+    pub was_update: bool,
+    pub action: String,
+    /// GitHub only: `issues` or `pull_request`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+}
+
 /// POST /webhook/linear - Linear webhook receiver
 #[tracing::instrument(skip(state, body, headers))]
 pub async fn linear_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<WebhookResponse>, AppError> {
     use integrations::linear::LinearWebhook;
 
     let signing_secret = std::env::var("LINEAR_WEBHOOK_SECRET")
@@ -73,17 +101,17 @@ pub async fn linear_webhook(
     let payload = webhook.parse_payload(&body).map_err(AppError::Internal)?;
 
     if payload.entity_type != "Issue" {
-        return Ok(Json(serde_json::json!({
-            "status": "ignored",
-            "reason": "Only Issue events are processed"
-        })));
+        return Ok(Json(WebhookResponse::Ignored {
+            status: "ignored".to_string(),
+            reason: "Only Issue events are processed".to_string(),
+        }));
     }
 
     if payload.action == "remove" {
-        return Ok(Json(serde_json::json!({
-            "status": "acknowledged",
-            "action": "remove"
-        })));
+        return Ok(Json(WebhookResponse::Acknowledged {
+            status: "acknowledged".to_string(),
+            action: "remove".to_string(),
+        }));
     }
 
     let external_id = match &payload.data.identifier {
@@ -146,12 +174,13 @@ pub async fn linear_webhook(
         .map_err(AppError::Internal)?
     };
 
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "id": memory_id.0.to_string(),
-        "external_id": external_id,
-        "was_update": was_update,
-        "action": payload.action
+    Ok(Json(WebhookResponse::Stored(WebhookStored {
+        status: "success".to_string(),
+        id: memory_id.0.to_string(),
+        external_id,
+        was_update,
+        action: payload.action,
+        event_type: None,
     })))
 }
 
@@ -265,7 +294,7 @@ pub async fn github_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<WebhookResponse>, AppError> {
     use integrations::github::GitHubWebhook;
 
     let webhook_secret = std::env::var("GITHUB_WEBHOOK_SECRET")
@@ -322,10 +351,13 @@ pub async fn github_webhook(
         .unwrap_or("unknown");
 
     if event_type != "issues" && event_type != "pull_request" {
-        return Ok(Json(serde_json::json!({
-            "status": "ignored",
-            "reason": format!("Only issues and pull_request events are processed, got: {}", event_type)
-        })));
+        return Ok(Json(WebhookResponse::Ignored {
+            status: "ignored".to_string(),
+            reason: format!(
+                "Only issues and pull_request events are processed, got: {}",
+                event_type
+            ),
+        }));
     }
 
     let payload = webhook.parse_payload(&body).map_err(AppError::Internal)?;
@@ -346,10 +378,10 @@ pub async fn github_webhook(
         let ct = GitHubWebhook::determine_change_type(&payload.action, true);
         (ext_id, content, tags, ct)
     } else {
-        return Ok(Json(serde_json::json!({
-            "status": "ignored",
-            "reason": "No issue or pull_request data in payload"
-        })));
+        return Ok(Json(WebhookResponse::Ignored {
+            status: "ignored".to_string(),
+            reason: "No issue or pull_request data in payload".to_string(),
+        }));
     };
 
     let experience = Experience {
@@ -400,13 +432,13 @@ pub async fn github_webhook(
         .map_err(AppError::Internal)?
     };
 
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "id": memory_id.0.to_string(),
-        "external_id": external_id,
-        "was_update": was_update,
-        "action": payload.action,
-        "event_type": event_type
+    Ok(Json(WebhookResponse::Stored(WebhookStored {
+        status: "success".to_string(),
+        id: memory_id.0.to_string(),
+        external_id,
+        was_update,
+        action: payload.action,
+        event_type: Some(event_type.to_string()),
     })))
 }
 

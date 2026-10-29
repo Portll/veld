@@ -15,7 +15,7 @@ use axum::{
     extract::{Extension, Query, State},
     response::Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use super::utils::resolve_request_user_id;
@@ -84,20 +84,39 @@ pub async fn set_dials(
 /// `GET /api/dials/schema` — default / recommended / absolute ranges for the recall
 /// sliders, so the monitor can render each slider (track = absolute, shaded band =
 /// recommended, tick = default) without hard-coding any bounds.
-pub async fn get_dials_schema() -> Json<serde_json::Value> {
-    let sliders: Vec<serde_json::Value> = crate::memory::dials::RECALL_SLIDER_SPECS
+pub async fn get_dials_schema() -> Json<DialsSchemaResponse> {
+    let sliders = crate::memory::dials::RECALL_SLIDER_SPECS
         .iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "group": s.group,
-                "label": s.label,
-                "default": s.default,
-                "recommended": [s.rec_lo, s.rec_hi],
-                "absolute": [s.abs_lo, s.abs_hi],
-                "step": s.step,
-            })
+        .map(|s| DialSlider {
+            id: s.id,
+            group: s.group,
+            label: s.label,
+            default: s.default,
+            recommended: [s.rec_lo, s.rec_hi],
+            absolute: [s.abs_lo, s.abs_hi],
+            step: s.step,
         })
         .collect();
-    Json(serde_json::json!({ "sliders": sliders }))
+    Json(DialsSchemaResponse { sliders })
+}
+
+/// Reply of `GET /api/dials/schema`: one entry per recall slider.
+#[derive(Debug, Serialize)]
+pub struct DialsSchemaResponse {
+    pub sliders: Vec<DialSlider>,
+}
+
+/// The ranges of one recall slider.
+#[derive(Debug, Serialize)]
+pub struct DialSlider {
+    /// The `CognitiveDials` field the slider sets.
+    pub id: &'static str,
+    pub group: &'static str,
+    pub label: &'static str,
+    pub default: f64,
+    /// `[low, high]` of the recommended band.
+    pub recommended: [f64; 2],
+    /// `[low, high]` the slider track spans.
+    pub absolute: [f64; 2],
+    pub step: f64,
 }

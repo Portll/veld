@@ -823,6 +823,17 @@ pub struct FileAnswerRequest {
     pub memory_type: Option<String>,
 }
 
+/// Reply of `POST /api/file_answer`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FileAnswerResponse {
+    pub success: bool,
+    /// The memory written.
+    pub id: String,
+    /// Always true: an answer is a derived memory.
+    pub is_derived: bool,
+    pub cited_sources: Vec<String>,
+}
+
 /// POST /api/file_answer — file a synthesised answer as a DERIVED memory (A5).
 ///
 /// The answer is tagged [`DERIVED_TAG`] and its provenance recorded as
@@ -836,7 +847,7 @@ pub struct FileAnswerRequest {
 pub async fn file_answer(
     State(state): State<AppState>,
     Json(req): Json<FileAnswerRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<FileAnswerResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
 
@@ -889,12 +900,12 @@ pub async fn file_answer(
         crate::handlers::lenient_json::LenientJson(remember_req),
     )
     .await?;
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "id": resp.0.id,
-        "is_derived": true,
-        "cited_sources": req.cited_sources,
-    })))
+    Ok(Json(FileAnswerResponse {
+        success: true,
+        id: resp.0.id,
+        is_derived: true,
+        cited_sources: req.cited_sources,
+    }))
 }
 
 /// Remember a single memory
