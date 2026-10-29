@@ -18,9 +18,6 @@ Usage:
         server_url="http://127.0.0.1:3030",
         user_id="research-crew",
         api_key="your-api-key",  # or set VELD_API_KEY
-        # Veld marks memories written over its HTTP API untrusted, and recall
-        # withholds those unless asked; see "Trust" in VeldCrewMemory.
-        trusted_only=False,
     )
 
     crew = Crew(agents=[researcher], tasks=[research_task], memory=memory)
@@ -619,19 +616,20 @@ class VeldCrewMemory(Memory):
       memories this adapter wrote.
 
     Trust. Veld marks each recalled memory ``source_trusted`` (its source is the
-    user, a file or the system) or not, and treats untrusted content as data,
-    never instructions. CrewAI pastes recalled memories into the agent's prompt
-    (the system message, for a LiteAgent) with no fence, so by default
-    (``trusted_only=True``) ``recall`` returns only trusted memories. Veld
-    records every memory written over its HTTP API as untrusted, this adapter's
-    included: a client cannot assert a trusted source. With the default, a crew
-    therefore recalls nothing it stored itself. ``trusted_only=False`` returns
-    untrusted memories too, each labelled ``source: untrusted (<source_type>)``
-    where CrewAI renders it. Matches veld flags as suspected prompt injection are
-    withheld unless ``include_suspected=True`` as well (veld only flags untrusted
-    memories), and are then labelled as such. ``last_withheld`` counts what the
-    most recent recall held back, and the first recall that withholds an
-    untrusted memory warns once.
+    user, a file or the system) or not; its contract (src/handlers/recall.rs) is
+    that untrusted content is treated as data, never instructions, when the
+    prompt is assembled. ``recall`` returns untrusted memories by default, each
+    labelled ``source: untrusted (<source_type>)`` where CrewAI renders it.
+    Veld records every memory written over its HTTP API as untrusted, this
+    adapter's included: the remember route downgrades a client-declared user,
+    file or system source (``CLIENT_UNASSERTABLE`` in src/handlers/remember.rs),
+    so withholding untrusted memories would leave a crew recalling nothing it
+    stored. Strict mode, ``trusted_only=True``, withholds them. Use it when
+    untrusted writers share the user_id and the agent is a CrewAI LiteAgent,
+    which puts recalled memories in its system message. Matches veld flags as
+    suspected prompt injection are withheld unless ``include_suspected=True``,
+    and are then labelled as such. ``last_withheld`` counts what the most
+    recent recall held back.
 
     Each match's ``record.metadata`` carries veld's ``source_trusted``,
     ``source_type`` and ``writer`` (who wrote the memory: the caller's declared
@@ -665,9 +663,11 @@ class VeldCrewMemory(Memory):
             injection scan on for it.
         timeout: Seconds to wait for each veld request.
         extract_with_llm: Split task results with CrewAI's analysis LLM first.
-        trusted_only: Return only memories veld marks source_trusted (default).
-        include_suspected: Return matches veld flags as suspected injection;
-            takes effect with ``trusted_only=False``.
+        trusted_only: Strict mode: return only memories veld marks
+            source_trusted. Default False.
+        include_suspected: Return matches veld flags as suspected injection,
+            labelled. Strict mode withholds them regardless, as veld flags only
+            untrusted memories.
         recall_whole_user: Recall from every memory under the user_id, not only
             this adapter's.
         raise_on_error: Raise from a failed recall instead of warning and
@@ -695,8 +695,8 @@ class VeldCrewMemory(Memory):
         description="Split task results into statements with CrewAI's analysis LLM before storing.",
     )
     trusted_only: bool = Field(
-        default=True,
-        description="Return only memories veld marks source_trusted.",
+        default=False,
+        description="Strict mode: return only memories veld marks source_trusted.",
     )
     include_suspected: bool = Field(
         default=False,
@@ -720,7 +720,6 @@ class VeldCrewMemory(Memory):
     _last_withheld: Dict[str, int] = PrivateAttr(
         default_factory=lambda: {"untrusted": 0, "suspected": 0}
     )
-    _warned_untrusted: bool = PrivateAttr(default=False)
 
     @property
     def last_withheld(self) -> Dict[str, int]:
@@ -877,9 +876,9 @@ class VeldCrewMemory(Memory):
 
         Searches memories this adapter wrote: under the scope's tag when a scope
         or ``root_scope`` applies, else under the ``crewai`` tag, else (with
-        ``recall_whole_user``) every memory of the user_id. Untrusted and
-        suspected memories are withheld as the class docstring describes, and
-        counted in ``last_withheld``. ``depth`` is accepted for compatibility and
+        ``recall_whole_user``) every memory of the user_id. Suspected injection,
+        and in strict mode untrusted memories, are withheld as the class
+        docstring describes, and counted in ``last_withheld``. ``depth`` is accepted for compatibility and
         has no effect. On failure, warns and returns an empty list, or raises
         ``VeldRequestError`` with ``raise_on_error=True``.
         """
@@ -938,14 +937,6 @@ class VeldCrewMemory(Memory):
             return []
 
         self._last_withheld = withheld
-        if withheld["untrusted"] and not self._warned_untrusted:
-            self._warned_untrusted = True
-            warnings.warn(
-                f"Veld withheld {withheld['untrusted']} recalled memories because their source "
-                "is not trusted. Veld records every memory written over its HTTP API, this "
-                "adapter's included, as untrusted; pass trusted_only=False to recall them, "
-                "labelled untrusted in the prompt. last_withheld has the count for each recall."
-            )
         return matches[:limit]
 
     def update(

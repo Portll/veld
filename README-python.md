@@ -236,9 +236,7 @@ from veld.integrations.crewai import VeldCrewMemory
 
 # Use as the memory of a crew (or of one agent: Agent(memory=memory)).
 # Needs pip install veld[crewai] and a veld server; the API key comes from VELD_API_KEY.
-# trusted_only=False recalls memories written over veld's HTTP API (the crew's own
-# included), which veld marks untrusted; they reach the prompt labelled as such.
-memory = VeldCrewMemory(server_url="http://127.0.0.1:3030", user_id="my-crew", trusted_only=False)
+memory = VeldCrewMemory(server_url="http://127.0.0.1:3030", user_id="my-crew")
 crew = Crew(agents=[researcher], tasks=[task], memory=memory)
 ```
 

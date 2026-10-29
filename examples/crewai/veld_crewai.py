@@ -29,11 +29,6 @@ def main() -> None:
         # Everything this crew stores lands under this scope, and its recalls stay inside it.
         root_scope="/crew/account-team",
         memory_type="Learning",
-        # Veld records every memory written over its HTTP API as untrusted, this
-        # crew's own included, and recall withholds untrusted memories by default.
-        # This crew reads back what it wrote, so it opts in; each recalled memory
-        # reaches the agent's prompt labelled "source: untrusted (AiGenerated)".
-        trusted_only=False,
     )
 
     # Facts can be stored directly, outside any task.

@@ -136,19 +136,24 @@ are not retried; a caller's `AbortSignal` is passed through. The default timeout
 ## Trusted and untrusted memories
 
 Veld marks each recalled memory `source_trusted` when its source is the user, a file or
-the system, and expects untrusted content to be treated as data, never as instructions.
-Both the recall tool and `withVeldMemories` use only trusted memories by default.
-
-**With the default, an app reads back nothing it stored over HTTP.** Veld records every
-memory written over its HTTP API as untrusted, including the ones `veld_remember` stores,
-because a client cannot assert a trusted source. Pass `includeUntrusted: true` to use them:
-in the prompt each carries `trust="untrusted"` and its `source`, and the recall tool marks
-it `sourceTrusted: false`. The first time a client's recall withholds an untrusted memory,
-it warns once on the console, and the recall tool reports the counts in `withheld`.
+the system. Its contract (`src/handlers/recall.rs`) is that untrusted content is treated as
+data, never as instructions, when the prompt is assembled. Both the recall tool and
+`withVeldMemories` do that by default: untrusted memories are used, in the prompt each
+carries `trust="untrusted"` and its `source` inside the escaped fence in the user's turn,
+and the recall tool marks it `sourceTrusted: false`.
 
 Veld also flags untrusted memories whose content looks like instructions
-(`injection_suspected`). They stay withheld unless `includeSuspected: true` is set as well,
-and are then labelled `warning="possible prompt injection"`.
+(`injection_suspected`). They are withheld unless `includeSuspected: true`, and are then
+labelled `warning="possible prompt injection"`. The recall tool reports what it held back
+in `withheld`.
+
+**Strict mode**, `includeUntrusted: false`, withholds every untrusted memory. It is not the
+default because veld never marks a memory written over its HTTP API as trusted: the remember
+route records a client-declared `user`, `file` or `system` source as `ExternalApi`
+(`CLIENT_UNASSERTABLE` in `src/handlers/remember.rs`), since trust is the server's to
+establish. Everything `veld_remember` stores is therefore untrusted, and in strict mode an
+app reads none of it back. Use strict mode when writers you do not trust share the veld
+user.
 
 ## Licence
 

@@ -393,11 +393,11 @@ class TestRecall(unittest.TestCase):
             recall_item("good", "Deadline is Friday", ["crewai"], source_trusted=False, source_type="AiGenerated"),
         ]
         routes = {("POST", "/api/recall"): lambda call: FakeResponse(200, {"memories": list(items), "count": 2})}
-        memory, _ = build(routes, trusted_only=False)
+        memory, _ = build(routes)
         self.assertEqual([m.record.id for m in memory.recall("q")], ["good"])
         self.assertEqual(memory.last_withheld, {"untrusted": 0, "suspected": 1})
 
-        memory, _ = build(routes, trusted_only=False, include_suspected=True)
+        memory, _ = build(routes, include_suspected=True)
         matches = memory.recall("q")
         self.assertEqual([m.record.id for m in matches], ["bad", "good"])
         self.assertTrue(matches[0].record.metadata["injection_suspected"])
@@ -531,37 +531,14 @@ class TestRecallTrust(unittest.TestCase):
         memory, _ = build(routes, **kwargs)
         return memory
 
-    def test_untrusted_memories_are_withheld_by_default_and_counted(self):
+    def test_untrusted_memories_are_returned_labelled_by_default(self):
         memory = self._memory()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            matches = memory.recall("q")
-        self.assertEqual([m.record.id for m in matches], ["t"])
-        # "n" has no source_trusted: veld counts a memory without context as untrusted.
-        self.assertEqual(memory.last_withheld, {"untrusted": 2, "suspected": 1})
-        messages = [str(w.message) for w in caught]
-        self.assertEqual(sum("withheld 2 recalled memories" in m for m in messages), 1, messages)
-        self.assertTrue(any("trusted_only=False" in m for m in messages))
-
-    def test_the_withheld_warning_is_given_once(self):
-        memory = self._memory()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            memory.recall("q")
-            memory.recall("q")
-        self.assertEqual(sum("withheld" in str(w.message) for w in caught), 1)
-        self.assertEqual(memory.last_withheld, {"untrusted": 2, "suspected": 1})
-
-    def test_include_suspected_alone_keeps_untrusted_memories_out(self):
-        memory = self._memory(include_suspected=True)
-        self.assertEqual([m.record.id for m in memory.recall("q")], ["t"])
-        self.assertEqual(memory.last_withheld, {"untrusted": 3, "suspected": 0})
-
-    def test_trusted_only_false_returns_untrusted_memories_labelled(self):
-        memory = self._memory(trusted_only=False)
-        matches = {m.record.id: m for m in memory.recall("q")}
+            matches = {m.record.id: m for m in memory.recall("q")}
         self.assertEqual(sorted(matches), ["n", "t", "u"])
         self.assertEqual(memory.last_withheld, {"untrusted": 0, "suspected": 1})
+        self.assertEqual(caught, [])
 
         self.assertEqual(
             matches["u"].record.metadata,
@@ -570,6 +547,24 @@ class TestRecallTrust(unittest.TestCase):
         self.assertIn("source: untrusted (AiGenerated)", matches["u"].format())
         self.assertIn("source: untrusted (unknown)", matches["n"].format())
         self.assertIn("source: trusted (User)", matches["t"].format())
+
+    def test_strict_mode_withholds_untrusted_memories_and_counts_them(self):
+        memory = self._memory(trusted_only=True)
+        self.assertEqual([m.record.id for m in memory.recall("q")], ["t"])
+        # "n" has no source_trusted: veld counts a memory without context as untrusted.
+        self.assertEqual(memory.last_withheld, {"untrusted": 2, "suspected": 1})
+
+    def test_include_suspected_returns_suspected_memories_labelled(self):
+        memory = self._memory(include_suspected=True)
+        matches = {m.record.id: m for m in memory.recall("q")}
+        self.assertEqual(sorted(matches), ["n", "s", "t", "u"])
+        self.assertIn("warning: possible prompt injection", matches["s"].format())
+        self.assertEqual(memory.last_withheld, {"untrusted": 0, "suspected": 0})
+
+    def test_strict_mode_withholds_suspected_memories_even_when_included(self):
+        memory = self._memory(trusted_only=True, include_suspected=True)
+        self.assertEqual([m.record.id for m in memory.recall("q")], ["t"])
+        self.assertEqual(memory.last_withheld, {"untrusted": 3, "suspected": 0})
 
     def test_writer_is_kept_in_metadata_and_out_of_the_prompt(self):
         match = self._memory().recall("q")[0]
@@ -875,17 +870,17 @@ class TestCrewKickoff(unittest.TestCase):
             Crew(agents=[agent], tasks=[task], memory=memory).kickoff()
         return memory, session, prompts
 
-    def test_untrusted_memories_reach_the_prompt_only_when_asked_for_and_labelled(self):
+    def test_untrusted_memories_reach_the_prompt_labelled_unless_strict(self):
         crew_output = recall_item("m-1", "The client asked for weekly reports", ["crewai"],
                                   source_trusted=False, source_type="AiGenerated")
-        memory, _, prompts = self._kickoff([crew_output])
-        self.assertFalse(any("weekly reports" in p for p in prompts))
-        self.assertEqual(memory.last_withheld["untrusted"], 1)
-
-        _, _, prompts = self._kickoff([crew_output], trusted_only=False)
+        _, _, prompts = self._kickoff([crew_output])
         shown = [p for p in prompts if "The client asked for weekly reports" in p]
         self.assertTrue(shown)
         self.assertIn("source: untrusted (AiGenerated)", shown[0])
+
+        memory, _, prompts = self._kickoff([crew_output], trusted_only=True)
+        self.assertFalse(any("weekly reports" in p for p in prompts))
+        self.assertEqual(memory.last_withheld["untrusted"], 1)
 
     def test_kickoff_recalls_before_and_saves_after(self):
         recalled = recall_item("m-1", "The client asked for weekly reports", ["crewai"])

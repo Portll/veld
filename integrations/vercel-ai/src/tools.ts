@@ -1,7 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import type { VeldClient } from "./client.js";
-import { partitionMemories, toRecalledMemory, warnWithheldOnce } from "./format.js";
+import { partitionMemories, toRecalledMemory } from "./format.js";
 import { MEMORY_TYPES } from "./types.js";
 import type { RetrievalMode } from "./types.js";
 
@@ -14,14 +14,14 @@ export interface VeldToolsOptions {
   tags?: string[];
   /**
    * Return memories whose source veld does not trust, marked
-   * `sourceTrusted: false`. Default: false, they are withheld and counted. Veld
-   * records every memory written over its HTTP API as untrusted, including the
-   * ones veld_remember stores.
+   * `sourceTrusted: false`. Default: true. `false` is strict mode: they are
+   * withheld and counted. Veld records every memory written over its HTTP API
+   * as untrusted, including the ones veld_remember stores.
    */
   includeUntrusted?: boolean;
   /**
-   * Return memories veld flags as suspected prompt injection, marked. Takes
-   * effect with `includeUntrusted`. Default: false.
+   * Return memories veld flags as suspected prompt injection, marked. Default:
+   * false. Strict mode withholds them regardless.
    */
   includeSuspected?: boolean;
 }
@@ -95,7 +95,6 @@ export function veldTools(client: VeldClient, options: VeldToolsOptions = {}) {
           abortSignal,
         );
         const { visible, withheld } = partitionMemories(reply.memories, options);
-        warnWithheldOnce(client, withheld);
         const memories = visible.map(toRecalledMemory);
         return { memories, count: memories.length, withheld };
       },

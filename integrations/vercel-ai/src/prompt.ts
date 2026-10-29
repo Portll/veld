@@ -1,6 +1,6 @@
 import type { ModelMessage, SystemModelMessage, UserContent } from "ai";
 import type { VeldClient } from "./client.js";
-import { formatMemories, partitionMemories, warnWithheldOnce } from "./format.js";
+import { formatMemories } from "./format.js";
 import type { RetrievalMode } from "./types.js";
 
 /** The AI SDK's `instructions` value: a string or system messages. */
@@ -25,13 +25,14 @@ export interface MemoryPromptOptions {
   tags?: string[];
   /**
    * Use memories whose source veld does not trust, labelled `trust="untrusted"`.
-   * Default: false, they are withheld. Veld records every memory written over
-   * its HTTP API as untrusted, including the ones `veld_remember` stores.
+   * Default: true. `false` is strict mode: they are withheld. Veld records every
+   * memory written over its HTTP API as untrusted, including the ones
+   * `veld_remember` stores, so strict mode withholds all of those.
    */
   includeUntrusted?: boolean;
   /**
-   * Keep memories veld flags as suspected prompt injection, labelled. Takes
-   * effect with `includeUntrusted`. Default: false.
+   * Keep memories veld flags as suspected prompt injection, labelled. Default:
+   * false. Strict mode withholds them regardless.
    */
   includeSuspected?: boolean;
   signal?: AbortSignal;
@@ -103,8 +104,10 @@ function withBlockInMessages(messages: readonly ModelMessage[], block: string): 
  * memories, escapes their text and labels each one's trust (see
  * `formatMemories`).
  *
- * By default only memories veld trusts are used, and veld trusts nothing
- * written over its HTTP API; `includeUntrusted` uses the rest, labelled.
+ * Untrusted memories are used by default, labelled, as veld's contract asks:
+ * untrusted content is data at prompt assembly. Suspected prompt injection is
+ * withheld unless `includeSuspected`; `includeUntrusted: false` (strict mode)
+ * withholds every untrusted memory.
  *
  * A deprecated `system` field is moved to `instructions`; the instructions are
  * otherwise returned unchanged. With no query, or when no memory is left to
@@ -131,7 +134,6 @@ export async function withVeldMemories<T extends PromptFields>(
     },
     options.signal,
   );
-  warnWithheldOnce(client, partitionMemories(reply.memories, options).withheld);
   const block = formatMemories(reply.memories, options);
   if (!block) return result;
 

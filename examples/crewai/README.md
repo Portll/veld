@@ -33,9 +33,8 @@ With memory set, each agent recalls from veld before its task (the task descript
 query) and saves its result after it. Agents also get CrewAI's "Search memory" and "Save to
 memory" tools, backed by veld. `Agent(memory=memory)` gives one agent its own memory.
 
-Recall returns only memories veld trusts unless you pass `trusted_only=False`, and veld trusts
-nothing written over its HTTP API. A crew that should read back what it stored needs that
-option; see [Trusted and untrusted memories](#trusted-and-untrusted-memories).
+Recalled memories carry a trust label in the prompt; see
+[Trusted and untrusted memories](#trusted-and-untrusted-memories).
 
 ## What changes from CrewAI's default memory
 
@@ -73,28 +72,31 @@ including ones other clients (the MCP server, the LangChain adapter) wrote. `for
 ## Trusted and untrusted memories
 
 Veld marks each recalled memory `source_trusted` when its source is the user, a file or the
-system, and expects untrusted content to be treated as data, never as instructions. CrewAI
-pastes recalled memories into the agent's prompt without a fence, so by default
-(`trusted_only=True`) `recall` returns only trusted memories.
-
-**With the default, a crew recalls nothing it stored itself.** Veld records every memory
-written over its HTTP API as untrusted, this adapter's included, because a client cannot
-assert a trusted source. To recall them, pass `trusted_only=False`: each memory then reaches
-the prompt labelled with its provenance, for example
+system. Its contract (`src/handlers/recall.rs`) is that untrusted content is treated as data,
+never as instructions, when the prompt is assembled. `recall` returns untrusted memories by
+default, and each reaches the prompt labelled with its provenance, for example
 
 ```text
 - (score=0.82) Acme wants reports on Fridays
   source: untrusted (AiGenerated)
 ```
 
-Memories veld flags as suspected prompt injection stay withheld unless `include_suspected=True`
-is also set, and are then labelled `warning: possible prompt injection`.
+Memories veld flags as suspected prompt injection are withheld unless `include_suspected=True`,
+and are then labelled `warning: possible prompt injection`.
+
+**Strict mode**, `trusted_only=True`, withholds every untrusted memory. It is not the default
+because veld never marks a memory written over its HTTP API as trusted: the remember route
+records a client-declared `user`, `file` or `system` source as `ExternalApi`
+(`CLIENT_UNASSERTABLE` in `src/handlers/remember.rs`), since trust is the server's to establish.
+Every memory this adapter stores is therefore untrusted, and in strict mode a crew recalls
+none of them. Use strict mode when writers you do not trust share the `user_id`, and in
+particular for a CrewAI `LiteAgent`, which puts recalled memories in its system message rather
+than the task prompt.
 
 `memory.last_withheld` counts what the latest recall held back, as
-`{"untrusted": n, "suspected": m}`, and the first recall that withholds an untrusted memory
-warns once. Each match's `record.metadata` carries veld's `source_trusted`, `source_type` and
-`writer` (the caller's declared identity and what the server verified). `writer` stays out of
-the prompt text.
+`{"untrusted": n, "suspected": m}`. Each match's `record.metadata` carries veld's
+`source_trusted`, `source_type` and `writer` (the caller's declared identity and what the
+server verified). `writer` stays out of the prompt text.
 
 ## Options
 
@@ -108,8 +110,8 @@ the prompt text.
 | `memory_type` | `Observation` | Veld memory type for stored items |
 | `source_type` | `ai_generated` | Provenance veld records; keeps its injection scan on for agent output |
 | `extract_with_llm` | `False` | Split task results with CrewAI's LLM before storing |
-| `trusted_only` | `True` | Return only memories veld marks `source_trusted` (see above) |
-| `include_suspected` | `False` | Also return memories veld flags as suspected prompt injection; needs `trusted_only=False` |
+| `trusted_only` | `False` | Strict mode: return only memories veld marks `source_trusted` (see above) |
+| `include_suspected` | `False` | Also return memories veld flags as suspected prompt injection, labelled; strict mode withholds them regardless |
 | `recall_whole_user` | `False` | Recall from every memory under the `user_id`, not only this adapter's |
 | `raise_on_error` | `False` | Raise from a failed recall instead of warning and returning no matches |
 | `timeout` | `10` | Seconds per veld request |

@@ -3,22 +3,23 @@ import type { RecallMemory } from "./types.js";
 export interface FormatOptions {
   /**
    * Keep memories whose source veld does not trust (`source_trusted` is not
-   * true). Default false: they are withheld. When kept, they are labelled
-   * untrusted. Veld records every memory written over its HTTP API as
-   * untrusted, including the ones `veld_remember` stores.
+   * true), labelled untrusted. Default true. `false` is strict mode: they are
+   * withheld. Strict mode is not the default because veld never marks a memory
+   * written over its HTTP API as trusted (the remember route's
+   * `CLIENT_UNASSERTABLE`), so it withholds everything `veld_remember` stores.
    */
   includeUntrusted?: boolean;
   /**
-   * Keep memories veld flags as suspected prompt injection. Default false: they
-   * are withheld. Veld flags only untrusted memories, so this takes effect with
-   * `includeUntrusted`. When kept, they are labelled.
+   * Keep memories veld flags as suspected prompt injection, labelled. Default
+   * false: they are withheld. Strict mode withholds them regardless, as veld
+   * flags only untrusted memories.
    */
   includeSuspected?: boolean;
 }
 
 /** How many recalled memories the trust filters held back, by reason. */
 export interface Withheld {
-  /** Untrusted source, withheld because `includeUntrusted` is off. */
+  /** Untrusted source, withheld in strict mode (`includeUntrusted: false`). */
   untrusted: number;
   /** Suspected prompt injection, withheld because `includeSuspected` is off. */
   suspected: number;
@@ -56,28 +57,10 @@ export function partitionMemories(
   const withheld: Withheld = { untrusted: 0, suspected: 0 };
   for (const memory of memories) {
     if (memory.injection_suspected === true && !options.includeSuspected) withheld.suspected++;
-    else if (!isTrusted(memory) && !options.includeUntrusted) withheld.untrusted++;
+    else if (!isTrusted(memory) && options.includeUntrusted === false) withheld.untrusted++;
     else visible.push(memory);
   }
   return { visible, withheld };
-}
-
-const warnedClients = new WeakSet<object>();
-
-/**
- * Warn once per client, the first time untrusted memories are withheld from
- * it: with the default, an app reads back nothing it stored over HTTP, and
- * without a word that looks like memory not working.
- */
-export function warnWithheldOnce(client: object, withheld: Withheld): void {
-  if (withheld.untrusted === 0 || warnedClients.has(client)) return;
-  warnedClients.add(client);
-  console.warn(
-    `[veld] Withheld ${withheld.untrusted} recalled memories because veld does not trust ` +
-      "their source. Veld records every memory written over its HTTP API as untrusted, " +
-      "including the ones veld_remember stores. Pass includeUntrusted: true to use them, " +
-      'fenced and labelled trust="untrusted".',
-  );
 }
 
 /** Recalled memories minus the ones the trust filters withhold. */

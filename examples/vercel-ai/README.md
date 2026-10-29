@@ -23,13 +23,12 @@ const veld = new VeldClient({ userId: "alice" }); // VELD_API_URL, VELD_API_KEY 
 
 const result = await generateText({
   model,
-  tools: veldTools(veld, { includeUntrusted: true }),
+  tools: veldTools(veld),
   stopWhen: stepCountIs(5),
-  ...(await withVeldMemories(
-    veld,
-    { instructions: "You are a helpful assistant with long-term memory.", messages },
-    { includeUntrusted: true },
-  )),
+  ...(await withVeldMemories(veld, {
+    instructions: "You are a helpful assistant with long-term memory.",
+    messages,
+  })),
 });
 ```
 
@@ -37,9 +36,9 @@ const result = await generateText({
 - `withVeldMemories(veld, fields)` recalls with the last user message and puts the
   memories at the start of that message, fenced, escaped and labelled by trust, never in
   `instructions`.
-- `includeUntrusted: true` is needed to read back what the model stored: veld records every
-  memory written over its HTTP API as untrusted, and both helpers withhold untrusted
-  memories by default. See the package README's
+- Memories the model stored come back labelled `trust="untrusted"`, as veld records every
+  memory written over its HTTP API. `includeUntrusted: false` (strict mode) withholds them;
+  see the package README's
   [Trusted and untrusted memories](../../integrations/vercel-ai/README.md#trusted-and-untrusted-memories).
 
 ## Available Tools
