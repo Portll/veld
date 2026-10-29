@@ -109,6 +109,7 @@ the prompt text.
 | `trusted_only` | `True` | Return only memories veld marks `source_trusted` (see above) |
 | `include_suspected` | `False` | Also return memories veld flags as suspected prompt injection; needs `trusted_only=False` |
 | `recall_whole_user` | `False` | Recall from every memory under the `user_id`, not only this adapter's |
+| `raise_on_error` | `False` | Raise from a failed recall instead of warning and returning no matches |
 | `timeout` | `10` | Seconds per veld request |
 
 ## Errors
@@ -116,7 +117,11 @@ the prompt text.
 - Construction warns when `server_url` is plain `http://` to a host other than this machine
   (`127.0.0.1`, `localhost`, `::1`, `0.0.0.0`), since the API key would travel in clear text.
   Use `https://`, or set `VELD_ALLOW_HTTP=true` to silence it.
-- A failed recall warns and returns no matches, so the task runs without memory.
+- A failed recall warns and returns no matches, so the task runs without memory. Those empty
+  matches read the same as "nothing relevant"; with `raise_on_error=True` recall raises
+  `VeldRequestError` instead. CrewAI then reports a failed pre-task recall as
+  `MemoryRetrievalFailedEvent` and runs the task without memory, and the "Search memory"
+  tool reports the error to the agent.
 - `remember`, `forget`, `reset`, `update` and the listing methods raise
   `VeldRequestError`, with `status` (HTTP status) and `code` (veld's error code, such as
   `INVALID_API_KEY`).

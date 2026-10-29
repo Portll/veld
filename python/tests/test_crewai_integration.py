@@ -444,6 +444,40 @@ class TestRecall(unittest.TestCase):
         with self.assertWarns(UserWarning):
             self.assertEqual(memory.recall("q"), [])
 
+    def test_raise_on_error_raises_instead_of_returning_nothing(self):
+        routes = {("POST", "/api/recall"): FakeResponse(503, {"code": "SERVICE_UNAVAILABLE", "message": "down"})}
+        memory, _ = build(routes, raise_on_error=True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(M.VeldRequestError) as ctx:
+                memory.recall("q")
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(ctx.exception.code, "SERVICE_UNAVAILABLE")
+        self.assertEqual([w for w in caught if "recall failed" in str(w.message)], [])
+
+        memory, _ = build({("POST", "/api/recall"): requests.exceptions.ConnectionError("refused")},
+                          raise_on_error=True)
+        with self.assertRaises(M.VeldRequestError) as ctx:
+            memory.recall("q")
+        self.assertIsNone(ctx.exception.status)
+
+    def test_swallowed_failure_says_it_returned_nothing(self):
+        memory, _ = build({("POST", "/api/recall"): FakeResponse(503, {"code": "SERVICE_UNAVAILABLE", "message": "x"})})
+        with self.assertWarns(UserWarning) as ctx:
+            self.assertEqual(memory.recall("q"), [])
+        self.assertIn("returning no memories", str(ctx.warning))
+
+    def test_search_memory_tool_reports_a_failure_with_raise_on_error(self):
+        from crewai.tools.memory_tools import create_memory_tools
+
+        memory, _ = build(
+            {("POST", "/api/recall"): FakeResponse(401, {"code": "INVALID_API_KEY", "message": "bad key"})},
+            raise_on_error=True,
+        )
+        tools = {tool.name: tool for tool in create_memory_tools(memory)}
+        with self.assertRaises(M.VeldRequestError):
+            tools["Search memory"]._run(queries=["deadline"])
+
     def test_recall_waits_for_queued_saves(self):
         memory, session = build(
             {

@@ -640,7 +640,11 @@ class VeldCrewMemory(Memory):
     in the prompt, shows the trust label and leaves ``writer`` out.
 
     Errors: a failed recall warns and returns no matches, so a task still runs
-    without memory. ``remember`` raises ``VeldRequestError``. A failed background
+    without memory. Empty matches then read the same as "nothing relevant", so
+    ``raise_on_error=True`` makes recall raise ``VeldRequestError`` instead:
+    CrewAI reports a failed pre-task recall as ``MemoryRetrievalFailedEvent``
+    and runs the task without memory, and the "Search memory" tool reports the
+    error to the agent. ``remember`` raises ``VeldRequestError``. A failed background
     save from ``remember_many`` warns and is reported as CrewAI's
     ``MemorySaveFailedEvent``. ``forget``, ``reset``, ``update`` and the listing
     methods raise ``VeldRequestError``.
@@ -666,6 +670,8 @@ class VeldCrewMemory(Memory):
             takes effect with ``trusted_only=False``.
         recall_whole_user: Recall from every memory under the user_id, not only
             this adapter's.
+        raise_on_error: Raise from a failed recall instead of warning and
+            returning no matches.
     """
 
     server_url: str = Field(default="http://127.0.0.1:3030", description="URL of the veld server.")
@@ -699,6 +705,10 @@ class VeldCrewMemory(Memory):
     recall_whole_user: bool = Field(
         default=False,
         description="Recall from every memory under the user_id, not only this adapter's.",
+    )
+    raise_on_error: bool = Field(
+        default=False,
+        description="Raise VeldRequestError from a failed recall instead of warning and returning [].",
     )
     storage: Any = Field(
         default=None,
@@ -870,7 +880,8 @@ class VeldCrewMemory(Memory):
         ``recall_whole_user``) every memory of the user_id. Untrusted and
         suspected memories are withheld as the class docstring describes, and
         counted in ``last_withheld``. ``depth`` is accepted for compatibility and
-        has no effect. On failure, warns and returns an empty list.
+        has no effect. On failure, warns and returns an empty list, or raises
+        ``VeldRequestError`` with ``raise_on_error=True``.
         """
         self.drain_writes()
         self._last_withheld = {"untrusted": 0, "suspected": 0}
@@ -921,7 +932,9 @@ class VeldCrewMemory(Memory):
                     )
                 )
         except VeldRequestError as e:
-            warnings.warn(f"Veld memory recall failed: {e}")
+            if self.raise_on_error:
+                raise
+            warnings.warn(f"Veld memory recall failed, returning no memories: {e}")
             return []
 
         self._last_withheld = withheld
