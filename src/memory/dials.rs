@@ -308,7 +308,7 @@ pub struct CognitiveDials {
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
     /// `people_density`, `prf`, `entity_overlap`, `length_penalty`,
-    /// `temporal_topic_dedup`, `temporal_fact_boost`.
+    /// `temporal_topic_dedup`, `temporal_fact_boost`, `temporal_fact_untimed_fallback`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
 }
@@ -1058,6 +1058,7 @@ mod tests {
             "length_penalty",
             "temporal_topic_dedup",
             "temporal_fact_boost",
+            "temporal_fact_untimed_fallback",
         ];
         for id in &all_ids {
             assert!(

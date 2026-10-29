@@ -157,6 +157,9 @@ pub struct RetrievalDials {
     /// The `graph_candidates_only` dial: `None` is the engine default (the graph leg scores).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_candidates_only: Option<bool>,
+    /// The `disabled_signals` dial, sorted: empty is every signal on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_signals: Vec<String>,
 }
 
 impl RetrievalDials {
@@ -166,6 +169,11 @@ impl RetrievalDials {
             date_window_leg: dials.date_window_leg,
             fusion: dials.fusion,
             graph_candidates_only: dials.graph_candidates_only,
+            disabled_signals: {
+                let mut ids: Vec<String> = dials.disabled_signals.iter().cloned().collect();
+                ids.sort();
+                ids
+            },
         }
     }
 
@@ -179,6 +187,12 @@ impl RetrievalDials {
         }
         if let Some(v) = self.graph_candidates_only {
             set.push(format!("graph_candidates_only={v}"));
+        }
+        if !self.disabled_signals.is_empty() {
+            set.push(format!(
+                "disabled_signals={}",
+                self.disabled_signals.join(",")
+            ));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1478,10 +1492,18 @@ mod tests {
             graph_candidates_only: Some(true),
             ..Default::default()
         };
+        let untimed_off = RetrievalDials {
+            disabled_signals: vec!["temporal_fact_untimed_fallback".to_string()],
+            ..Default::default()
+        };
         for (set, named) in [
             (off, "date_window_leg=false"),
             (rrf, "fusion=rrf"),
             (admit_only, "graph_candidates_only=true"),
+            (
+                untimed_off,
+                "disabled_signals=temporal_fact_untimed_fallback",
+            ),
         ] {
             let set = Some(set);
             let defaults = Some(RetrievalDials::default());

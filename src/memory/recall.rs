@@ -946,6 +946,13 @@ impl super::MemorySystem {
                 // ---------------------------------------------------------------
                 // Fires when entity is known but event keywords are empty or
                 // Strategy 1 returned nothing.
+                // [signal: temporal_fact_untimed_fallback] With no time window to filter by, it
+                // takes every fact about the entity, up to 50 sources for one person; disabled,
+                // only time-window-filtered facts count. Default = on.
+                let untimed_entity_fallback = self
+                    .cognitive_dials
+                    .read()
+                    .signal_enabled("temporal_fact_untimed_fallback");
                 if boosted.is_empty() && !entity.is_empty() {
                     match self
                         .temporal_fact_store
@@ -964,7 +971,7 @@ impl super::MemorySystem {
                                 boosted.extend(
                                     filtered.into_iter().map(|f| f.source_memory_id.clone()),
                                 );
-                            } else {
+                            } else if untimed_entity_fallback {
                                 // No time window or no overlap — take all entity facts
                                 tracing::debug!(
                                     "Layer 0.6: Fallback entity-only found {} facts for '{}'",

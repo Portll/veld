@@ -98,6 +98,13 @@ on:
           graph term. Recorded as an override like fusion: pair it with record=true.
         required: false
         default: ''
+      disable_signals:
+        description: >-
+          Comma-separated recall signal ids for the disabled_signals dial (the ids listed on
+          CognitiveDials::disabled_signals), for a leave-one-out arm. Empty runs every signal.
+          Recorded as an override like fusion: pair it with record=true.
+        required: false
+        default: ''
       embedder:
         description: >-
           Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
@@ -269,6 +276,7 @@ jobs:
           VELD_TUNE_CE_BLEND: ${{ github.event.inputs.ce_blend || '' }}
           VELD_DIALS_FUSION: ${{ github.event.inputs.fusion || '' }}
           VELD_DIALS_GRAPH_CANDIDATES_ONLY: ${{ github.event.inputs.graph_candidates_only || '' }}
+          VELD_DIALS_DISABLE_SIGNALS: ${{ github.event.inputs.disable_signals || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
           # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
