@@ -1241,7 +1241,7 @@ pub fn ingest_corpus(
     corpus: &[CorpusItem],
 ) -> Result<HashMap<String, Uuid>> {
     guard_ner_backend(manager)?;
-    let mut map = HashMap::with_capacity(corpus.len());
+    let mut map: HashMap<String, Uuid> = HashMap::with_capacity(corpus.len());
     let ner = manager.get_neural_ner();
     let keyword_extractor = manager.get_keyword_extractor();
     let user_mem = manager.get_user_memory(EVAL_USER)?;
@@ -1302,12 +1302,26 @@ pub fn ingest_corpus(
                 None
             };
 
+        // A threaded item carries what the hook sends: the session's episode id, the memory's
+        // sequence number in it, and the id of the memory it follows.
+        let context = item.episode.as_ref().map(|episode| {
+            let mut ctx = crate::memory::index_text::threaded_context(item.created_at);
+            ctx.episode.episode_id = Some(episode.id.clone());
+            ctx.episode.sequence_number = Some(episode.sequence);
+            ctx.episode.preceding_memory_id = episode
+                .follows
+                .as_ref()
+                .and_then(|follows| map.get(follows))
+                .map(|uuid| uuid.to_string());
+            ctx
+        });
         let experience = Experience {
             experience_type: experience_type_for(&item.memory_type),
             content: item.content.clone(),
             entities: merged.clone(),
             tags: merged,
             ner_entities,
+            context,
             ..Default::default()
         };
 
@@ -3689,6 +3703,7 @@ mod tests {
                 memory_type: "fact".into(),
                 tags: vec![a.to_string(), b.to_string()],
                 created_at: base + chrono::Duration::minutes(k as i64),
+                episode: None,
             })
             .collect();
         ingest_corpus(&manager, &corpus).expect("ingest");
@@ -3884,6 +3899,7 @@ mod tests {
             memory_type: "fact".into(),
             tags: vec![],
             created_at: base,
+            episode: None,
         });
         // Lexical crowd: many Caroline memories so the gold has competition.
         for i in 0..20 {
@@ -3893,6 +3909,7 @@ mod tests {
                 memory_type: "fact".into(),
                 tags: vec![],
                 created_at: base + chrono::Duration::minutes(i as i64 + 1),
+                episode: None,
             });
         }
         let id_map = ingest_corpus(&manager, &corpus).expect("ingest");
@@ -4626,6 +4643,7 @@ mod tests {
             memory_type: "fact".to_string(),
             tags: vec![],
             created_at: base + Duration::minutes(i),
+            episode: None,
         };
         let mut corpus = vec![
             mk(
@@ -4723,6 +4741,7 @@ mod tests {
             memory_type: "fact".to_string(),
             tags: vec![],
             created_at: base + Duration::minutes(i),
+            episode: None,
         };
         let corpus = vec![
             mk("person", frame("Alice"), 0),
@@ -5344,6 +5363,7 @@ mod tests {
             memory_type: "fact".to_string(),
             tags: vec![],
             created_at: base + chrono::Duration::minutes(i),
+            episode: None,
         };
         let gold_text = "Melanie ran a marathon yesterday.";
         let corpus = vec![

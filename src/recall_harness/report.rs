@@ -160,6 +160,30 @@ pub struct RetrievalDials {
     /// The `disabled_signals` dial, sorted: empty is every signal on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_signals: Vec<String>,
+    /// The `enabled_signals` dial, sorted: empty is no opt-in signal on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_signals: Vec<String>,
+    /// The `turn_context` dial: `None` is the engine default (on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_context: Option<bool>,
+    /// The `turn_context_embedding` dial: `None` is the engine default (off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_context_embedding: Option<bool>,
+    /// The `neighbour_expansion` dial: `None` is the engine default (on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbour_expansion: Option<bool>,
+    /// The `neighbour_expansion_top` dial: `None` is the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbour_expansion_top: Option<usize>,
+    /// The `neighbour_expansion_predecessor` dial: `None` is the engine default (off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbour_expansion_predecessor: Option<bool>,
+}
+
+fn sorted(ids: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().cloned().collect();
+    ids.sort();
+    ids
 }
 
 impl RetrievalDials {
@@ -169,11 +193,13 @@ impl RetrievalDials {
             date_window_leg: dials.date_window_leg,
             fusion: dials.fusion,
             graph_candidates_only: dials.graph_candidates_only,
-            disabled_signals: {
-                let mut ids: Vec<String> = dials.disabled_signals.iter().cloned().collect();
-                ids.sort();
-                ids
-            },
+            disabled_signals: sorted(&dials.disabled_signals),
+            enabled_signals: sorted(&dials.enabled_signals),
+            turn_context: dials.turn_context,
+            turn_context_embedding: dials.turn_context_embedding,
+            neighbour_expansion: dials.neighbour_expansion,
+            neighbour_expansion_top: dials.neighbour_expansion_top,
+            neighbour_expansion_predecessor: dials.neighbour_expansion_predecessor,
         }
     }
 
@@ -193,6 +219,27 @@ impl RetrievalDials {
                 "disabled_signals={}",
                 self.disabled_signals.join(",")
             ));
+        }
+        if !self.enabled_signals.is_empty() {
+            set.push(format!(
+                "enabled_signals={}",
+                self.enabled_signals.join(",")
+            ));
+        }
+        if let Some(v) = self.turn_context {
+            set.push(format!("turn_context={v}"));
+        }
+        if let Some(v) = self.turn_context_embedding {
+            set.push(format!("turn_context_embedding={v}"));
+        }
+        if let Some(v) = self.neighbour_expansion {
+            set.push(format!("neighbour_expansion={v}"));
+        }
+        if let Some(v) = self.neighbour_expansion_top {
+            set.push(format!("neighbour_expansion_top={v}"));
+        }
+        if let Some(v) = self.neighbour_expansion_predecessor {
+            set.push(format!("neighbour_expansion_predecessor={v}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1496,6 +1543,14 @@ mod tests {
             disabled_signals: vec!["temporal_fact_untimed_fallback".to_string()],
             ..Default::default()
         };
+        let rerank_context = RetrievalDials {
+            enabled_signals: vec!["rerank_context".to_string()],
+            ..Default::default()
+        };
+        let no_expansion = RetrievalDials {
+            neighbour_expansion: Some(false),
+            ..Default::default()
+        };
         for (set, named) in [
             (off, "date_window_leg=false"),
             (flat, "fusion=flat"),
@@ -1504,6 +1559,8 @@ mod tests {
                 untimed_off,
                 "disabled_signals=temporal_fact_untimed_fallback",
             ),
+            (rerank_context, "enabled_signals=rerank_context"),
+            (no_expansion, "neighbour_expansion=false"),
         ] {
             let set = Some(set);
             let defaults = Some(RetrievalDials::default());

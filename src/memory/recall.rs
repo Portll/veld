@@ -243,7 +243,11 @@ impl super::MemorySystem {
             Some(_) => query.effective_competition_mode(),
             None => CompetitionMode::Coexist,
         };
-        let _ = Self::compete_memories(&mut memories, competition_mode);
+        let demote = self
+            .cognitive_dials
+            .read()
+            .signal_opted_in("competition_demote");
+        let _ = Self::compete_memories(&mut memories, competition_mode, demote);
 
         memories.truncate(query.max_results);
 
@@ -2575,6 +2579,8 @@ impl super::MemorySystem {
             // which is usually the oldest on its topic. Firing on every temporal query took
             // LoCoMo temporal hit@10 to zero.
             // [signal: temporal_topic_dedup] Gated by disabled_signals dial; default = always on.
+            // [signal: topic_dedup_topical] Opt-in via enabled_signals; default = off. Neutral on
+            // locomo-holdout (2026-10-21: 0 cases moved), so every shared entity counts.
             if query_parser::has_recency_intent(query_text)
                 && early_dials_snapshot.signal_enabled("temporal_topic_dedup")
             {
@@ -2582,6 +2588,7 @@ impl super::MemorySystem {
                     &mut fused,
                     &candidates,
                     crate::constants::TEMPORAL_DEDUP_MAX_CANDIDATES,
+                    early_dials_snapshot.signal_opted_in("topic_dedup_topical"),
                 );
                 if demoted > 0 {
                     tracing::debug!(
@@ -2945,6 +2952,40 @@ impl super::MemorySystem {
                         pre_dedup
                     );
                 }
+            }
+
+            // ===========================================================================
+            // LAYER 4.97: CONVERSATION NEIGHBOUR EXPANSION
+            // ===========================================================================
+            // The turn after a well-ranked conversation turn joins the pool just below
+            // it, so a reply that shares no word with the query reaches the
+            // cross-encoder and is judged on its own text. After every fused-score
+            // adjustment, before the cut it has to survive. Full pipeline only, so the
+            // layer-attribution rungs below Full measure what they did before.
+            let neighbours = if query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::Full)
+            {
+                self.neighbour_candidates(&res)
+            } else {
+                Vec::new()
+            };
+            crate::memory::gold_funnel::record("neighbour", neighbours.iter().map(|(id, _)| id));
+            if !neighbours.is_empty() {
+                let position: std::collections::HashMap<MemoryId, usize> = res
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, _))| (id.clone(), i))
+                    .collect();
+                let added = neighbours.len();
+                for (id, score) in neighbours {
+                    match position.get(&id) {
+                        Some(&i) => res[i].1 = res[i].1.max(score),
+                        None => res.push((id, score)),
+                    }
+                }
+                res.sort_by(|a, b| b.1.total_cmp(&a.1));
+                tracing::debug!("Layer 4.97: neighbour expansion placed {added} turns");
             }
 
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
@@ -3599,9 +3640,19 @@ impl super::MemorySystem {
         // Some(false)) fully skips this layer. The `rerank_count` dial caps the
         // candidate budget; absent that, the hardcoded ce_cap applies.
         let rerank_shape = query_parser::classify_rerank_shape(query_text, decomposed, &query_type);
-        let (layer53_use_reranking, layer53_rerank_count_dial, ce_w) = {
+        let (layer53_use_reranking, layer53_rerank_count_dial, ce_w, rerank_context) = {
             let d = self.cognitive_dials.read();
-            (d.use_reranking, d.rerank_count, d.ce_share(rerank_shape))
+            (
+                d.use_reranking,
+                d.rerank_count,
+                d.ce_share(rerank_shape),
+                // [signal: rerank_context] Opt-in via enabled_signals; default = off.
+                // Measured 2026-10-21 on locomo-holdout at pool 100 / count 50 / blend 0.4:
+                // switching it off from the full set cost recall@10 -0.030 [-0.042, -0.018]
+                // and MRR -0.019. It lengthens every reranked passage of a linked memory, so
+                // it waits for the rerank-depth decision and a paired latency measurement.
+                d.turn_context_enabled() && d.signal_opted_in("rerank_context"),
+            )
         };
         if ce_w < crate::constants::CE_BLEND_SKIP_BELOW {
             tracing::debug!(
@@ -3641,6 +3692,10 @@ impl super::MemorySystem {
                 // carries as an entity, that entity is put in front of the text the
                 // cross-encoder reads. Nothing changes for a query with no identifier in it.
                 //
+                // With the `rerank_context` opt-in, a linked memory is read with its context
+                // (index_text): its date and the memory it follows. A reply that names nothing is otherwise judged on its own
+                // words, which is how anaphoric gold reached the pool and still lost the
+                // blend.
                 // Without a cross-encoder only dense similarity is left, and it cannot tell
                 // `serve.mjs` from `server.mjs`. A query that names a path some candidate
                 // declared keeps its fused order, which already carries the identifier boost.
@@ -3682,10 +3737,19 @@ impl super::MemorySystem {
                                 .iter()
                                 .any(|q| query_token_matches_entity(q, &e))
                         });
-                        let text = if named.is_empty() {
-                            m.experience.content.clone()
+                        let passage = if rerank_context && super::index_text::applies(&m.experience)
+                        {
+                            super::index_text::for_stored(m, |id| {
+                                self.long_term_memory.get(id).ok()
+                            })
+                            .embedding
                         } else {
-                            format!("{}\n{}", named.join(" "), m.experience.content)
+                            m.experience.content.clone()
+                        };
+                        let text = if named.is_empty() {
+                            passage
+                        } else {
+                            format!("{}\n{}", named.join(" "), passage)
                         };
                         (
                             m.id.clone(),
@@ -4332,8 +4396,15 @@ impl super::MemorySystem {
         // (Linguistic boost moved to Layer 5.85, before ordinal resolution)
 
         let competition_mode = query.effective_competition_mode();
+        // [signal: competition_demote] Opt-in via enabled_signals; default = off.
+        // Neutral on locomo-holdout (2026-10-21: 1 case moved), so deleting each
+        // competition's loser stays the default.
+        let demote = self
+            .cognitive_dials
+            .read()
+            .signal_opted_in("competition_demote");
         let (competitions_detected, memories_eliminated) =
-            Self::compete_memories(&mut memories, competition_mode);
+            Self::compete_memories(&mut memories, competition_mode, demote);
         if competitions_detected > 0 {
             tracing::info!(
                 mode = ?competition_mode,
@@ -5381,8 +5452,19 @@ impl super::MemorySystem {
     }
 
     /// Entity-aware retrieval-time competition for the live recall path.
-    fn compete_memories(memories: &mut Vec<SharedMemory>, mode: CompetitionMode) -> (usize, usize) {
-        use crate::constants::{COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_MAX_PAIRS};
+    ///
+    /// With `demote`, each loser is kept, scaled by
+    /// [`crate::constants::COMPETITION_LOSER_DEMOTION`] and marked with its opponent, and the
+    /// list is re-sorted; without it the loser is removed. Returns the competitions detected
+    /// and the memories removed.
+    fn compete_memories(
+        memories: &mut Vec<SharedMemory>,
+        mode: CompetitionMode,
+        demote: bool,
+    ) -> (usize, usize) {
+        use crate::constants::{
+            COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_LOSER_DEMOTION, COMPETITION_MAX_PAIRS,
+        };
 
         if mode == CompetitionMode::Coexist || memories.len() < 2 {
             return (0, 0);
@@ -5401,6 +5483,7 @@ impl super::MemorySystem {
             .collect();
 
         let mut eliminated: HashSet<usize> = HashSet::new();
+        let mut lost_to: Vec<(usize, usize)> = Vec::new();
         let mut competitions_detected = 0;
         let mut pair_count = 0;
         let check_limit = memories.len().min(20);
@@ -5516,6 +5599,7 @@ impl super::MemorySystem {
                     left_idx
                 };
                 eliminated.insert(loser_idx);
+                lost_to.push((loser_idx, winner_idx));
 
                 let shared_entities: Vec<&String> = entity_sets[left_idx]
                     .intersection(&entity_sets[right_idx])
@@ -5533,6 +5617,27 @@ impl super::MemorySystem {
             if pair_count >= COMPETITION_MAX_PAIRS {
                 break;
             }
+        }
+
+        if demote {
+            if lost_to.is_empty() {
+                return (competitions_detected, 0);
+            }
+            for (loser_idx, winner_idx) in lost_to {
+                let mut loser: Memory = memories[loser_idx].as_ref().clone();
+                loser.set_score(loser.score.unwrap_or(0.0) * COMPETITION_LOSER_DEMOTION);
+                loser
+                    .experience
+                    .metadata
+                    .insert("competition_conflict".to_string(), "true".to_string());
+                loser.experience.metadata.insert(
+                    "competition_opponent".to_string(),
+                    memories[winner_idx].id.0.to_string(),
+                );
+                memories[loser_idx] = Arc::new(loser);
+            }
+            memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+            return (competitions_detected, 0);
         }
 
         let memories_eliminated = eliminated.len();
@@ -5564,6 +5669,99 @@ impl super::MemorySystem {
             31..=90 => 0.4, // Old: 40% weight
             _ => 0.2,       // Ancient: 20% weight (never completely forgotten)
         }
+    }
+
+    /// Neighbour expansion (recall Layer 4.97): the conversation turns next to the
+    /// best-ranked fused candidates, scored for the pre-rerank pool.
+    ///
+    /// An anaphoric reply ("Nate: I've had them for 3 years now!") has no word in common
+    /// with the question about it, but the turn before it usually does. For each of the
+    /// first `neighbour_expansion_top` candidates in `ranked` that is a live conversation
+    /// turn with a positive score, the turns recorded as following it (and, under
+    /// `neighbour_expansion_predecessor`, the turn it follows) are returned at the parent's
+    /// score times [`crate::constants::NEIGHBOUR_EXPANSION_SCORE_DECAY`].
+    ///
+    /// A neighbour already in `ranked` at that score or above is left out. One below it is
+    /// returned, so the caller lifts it: a turn already in the pool but under the cut is
+    /// as far from the cross-encoder as one that is not in the pool at all. The first
+    /// (best-ranked) parent to reach a neighbour scores it. Empty when the dial is off.
+    /// `ranked` must be in rank order; the result is in parent order.
+    pub(crate) fn neighbour_candidates(&self, ranked: &[(MemoryId, f32)]) -> Vec<(MemoryId, f32)> {
+        let (enabled, top, with_predecessor) = {
+            let dials = self.cognitive_dials.read();
+            (
+                dials.neighbour_expansion_enabled(),
+                dials.neighbour_expansion_top_n(),
+                dials.neighbour_expansion_predecessor_enabled(),
+            )
+        };
+        if !enabled || ranked.is_empty() {
+            return Vec::new();
+        }
+
+        let held: std::collections::HashMap<&MemoryId, f32> =
+            ranked.iter().map(|(id, score)| (id, *score)).collect();
+        let mut claimed: HashSet<MemoryId> = HashSet::new();
+        let mut out: Vec<(MemoryId, f32)> = Vec::new();
+        let (mut successors, mut predecessors) = (0u64, 0u64);
+
+        for (parent_id, parent_score) in ranked.iter().take(top) {
+            if !parent_score.is_finite() || *parent_score <= 0.0 {
+                continue;
+            }
+            let Some(parent) = self.live_memory(parent_id) else {
+                continue;
+            };
+            if !super::index_text::applies(&parent.experience) {
+                continue;
+            }
+            let score = parent_score * crate::constants::NEIGHBOUR_EXPANSION_SCORE_DECAY;
+
+            let mut neighbours: Vec<(MemoryId, bool)> = self
+                .live_turn_successors(parent_id)
+                .into_iter()
+                .take(crate::constants::NEIGHBOUR_EXPANSION_SUCCESSORS_PER_TURN)
+                .map(|successor| (successor.id.clone(), false))
+                .collect();
+            if with_predecessor {
+                if let Some(predecessor) =
+                    super::index_text::preceding_memory_id(&parent.experience)
+                        .and_then(|id| self.live_memory(&id))
+                        .filter(|memory| super::index_text::applies(&memory.experience))
+                {
+                    neighbours.push((predecessor.id.clone(), true));
+                }
+            }
+
+            for (id, is_predecessor) in neighbours {
+                if !claimed.insert(id.clone()) {
+                    continue;
+                }
+                if held.get(&id).is_some_and(|current| *current >= score) {
+                    continue;
+                }
+                if is_predecessor {
+                    predecessors += 1;
+                } else {
+                    successors += 1;
+                }
+                out.push((id, score));
+            }
+        }
+
+        crate::metrics::RECALL_NEIGHBOUR_CANDIDATES_TOTAL
+            .with_label_values(&["successor"])
+            .inc_by(successors);
+        crate::metrics::RECALL_NEIGHBOUR_CANDIDATES_TOTAL
+            .with_label_values(&["predecessor"])
+            .inc_by(predecessors);
+        tracing::debug!(
+            parents = top.min(ranked.len()),
+            successors,
+            predecessors,
+            "recall [layer:4.97] neighbour expansion"
+        );
+        out
     }
 
     /// Expand retrieved memories with their hierarchy context
@@ -6461,6 +6659,12 @@ fn graph_activation_factor(graph_w: f32, activation: f32) -> f32 {
 /// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85, once
 /// however many newer memories share its topic. Compounded per pair, the oldest memory on a
 /// busy topic fell by 0.85^n and left the top 50 entirely.
+///
+/// `topical` (the `topic_dedup_topical` opt-in) reads topic from the entities that tell
+/// candidates apart: an entity carried by more than a quarter of the compared candidates (a
+/// speaker, a conversation, a project or repo tag) names the setting, not the topic, and is
+/// left out of the overlap.
+///
 /// Pairs are visited in content order: when two same-topic memories share a timestamp the
 /// second one visited is demoted, so the order must not come from the map's hash order.
 /// Returns the number of memories demoted.
@@ -6468,6 +6672,7 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
     fused: &mut std::collections::HashMap<MemoryId, f32>,
     candidates: &RecallCandidates<'_, S>,
     cap: usize,
+    topical: bool,
 ) -> usize {
     let mut entries: Vec<(MemoryId, f32, Arc<CandidateView>)> = fused
         .iter()
@@ -6486,9 +6691,31 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
     entries.truncate(cap);
     entries.sort_by(by_content);
 
+    let background: HashSet<&str> = if topical {
+        let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, _, view) in &entries {
+            let distinct: HashSet<&str> = view.entities_lower.iter().map(String::as_str).collect();
+            for entity in distinct {
+                *df.entry(entity).or_default() += 1;
+            }
+        }
+        let bar = (entries.len() / 4).max(1);
+        df.into_iter()
+            .filter(|(_, carried)| *carried > bar)
+            .map(|(entity, _)| entity)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let entity_sets: Vec<HashSet<&str>> = entries
         .iter()
-        .map(|(_, _, view)| view.entities_lower.iter().map(String::as_str).collect())
+        .map(|(_, _, view)| {
+            view.entities_lower
+                .iter()
+                .map(String::as_str)
+                .filter(|entity| !background.contains(entity))
+                .collect()
+        })
         .collect();
 
     let mut older: HashSet<&MemoryId> = HashSet::new();
@@ -7236,6 +7463,234 @@ mod query_token_tests {
 }
 
 #[cfg(test)]
+mod neighbour_expansion_tests {
+    use super::*;
+    use crate::memory::dials::CognitiveDials;
+    use crate::memory::{MemoryConfig, MemorySystem};
+    use chrono::TimeZone;
+    use tempfile::TempDir;
+
+    const DECAY: f32 = crate::constants::NEIGHBOUR_EXPANSION_SCORE_DECAY;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn at(minute: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2023, 5, 20, 14, minute, 0)
+            .unwrap()
+    }
+
+    fn turn(sys: &MemorySystem, content: &str, speaker: &str, minute: u32) -> MemoryId {
+        sys.remember(
+            Experience {
+                experience_type: ExperienceType::Conversation,
+                content: content.to_string(),
+                tags: vec!["conv-42".to_string(), speaker.to_string()],
+                entities: vec!["conv-42".to_string(), speaker.to_string()],
+                ..Default::default()
+            },
+            Some(at(minute)),
+        )
+        .expect("turn stored")
+    }
+
+    /// question → reply → follow-up, one conversation.
+    fn conversation(sys: &MemorySystem) -> (MemoryId, MemoryId, MemoryId) {
+        let question = turn(
+            sys,
+            "Joanna: How are your turtles doing, Nate?",
+            "Joanna",
+            1,
+        );
+        let reply = turn(sys, "Nate: I've had them for 3 years now!", "Nate", 2);
+        let follow_up = turn(sys, "Joanna: Wow, that long!", "Joanna", 3);
+        (question, reply, follow_up)
+    }
+
+    #[test]
+    fn a_ranked_turn_brings_its_successor_in_just_below_it() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let got = sys.neighbour_candidates(&[(question, 0.5)]);
+        assert_eq!(got, vec![(reply, 0.5 * DECAY)]);
+    }
+
+    #[test]
+    fn a_successor_already_above_the_decayed_score_is_left_alone() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let got = sys.neighbour_candidates(&[(question, 0.5), (reply.clone(), 0.48)]);
+        assert!(!got.iter().any(|(id, _)| *id == reply), "{got:?}");
+    }
+
+    #[test]
+    fn a_successor_below_the_cut_is_lifted() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let got = sys.neighbour_candidates(&[(question, 0.5), (reply.clone(), 0.01)]);
+        assert!(got.contains(&(reply, 0.5 * DECAY)), "{got:?}");
+    }
+
+    #[test]
+    fn the_best_ranked_parent_scores_a_shared_neighbour() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, follow_up) = conversation(&sys);
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        });
+        // The reply is the question's successor and the follow-up's predecessor.
+        let got = sys.neighbour_candidates(&[(follow_up, 0.6), (question, 0.5)]);
+        assert_eq!(
+            got.iter().filter(|(id, _)| *id == reply).count(),
+            1,
+            "{got:?}"
+        );
+        assert!(got.contains(&(reply, 0.6 * DECAY)), "{got:?}");
+    }
+
+    #[test]
+    fn only_the_top_n_are_read() {
+        let (sys, _tmp) = fresh_system();
+        let (question, _, _) = conversation(&sys);
+        let absent = MemoryId(uuid::Uuid::new_v4());
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion_top: Some(1),
+            ..Default::default()
+        });
+        assert!(sys
+            .neighbour_candidates(&[(absent, 0.9), (question, 0.5)])
+            .is_empty());
+    }
+
+    #[test]
+    fn a_non_turn_parent_and_a_non_positive_score_bring_nothing() {
+        let (sys, _tmp) = fresh_system();
+        let (question, _, _) = conversation(&sys);
+        let note = sys
+            .remember(
+                Experience {
+                    experience_type: ExperienceType::Observation,
+                    content: "Turtles can live for decades.".to_string(),
+                    ..Default::default()
+                },
+                Some(at(4)),
+            )
+            .expect("note stored");
+        assert!(sys.neighbour_candidates(&[(note, 0.9)]).is_empty());
+        assert!(sys.neighbour_candidates(&[(question, 0.0)]).is_empty());
+    }
+
+    #[test]
+    fn the_predecessor_comes_in_only_under_its_dial() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let alone = sys.neighbour_candidates(&[(reply.clone(), 0.5)]);
+        assert!(
+            !alone.iter().any(|(id, _)| *id == question),
+            "the predecessor leg is off by default: {alone:?}"
+        );
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        });
+        let got = sys.neighbour_candidates(&[(reply, 0.5)]);
+        assert!(got.contains(&(question, 0.5 * DECAY)), "{got:?}");
+    }
+
+    #[test]
+    fn the_dial_switches_expansion_off() {
+        let (sys, _tmp) = fresh_system();
+        let (question, _, _) = conversation(&sys);
+        sys.set_cognitive_dials(CognitiveDials {
+            neighbour_expansion: Some(false),
+            ..Default::default()
+        });
+        assert!(sys.neighbour_candidates(&[(question, 0.5)]).is_empty());
+    }
+
+    /// The gold funnel's `neighbour` stage records the leg's own list, the way
+    /// `date_window` records the date leg's.
+    #[test]
+    fn the_funnel_records_the_neighbour_stage() {
+        let (sys, _tmp) = fresh_system();
+        let (_, reply, _) = conversation(&sys);
+        let query = Query {
+            query_text: Some("How are your turtles doing, Nate?".to_string()),
+            max_results: 5,
+            ..Default::default()
+        };
+        crate::memory::gold_funnel::begin(HashSet::from([reply]));
+        sys.recall(&query).expect("recall");
+        let funnel = crate::memory::gold_funnel::take().expect("funnel armed");
+        assert!(
+            funnel.iter().any(|(stage, _)| stage == "neighbour"),
+            "{funnel:?}"
+        );
+    }
+
+    /// A follower stores the leader's snapshots without resolving anything, and still
+    /// builds the successor index, because the leader threaded each turn's prior into
+    /// the record it replicates.
+    #[test]
+    fn a_follower_applying_snapshots_records_the_leaders_successors() {
+        let (leader, _leader_tmp) = fresh_system();
+        let (question, reply, follow_up) = conversation(&leader);
+        let snapshots: Vec<Memory> = [&question, &reply, &follow_up]
+            .into_iter()
+            .map(|id| leader.get_memory(id).expect("stored on the leader"))
+            .collect();
+        let (follower, _follower_tmp) = fresh_system();
+        follower
+            .upsert_memories(&snapshots)
+            .expect("snapshots applied");
+        assert_eq!(follower.turn_successors(&question), vec![reply.clone()]);
+        assert_eq!(follower.turn_successors(&reply), vec![follow_up]);
+    }
+
+    /// The source a journaled BM25 projection reads derives a stored turn's document from
+    /// the record alone: its date, and the entities of the turn it follows.
+    #[test]
+    fn the_projection_source_derives_a_stored_turns_document() {
+        let (sys, _tmp) = fresh_system();
+        let (question, reply, _) = conversation(&sys);
+        let source = sys.bm25_document_source();
+        let stored_reply = sys.get_memory(&reply).expect("reply stored");
+        let text = source
+            .turn_text(&stored_reply)
+            .expect("a conversation turn is contextualised");
+        assert!(text.bm25_content.contains("20 May 2023"), "{text:?}");
+        assert!(
+            text.bm25_entities.iter().any(|e| e == "Joanna"),
+            "the prior turn's speaker: {text:?}"
+        );
+        let first_turn = sys.get_memory(&question).expect("question stored");
+        let opening = source.turn_text(&first_turn).expect("contextualised");
+        assert!(
+            !opening.bm25_content.contains("(previous:"),
+            "the opening turn follows nothing: {opening:?}"
+        );
+
+        sys.set_cognitive_dials(CognitiveDials {
+            turn_context: Some(false),
+            ..Default::default()
+        });
+        assert!(
+            source.turn_text(&stored_reply).is_none(),
+            "the dial off indexes the bare content on both paths"
+        );
+    }
+}
+
+#[cfg(test)]
 mod date_window_leg_tests {
     use super::*;
     use crate::memory::dials::CognitiveDials;
@@ -7729,7 +8184,7 @@ mod candidate_projection_tests {
         let before = fused.clone();
         let candidates = RecallCandidates::new(&source);
 
-        let demoted = temporal_topic_dedup(&mut fused, &candidates, 50);
+        let demoted = temporal_topic_dedup(&mut fused, &candidates, 50, false);
         assert_eq!(
             demoted, 49,
             "every compared memory but the newest has a newer one on its topic"
@@ -7743,6 +8198,97 @@ mod candidate_projection_tests {
         for id in &by_rank[10..59] {
             assert!((fused[id] - before[id] * 0.85).abs() < 1e-4);
         }
+    }
+
+    /// Entities every candidate carries (a speaker, a project) are the setting, not a
+    /// topic: in topical mode they demote nobody.
+    #[test]
+    fn topical_dedup_ignores_entities_the_whole_pool_carries() {
+        let mut source = CountingSource::default();
+        let base = chrono::Utc::now() - chrono::Duration::days(100);
+        let mut fused: HashMap<MemoryId, f32> = HashMap::new();
+        for rank in 0..20 {
+            let mut m = memory(&format!("note {rank:02}"), &["veld", "Nate"]);
+            m.created_at = base + chrono::Duration::days(rank);
+            fused.insert(m.id.clone(), 1.0 + rank as f32);
+            source.stored.insert(m.id.clone(), m);
+        }
+        let before = fused.clone();
+        let candidates = RecallCandidates::new(&source);
+        assert_eq!(temporal_topic_dedup(&mut fused, &candidates, 50, true), 0);
+        assert_eq!(fused, before);
+    }
+
+    /// A topic shared by a few candidates demotes each older one once, however many
+    /// newer statements of it there are.
+    #[test]
+    fn topical_dedup_demotes_an_older_statement_once() {
+        let mut source = CountingSource::default();
+        let base = chrono::Utc::now() - chrono::Duration::days(100);
+        let mut fused: HashMap<MemoryId, f32> = HashMap::new();
+        let mut redis: Vec<MemoryId> = Vec::new();
+        for rank in 0..12 {
+            let topic = if rank < 3 { "redis" } else { "other" };
+            let mut m = memory(&format!("note {rank:02}"), &["veld", topic]);
+            m.created_at = base + chrono::Duration::days(rank);
+            fused.insert(m.id.clone(), 1.0);
+            if rank < 3 {
+                redis.push(m.id.clone());
+            }
+            source.stored.insert(m.id.clone(), m);
+        }
+        let candidates = RecallCandidates::new(&source);
+        temporal_topic_dedup(&mut fused, &candidates, 50, true);
+        assert!(
+            (fused[&redis[0]] - 0.85).abs() < 1e-6,
+            "two newer: demoted once"
+        );
+        assert!((fused[&redis[1]] - 0.85).abs() < 1e-6);
+        assert_eq!(fused[&redis[2]], 1.0, "the newest statement leads");
+    }
+
+    /// Two memories that compete are both often answers ("Nate won the regional
+    /// tournament", "Nate won his third tournament"): the loser stays, below its winner.
+    #[test]
+    fn a_competition_loser_is_demoted_not_dropped() {
+        use crate::constants::COMPETITION_LOSER_DEMOTION;
+        use crate::memory::types::CompetitionMode;
+        let pair = || -> Vec<SharedMemory> {
+            [
+                ("Nate won the regional tournament", 0.9),
+                ("Nate won his third tournament", 0.8),
+            ]
+            .into_iter()
+            .map(|(content, score)| {
+                let mut m = memory(content, &["Nate", "tournament"]);
+                m.experience.embeddings = Some(vec![0.6, 0.8]);
+                m.set_score(score);
+                Arc::new(m)
+            })
+            .collect()
+        };
+
+        let mut demoted = pair();
+        let (detected, removed) = crate::memory::MemorySystem::compete_memories(
+            &mut demoted,
+            CompetitionMode::ResolveStrongest,
+            true,
+        );
+        assert_eq!((detected, removed), (1, 0));
+        assert_eq!(demoted.len(), 2);
+        assert!((demoted[1].score.unwrap() - 0.8 * COMPETITION_LOSER_DEMOTION).abs() < 1e-6);
+        assert_eq!(
+            demoted[1].experience.metadata.get("competition_opponent"),
+            Some(&demoted[0].id.0.to_string())
+        );
+
+        let mut dropped = pair();
+        let (_, removed) = crate::memory::MemorySystem::compete_memories(
+            &mut dropped,
+            CompetitionMode::ResolveStrongest,
+            false,
+        );
+        assert_eq!((removed, dropped.len()), (1, 1));
     }
 }
 

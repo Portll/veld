@@ -110,6 +110,16 @@ for it.
   conversations, and 1,166 cases on 2026-10-21. Run ungated with `suite=locomo-holdout`. This is
   the number to report, with its interval.
 - `locomo-holdout-spent.txt` — hold-out cases whose individual results someone has examined.
+- `corpora/agent-episodes.jsonl`, `agent-episodes-cases.jsonl` — `suite=agent-episodes`: 187
+  coding-agent memories over five fictional projects, 147 of them in 14 sessions threaded the way
+  the Claude Code hook threads a session (each item's `episode` names its episode id, sequence
+  number and the item it follows; the harness sends them as `episode_id`, `sequence_number` and
+  `preceding_memory_id`), and 40 unthreaded project notes. Every memory carries its project tag.
+  80 cases: `adj` asks about a fix or outcome in the words of the memory before it, `back` about a
+  cause in the words of the memory after it, `dir` are direct lookups (controls), `dec` decisions,
+  `tmp` a fact that changed between sessions, `xp` the same kind of event in two projects. Cases
+  `agent-dev-*` may be read case by case; `agent-ho-*` are reported in aggregate only, as with
+  `locomo-holdout`. Synthetic, authored 2026-10-21 without reference to the ranking code; ungated.
 
 ## The held-out set (`locomo-holdout`)
 

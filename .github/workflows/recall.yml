@@ -31,11 +31,15 @@ on:
           gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall and
           0.04 on multi_hop at n=100, both above a 2% allowance. locomo contains the gate's
           conversation; locomo-holdout leaves it out, and every case someone has examined, and
-          is the number to report. Neither is gated.
+          is the number to report. Neither is gated. smoke is the 108-case set over hand-written
+          engineering memories, no dialogue: the check that a ranking change made for LoCoMo
+          does not cost non-conversational recall. agent-episodes is agent sessions shaped the
+          way the Claude Code hook writes them (tasks, errors and fixes threaded by episode)
+          among unthreaded project notes. Both are ungated.
         required: false
         default: 'locomo-gate'
         type: choice
-        options: ['locomo-gate', 'locomo', 'locomo-holdout']
+        options: ['locomo-gate', 'locomo', 'locomo-holdout', 'smoke', 'agent-episodes']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false
@@ -100,9 +104,17 @@ on:
         default: ''
       disable_signals:
         description: >-
-          Comma-separated recall signal ids for the disabled_signals dial (the ids listed on
-          CognitiveDials::disabled_signals), for a leave-one-out arm. Empty runs every signal.
-          Recorded as an override like fusion: pair it with record=true.
+          Comma-separated recall signals to switch off for this run (CognitiveDials
+          disabled_signals, VELD_DIALS_DISABLE_SIGNALS), for an ablation arm on one build: e.g.
+          turn_context,neighbour_expansion. A signal is a [signal: id] marker in
+          src/memory/recall.rs. Not gated: pair it with record=true.
+        required: false
+        default: ''
+      enable_signals:
+        description: >-
+          Comma-separated opt-in recall signals to switch on for this run (CognitiveDials
+          enabled_signals, VELD_DIALS_ENABLE_SIGNALS): ranking changes that did not earn a
+          default, e.g. rerank_context. Not gated: pair it with record=true.
         required: false
         default: ''
       embedder:
@@ -277,6 +289,7 @@ jobs:
           VELD_DIALS_FUSION: ${{ github.event.inputs.fusion || '' }}
           VELD_DIALS_GRAPH_CANDIDATES_ONLY: ${{ github.event.inputs.graph_candidates_only || '' }}
           VELD_DIALS_DISABLE_SIGNALS: ${{ github.event.inputs.disable_signals || '' }}
+          VELD_DIALS_ENABLE_SIGNALS: ${{ github.event.inputs.enable_signals || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
           # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;
