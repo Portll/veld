@@ -126,22 +126,18 @@ impl ProductQuantizer {
             iterations
         );
 
-        // Initialize centroids storage
-        self.centroids = Vec::with_capacity(n_subvectors);
-
-        // Train k-means for each subspace independently
-        for subvec_idx in 0..n_subvectors {
-            let start = subvec_idx * subvec_dim;
-            let end = start + subvec_dim;
-
-            // Extract subvectors for this subspace
-            let subvectors: Vec<Vec<f32>> =
-                vectors.iter().map(|v| v[start..end].to_vec()).collect();
-
-            // Run k-means clustering
-            let centroids = self.kmeans(&subvectors, n_centroids, iterations)?;
-            self.centroids.push(centroids);
-        }
+        // Each subspace's k-means is independent of the others', so they train in parallel.
+        use rayon::prelude::*;
+        self.centroids = (0..n_subvectors)
+            .into_par_iter()
+            .map(|subvec_idx| {
+                let start = subvec_idx * subvec_dim;
+                let end = start + subvec_dim;
+                let subvectors: Vec<Vec<f32>> =
+                    vectors.iter().map(|v| v[start..end].to_vec()).collect();
+                self.kmeans(&subvectors, n_centroids, iterations)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         self.trained = true;
         tracing::info!("PQ training complete");

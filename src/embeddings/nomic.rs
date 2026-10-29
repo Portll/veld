@@ -561,30 +561,15 @@ impl NomicEmbedder {
         self.encode_raw(&prefixed)
     }
 
-    /// Batch encode documents (prepends "search_document: " prefix to each)
+    /// [`Self::encode_document`] for each text, one inference apiece (see
+    /// [`Embedder::encode_batch`] for why not one batched run).
     pub fn encode_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let prefixed: Vec<String> = texts
-            .iter()
-            .map(|t| format!("{SEARCH_DOCUMENT_PREFIX}{t}"))
-            .collect();
-        let prefixed_refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
-        self.encode_batch_raw(&prefixed_refs)
+        texts.iter().map(|t| self.encode_document(t)).collect()
     }
 
-    /// Batch encode queries (prepends "search_query: " prefix to each)
+    /// [`Self::encode_query`] for each text, one inference apiece.
     pub fn encode_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let prefixed: Vec<String> = texts
-            .iter()
-            .map(|t| format!("{SEARCH_QUERY_PREFIX}{t}"))
-            .collect();
-        let prefixed_refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
-        self.encode_batch_raw(&prefixed_refs)
+        texts.iter().map(|t| self.encode_query(t)).collect()
     }
 
     /// Raw encode without any prefix (text must already include prefix if needed)
@@ -661,108 +646,6 @@ impl NomicEmbedder {
                     e
                 );
                 self.generate_embedding_simplified(text)
-            }
-        }
-    }
-
-    /// Batch encode without prefix manipulation (texts must already include prefixes)
-    fn encode_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let empty_embedding = vec![0.0; self.dimension];
-        if texts.iter().all(|t| t.is_empty()) {
-            return Ok(vec![empty_embedding; texts.len()]);
-        }
-
-        if self.simplified_mode {
-            let start = std::time::Instant::now();
-            let results: Result<Vec<_>> = texts
-                .iter()
-                .map(|text| {
-                    if text.is_empty() {
-                        Ok(vec![0.0; self.dimension])
-                    } else {
-                        self.generate_embedding_simplified(text)
-                    }
-                })
-                .collect();
-            let duration = start.elapsed().as_secs_f64();
-
-            crate::metrics::EMBEDDING_GENERATE_DURATION
-                .with_label_values(&["nomic_simplified_batch"])
-                .observe(duration);
-            crate::metrics::EMBEDDING_GENERATE_TOTAL
-                .with_label_values(&[
-                    "nomic_simplified_batch",
-                    if results.is_ok() {
-                        "success"
-                    } else {
-                        "failure"
-                    },
-                ])
-                .inc();
-
-            return results;
-        }
-
-        let start = std::time::Instant::now();
-
-        // Filter out empty strings and track their positions
-        let (non_empty_texts, empty_indices): (Vec<_>, Vec<_>) =
-            texts.iter().enumerate().partition(|(_, t)| !t.is_empty());
-
-        let non_empty_texts: Vec<&str> = non_empty_texts.into_iter().map(|(_, t)| *t).collect();
-        let empty_indices: Vec<usize> = empty_indices.into_iter().map(|(i, _)| i).collect();
-
-        match self.generate_embeddings_batch_onnx(&non_empty_texts) {
-            Ok(embeddings) => {
-                let duration = start.elapsed().as_secs_f64();
-                crate::metrics::EMBEDDING_GENERATE_DURATION
-                    .with_label_values(&["nomic_onnx_batch"])
-                    .observe(duration);
-                crate::metrics::EMBEDDING_GENERATE_TOTAL
-                    .with_label_values(&["nomic_onnx_batch", "success"])
-                    .inc();
-
-                // Reconstruct results with empty embeddings in correct positions
-                let mut results = Vec::with_capacity(texts.len());
-                let mut embedding_iter = embeddings.into_iter();
-
-                for i in 0..texts.len() {
-                    if empty_indices.contains(&i) {
-                        results.push(vec![0.0; self.dimension]);
-                    } else {
-                        results.push(
-                            embedding_iter
-                                .next()
-                                .unwrap_or_else(|| vec![0.0; self.dimension]),
-                        );
-                    }
-                }
-
-                Ok(results)
-            }
-            Err(e) => {
-                crate::metrics::EMBEDDING_GENERATE_TOTAL
-                    .with_label_values(&["nomic_onnx_batch", "failure"])
-                    .inc();
-                tracing::warn!(
-                    "Nomic batch ONNX inference failed: {}. Falling back to sequential simplified.",
-                    e
-                );
-
-                texts
-                    .iter()
-                    .map(|text| {
-                        if text.is_empty() {
-                            Ok(vec![0.0; self.dimension])
-                        } else {
-                            self.generate_embedding_simplified(text)
-                        }
-                    })
-                    .collect()
             }
         }
     }
@@ -960,139 +843,10 @@ impl NomicEmbedder {
         // Matryoshka: truncate to the configured dimension and re-normalize.
         Ok((self.apply_matryoshka(pooled), queue_ms, run_ms))
     }
-
-    /// Generate embeddings for multiple texts in a single ONNX batch
-    fn generate_embeddings_batch_onnx(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let model = self.ensure_model_loaded()?;
-        let batch_size = texts.len();
-        let max_length = self.config.max_length;
-
-        // Tokenize all texts before grabbing a session — purely CPU work, no
-        // reason to serialize it behind the model lock.
-        let encodings: Vec<_> = texts
-            .iter()
-            .map(|text| {
-                model
-                    .tokenizer
-                    .encode(*text, true)
-                    .map_err(|e| anyhow::anyhow!("Nomic tokenization failed: {e}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // The batched seq_len is the longest tokenization in the batch, aligned
-        // to the next multiple of 32, capped at max_length. Empty batches and
-        // short queries no longer pay full 512-token cost.
-        let longest = encodings
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0);
-        let seq_len = align_seq_len(longest.min(max_length), max_length);
-
-        // Prepare batched tensors
-        let total_elements = batch_size * seq_len;
-        let mut input_ids = vec![0i64; total_elements];
-        let mut attention_masks = vec![0i64; total_elements];
-        let token_type_ids = vec![0i64; total_elements];
-
-        for (batch_idx, encoding) in encodings.iter().enumerate() {
-            let tokens = encoding.get_ids();
-            let attention_mask = encoding.get_attention_mask();
-            let offset = batch_idx * seq_len;
-
-            for (i, &token) in tokens.iter().take(seq_len).enumerate() {
-                input_ids[offset + i] = token as i64;
-            }
-            for (i, &mask) in attention_mask.iter().take(seq_len).enumerate() {
-                attention_masks[offset + i] = mask as i64;
-            }
-        }
-
-        // Acquire a pool slot for the run only.
-        let lock_timeout = std::time::Duration::from_secs(30);
-        let mut session = model.sessions.acquire(lock_timeout).ok_or_else(|| {
-            tracing::error!(
-                "Nomic ONNX session lock timed out after {}s in batch embed",
-                lock_timeout.as_secs()
-            );
-            anyhow::anyhow!(
-                "Nomic ONNX session lock timeout ({}s) in batch embed",
-                lock_timeout.as_secs()
-            )
-        })?;
-
-        // Create batched input tensors
-        let input_ids_value = Value::from_array((vec![batch_size, seq_len], input_ids))?;
-        let attention_mask_value =
-            Value::from_array((vec![batch_size, seq_len], attention_masks.clone()))?;
-        let token_type_ids_value = Value::from_array((vec![batch_size, seq_len], token_type_ids))?;
-
-        // Run batch inference. `outputs` borrows from `session`, so the lock
-        // stays held through pooling below; pool size (VELD_NOMIC_POOL_SIZE)
-        // is what enables concurrent batches across slots.
-        let outputs = session.run(ort::inputs![
-            "input_ids" => &input_ids_value,
-            "attention_mask" => &attention_mask_value,
-            "token_type_ids" => &token_type_ids_value,
-        ])?;
-
-        // Extract embeddings - output shape is [batch_size, seq_length, hidden_size]
-        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-        let (_shape, output_data) = output_tensor;
-
-        // Mean pooling for each item in batch
-        let mut results = Vec::with_capacity(batch_size);
-
-        for batch_idx in 0..batch_size {
-            // Pool at NOMIC_NATIVE_DIM (the model's row stride), truncate after.
-            let mut pooled = vec![0.0; NOMIC_NATIVE_DIM];
-            let mut mask_sum = 0.0;
-
-            let batch_offset = batch_idx * seq_len * NOMIC_NATIVE_DIM;
-            let attention_offset = batch_idx * seq_len;
-
-            for seq_idx in 0..seq_len {
-                if attention_masks[attention_offset + seq_idx] == 1 {
-                    for (dim_idx, pooled_val) in
-                        pooled.iter_mut().enumerate().take(NOMIC_NATIVE_DIM)
-                    {
-                        let idx = batch_offset + seq_idx * NOMIC_NATIVE_DIM + dim_idx;
-                        *pooled_val += output_data[idx];
-                    }
-                    mask_sum += 1.0;
-                }
-            }
-
-            if mask_sum > 0.0 {
-                for val in &mut pooled {
-                    *val /= mask_sum;
-                }
-            }
-
-            for val in pooled.iter_mut() {
-                if val.is_nan() || val.is_infinite() {
-                    *val = 0.0;
-                }
-            }
-
-            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > f32::EPSILON && !norm.is_nan() {
-                for val in &mut pooled {
-                    *val /= norm;
-                }
-            }
-
-            // Matryoshka: truncate to the configured dimension and re-normalize.
-            results.push(self.apply_matryoshka(pooled));
-        }
-
-        Ok(results)
-    }
 }
+
+/// The model name this embedder reports, and the one a corpus marker of `nomic` maps to.
+pub const MODEL_ID: &str = "nomic-embed-text-v1.5";
 
 impl Embedder for NomicEmbedder {
     fn id(&self) -> &str {
@@ -1100,7 +854,7 @@ impl Embedder for NomicEmbedder {
     }
 
     fn model_id(&self) -> &str {
-        "nomic-embed-text-v1.5"
+        MODEL_ID
     }
 
     /// Default encode uses the "search_document: " prefix (content being stored).

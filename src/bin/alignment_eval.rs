@@ -15,9 +15,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use veld::embeddings::{
-    read_alignment_file, Alignment, AlignmentPairId, Embedder, ProcrustesAlignment, RidgeAlignment,
-};
+use veld::embeddings::alignment_spaces::{load_alignment, spaces_of};
+use veld::embeddings::{read_alignment_file, Alignment, AlignmentPairId, Embedder};
 
 const PAIRS_VEC_MAGIC: &[u8; 8] = b"VELDPV1\0";
 
@@ -51,8 +50,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt::try_init().ok();
 
-    let (header, payload) = read_alignment_file(&args.alignment)?;
-    let expected_pid = AlignmentPairId::new(&args.primary_id, &args.secondary_id);
+    let (header, _) = read_alignment_file(&args.alignment)?;
+    // A map keyed by spaces names its own pair; one keyed by model names must match the ids.
+    let expected_pid = match spaces_of(&header.pair_id) {
+        Some((from, to)) => {
+            tracing::info!("evaluating the map from {from} to {to}");
+            header.pair_id.clone()
+        }
+        None => AlignmentPairId::new(&args.primary_id, &args.secondary_id),
+    };
     if header.pair_id != expected_pid {
         anyhow::bail!(
             "pair_id mismatch: file = {:?}, expected = {:?}",
@@ -60,15 +66,7 @@ fn main() -> Result<()> {
             expected_pid
         );
     }
-    let method = header.method.clone();
-    let alignment: Box<dyn Alignment> = match method.as_str() {
-        "orthogonal_procrustes" => Box::new(ProcrustesAlignment::from_payload(header, &payload)?),
-        "ridge" => Box::new(RidgeAlignment::from_payload(header, &payload)?),
-        other => anyhow::bail!(
-            "unsupported alignment method `{}` — alignment-eval handles procrustes and ridge",
-            other
-        ),
-    };
+    let alignment: Arc<dyn Alignment> = load_alignment(&args.alignment)?;
 
     let file =
         File::open(&args.pairs).with_context(|| format!("opening {}", args.pairs.display()))?;

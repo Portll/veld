@@ -47,6 +47,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::embeddings::space::{SlotSpaces, SpaceId};
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::intent_log::{payload, IntentPayload, LogMode};
 use crate::memory::types::MemoryId;
@@ -108,6 +109,15 @@ pub struct FeedPage {
     /// legacy log without one. A different value means the log was recreated.
     #[serde(default)]
     pub log_created: u64,
+    /// How the leader reads a vector slot that records no space. A snapshot journaled before
+    /// spaces were recorded carries such slots, and a follower with another embedder must not
+    /// read them as its own. Absent from a leader that predates spaces: the follower then reads
+    /// them as its own, as it always did.
+    #[serde(default)]
+    pub slot_spaces: Option<SlotSpaces>,
+    /// The spaces of the vectors in this page's snapshots, as the leader reads them.
+    #[serde(default)]
+    pub spaces: Vec<SpaceId>,
 }
 
 /// What a follower follows. The keys never leave the process: serialization skips
@@ -186,6 +196,9 @@ pub struct UserProgress {
     /// The leader log identity this cursor belongs to (see [`FeedPage::log_created`]).
     #[serde(default)]
     pub log_created: Option<u64>,
+    /// The spaces of the vectors in the leader's last page (see [`FeedPage::spaces`]).
+    #[serde(default)]
+    pub leader_spaces: Vec<SpaceId>,
     /// Set when the leader's log no longer contains what this follower applied.
     /// The tenant is not synced again until its local data is removed.
     #[serde(default)]
@@ -315,6 +328,9 @@ impl FollowStatus {
         entry.journaled_records += journaled;
         entry.leader_head_lsn = Some(page.head_lsn);
         entry.log_created = Some(page.log_created);
+        if !page.spaces.is_empty() {
+            entry.leader_spaces = page.spaces.clone();
+        }
         entry.refresh_lag();
         self.pages += 1;
         self.last_applied = Some(Utc::now());
@@ -1021,13 +1037,45 @@ pub fn feed(
     };
     let floor = after_lsn.map(|l| l + 1).unwrap_or(0);
     let (records, more) = page_below_head(iter, floor, head_lsn, limit)?;
+    let slot_spaces = manager.slot_spaces(user_id);
+    let spaces = page_spaces(&records, slot_spaces.as_ref());
     Ok(FeedPage {
         user_id: user_id.to_string(),
         records,
         head_lsn,
         more,
         log_created,
+        slot_spaces,
+        spaces,
     })
+}
+
+/// The spaces of the vectors the snapshots in `records` hold, unrecorded slots read with
+/// `slot_spaces`, sorted. A frame that does not decode names none: the follower reports it.
+fn page_spaces(records: &[FeedRecord], slot_spaces: Option<&SlotSpaces>) -> Vec<SpaceId> {
+    let primary = slot_spaces.map(|s| &s.primary);
+    let secondary = slot_spaces.and_then(|s| s.secondary.as_ref());
+    let mut spaces = std::collections::BTreeSet::new();
+    for record in records {
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&record.frame_b64) else {
+            continue;
+        };
+        let Ok(
+            IntentPayload::Remember { memory_bincode, .. }
+            | IntentPayload::Update { memory_bincode, .. },
+        ) = payload::decode(&bytes)
+        else {
+            continue;
+        };
+        let Ok(memory) = crate::memory::storage::decode_memory_snapshot(&memory_bincode) else {
+            continue;
+        };
+        let experience = &memory.experience;
+        spaces.extend(experience.primary_space(primary));
+        spaces.extend(experience.secondary_space(secondary));
+        spaces.extend(experience.other_vectors.iter().map(|v| v.space.clone()));
+    }
+    spaces.into_iter().collect()
 }
 
 /// Frames from `floor` up to `limit`, ending at the last frame below `head_lsn`.
@@ -1142,19 +1190,27 @@ fn check_tenant(user_id: &str, frames: &[(u64, IntentPayload)]) -> Result<()> {
 /// are journaled, on its own commit cadence. Idempotent:
 /// a snapshot is an upsert, a forget of an unknown id is a no-op. Returns the
 /// number of frames journaled. Blocking.
+///
+/// Each snapshot's vectors are read as the leader reads them (`leader`, from the page) and
+/// kept in this corpus's slots only when they are in its spaces; a vector in another space is
+/// kept beside them, and the memory is queued for its vectors here. The frame journaled here is
+/// the snapshot as this corpus stores it, so the local projections never read the leader's
+/// vectors as this corpus's.
 pub fn apply_replicated_page(
     manager: &MultiUserMemoryManager,
     user_id: &str,
     frames: Vec<(u64, IntentPayload)>,
+    leader: Option<&SlotSpaces>,
 ) -> Result<u64> {
     check_tenant(user_id, &frames)?;
-    let frames = coalesce(frames);
+    let mut frames = coalesce(frames);
     if frames.is_empty() {
         return Ok(0);
     }
     let memory_sys = manager.get_user_memory(user_id)?;
     let mut snapshots: Vec<crate::memory::types::Memory> = Vec::new();
-    for (lsn, payload) in &frames {
+    let mut arrived: BTreeMap<SpaceId, usize> = BTreeMap::new();
+    for (lsn, payload) in &mut frames {
         if let IntentPayload::Remember {
             memory_bincode,
             memory_id,
@@ -1168,13 +1224,21 @@ pub fn apply_replicated_page(
         {
             // The snapshot ages like the store's own records: frames journaled before a
             // layout change need the legacy decode arms, the same ones the projections use.
-            let memory = crate::memory::storage::decode_memory_snapshot(memory_bincode)
+            let mut memory = crate::memory::storage::decode_memory_snapshot(memory_bincode)
                 .map_err(|e| anyhow!("decoding the memory snapshot at lsn {lsn}: {e}"))?;
             if memory.id.0.to_string() != *memory_id {
                 bail!(
                     "frame lsn {lsn} names memory {memory_id} but its snapshot is memory {}",
                     memory.id.0
                 );
+            }
+            if memory_sys.read().normalise_replicated(&mut memory, leader) {
+                *memory_bincode =
+                    bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+                        .map_err(|e| anyhow!("re-encoding the snapshot at lsn {lsn}: {e}"))?;
+            }
+            for kept in &memory.experience.other_vectors {
+                *arrived.entry(kept.space.clone()).or_insert(0) += 1;
             }
             snapshots.push(memory);
         }
@@ -1187,7 +1251,11 @@ pub fn apply_replicated_page(
     // All or nothing: a page that fails journals no frame, and its retry adds no
     // duplicates of the frames before the failure.
     let payloads: Vec<IntentPayload> = frames.into_iter().map(|(_, payload)| payload).collect();
-    Ok(manager.journal_and_apply_batch(user_id, &payloads)?.len() as u64)
+    let journaled = manager.journal_and_apply_batch(user_id, &payloads)?.len() as u64;
+    if !arrived.is_empty() {
+        memory_sys.read().note_replicated_spaces(&arrived);
+    }
+    Ok(journaled)
 }
 
 /// The store-side effect of a `Forget`, `Anchor` or `SetAnchored` frame; snapshots are handled in
@@ -1610,11 +1678,13 @@ async fn sync_user(
         let received = frames.len() as u64;
         let user_id = info.user_id.clone();
         let m = Arc::clone(manager);
-        let journaled =
-            tokio::task::spawn_blocking(move || apply_replicated_page(&m, &user_id, frames))
-                .await
-                .map_err(|e| anyhow!("apply task: {e}"))?
-                .with_context(|| format!("applying lsns up to {last_lsn} of {}", info.user_id))?;
+        let leader = page.slot_spaces.clone();
+        let journaled = tokio::task::spawn_blocking(move || {
+            apply_replicated_page(&m, &user_id, frames, leader.as_ref())
+        })
+        .await
+        .map_err(|e| anyhow!("apply task: {e}"))?
+        .with_context(|| format!("applying lsns up to {last_lsn} of {}", info.user_id))?;
         let saved = replication.follow.write().record_page(
             generation,
             &info.user_id,
@@ -1855,6 +1925,7 @@ mod tests {
                 leader_head_lsn: Some(90),
                 lag: Some(48),
                 log_created: Some(1_700_000_000),
+                leader_spaces: vec![SpaceId::new("nomic-embed-text-v1.5", 768)],
                 diverged: Some("rolled back".into()),
                 last_error: None,
                 failures: 2,
@@ -1866,6 +1937,10 @@ mod tests {
         assert_eq!(back["alice"].applied_lsn, Some(41));
         assert_eq!(back["alice"].source_bytes, 1234);
         assert_eq!(back["alice"].log_created, Some(1_700_000_000));
+        assert_eq!(
+            back["alice"].leader_spaces,
+            vec![SpaceId::new("nomic-embed-text-v1.5", 768)]
+        );
         assert_eq!(back["alice"].diverged.as_deref(), Some("rolled back"));
         assert!(
             back["alice"].retry_at.is_none(),
@@ -2032,7 +2107,142 @@ mod tests {
             head_lsn,
             more: false,
             log_created,
+            slot_spaces: None,
+            spaces: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_page_from_a_leader_before_spaces_reads_with_no_spaces() {
+        let page: FeedPage =
+            serde_json::from_str(r#"{"user_id":"u","records":[],"head_lsn":3,"more":false}"#)
+                .unwrap();
+        assert_eq!(page.slot_spaces, None);
+        assert!(page.spaces.is_empty());
+    }
+
+    /// A snapshot journaled before spaces were recorded, holding `vector` in its primary slot.
+    fn unstamped_snapshot(vector: Vec<f32>) -> (crate::memory::types::Memory, IntentPayload) {
+        let memory = crate::memory::types::Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            crate::memory::types::Experience {
+                content: "the lighthouse keeper logs the fog at dawn".to_string(),
+                embeddings: Some(vector),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let payload = IntentPayload::Remember {
+            user_id: "u".into(),
+            memory_id: memory.id.0.to_string(),
+            memory_bincode: bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+                .unwrap(),
+            schema_version: Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        (memory, payload)
+    }
+
+    fn unit(dim: usize) -> Vec<f32> {
+        vec![1.0 / (dim as f32).sqrt(); dim]
+    }
+
+    /// A leader with another embedder of the same width: the follower must not read its
+    /// unrecorded vector as its own space's. It keeps it in the leader's space, queues the
+    /// memory for a vector of its own, and journals the snapshot as it stores it.
+    #[test]
+    fn a_leader_vector_in_another_space_is_kept_queued_and_journaled_as_stored() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let follower = manager.get_user_memory("u").unwrap();
+        let own = follower.read().slot_spaces();
+        let leader_space = SpaceId::new("leader-model", own.primary.dimension());
+        let vector = unit(own.primary.dimension());
+        let (memory, frame) = unstamped_snapshot(vector.clone());
+        let leader = SlotSpaces {
+            primary: leader_space.clone(),
+            secondary: None,
+        };
+
+        assert_eq!(
+            apply_replicated_page(&manager, "u", vec![(7, frame)], Some(&leader)).unwrap(),
+            1
+        );
+
+        let stored = follower.read().get_memory(&memory.id).unwrap();
+        assert!(
+            stored.experience.embeddings.is_none(),
+            "the follower's primary slot holds only its own space"
+        );
+        assert_eq!(
+            stored.experience.vector_in(&leader_space, None, None),
+            Some(&vector)
+        );
+        assert_eq!(follower.read().embed_queue_len(), 1);
+
+        let writer = manager.get_user_journaled_writer("u").unwrap();
+        let last = writer.lock().log().iter().unwrap().last().unwrap().unwrap();
+        let (_, journaled) = payload::decode_record(&last).unwrap();
+        let IntentPayload::Remember { memory_bincode, .. } = journaled else {
+            panic!("{journaled:?}");
+        };
+        let journaled = crate::memory::storage::decode_memory_snapshot(&memory_bincode).unwrap();
+        assert!(journaled.experience.embeddings.is_none());
+        assert_eq!(
+            journaled.experience.vector_in(&leader_space, None, None),
+            Some(&vector)
+        );
+    }
+
+    /// A leader that declares no spaces is read as before spaces existed: an unrecorded vector
+    /// as wide as the follower's is the follower's.
+    #[test]
+    fn a_leader_that_declares_no_spaces_is_read_as_before() {
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let follower = manager.get_user_memory("u").unwrap();
+        let own = follower.read().slot_spaces();
+        let vector = unit(own.primary.dimension());
+        let (memory, frame) = unstamped_snapshot(vector.clone());
+
+        apply_replicated_page(&manager, "u", vec![(7, frame)], None).unwrap();
+
+        let stored = follower.read().get_memory(&memory.id).unwrap();
+        assert_eq!(stored.experience.embeddings.as_ref(), Some(&vector));
+        assert_eq!(
+            stored.experience.embedding_space.as_ref(),
+            Some(&own.primary)
+        );
+    }
+
+    #[test]
+    fn a_page_lists_the_spaces_its_snapshots_hold() {
+        let primary = SpaceId::new("leader-model", 4);
+        let kept = SpaceId::new("older-model", 2);
+        let (mut memory, _) = unstamped_snapshot(unit(4));
+        memory.experience.keep_vector(kept.clone(), unit(2));
+        let frame = IntentPayload::Update {
+            user_id: "u".into(),
+            memory_id: memory.id.0.to_string(),
+            memory_bincode: bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+                .unwrap(),
+            schema_version: Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        let records = vec![FeedRecord {
+            lsn: 1,
+            frame_b64: base64::engine::general_purpose::STANDARD
+                .encode(payload::encode(&frame).unwrap()),
+        }];
+        let slot = SlotSpaces {
+            primary: primary.clone(),
+            secondary: None,
+        };
+        assert_eq!(page_spaces(&records, Some(&slot)), vec![primary, kept]);
+        assert_eq!(
+            page_spaces(&records, None),
+            vec![SpaceId::new("older-model", 2), SpaceId::unrecorded(4)]
+        );
     }
 
     #[test]
@@ -2904,7 +3114,10 @@ mod tests {
             ),
         ];
 
-        assert_eq!(apply_replicated_page(&manager, "u", frames).unwrap(), 3);
+        assert_eq!(
+            apply_replicated_page(&manager, "u", frames, None).unwrap(),
+            3
+        );
 
         let memory_sys = manager.get_user_memory("u").unwrap();
         assert!(memory_sys.read().get_memory(&first).unwrap().is_anchored());
@@ -3000,10 +3213,12 @@ mod tests {
         let follower = Arc::new(follower);
         let applied = {
             let follower = Arc::clone(&follower);
-            tokio::task::spawn_blocking(move || apply_replicated_page(&follower, user, frames))
-                .await
-                .unwrap()
-                .unwrap()
+            tokio::task::spawn_blocking(move || {
+                apply_replicated_page(&follower, user, frames, None)
+            })
+            .await
+            .unwrap()
+            .unwrap()
         };
         assert!(applied > 0);
 

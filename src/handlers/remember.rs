@@ -301,8 +301,8 @@ pub(crate) fn remember_journaled(
 }
 
 /// [`crate::memory::MemorySystem::upsert`], journaled: a `Remember` frame for a
-/// create, an `Update` for an update. The upsert embeds before it stores, so the
-/// frame carries the vectors. Blocking.
+/// create, an `Update` for an update, then the memory joins the embed queue, whose
+/// drain journals the record again once its vectors land. Blocking.
 pub(crate) fn upsert_journaled(
     state: &super::state::MultiUserMemoryManager,
     memory: &SharedUserMemory,
@@ -326,23 +326,45 @@ pub(crate) fn upsert_journaled(
         SnapshotKind::Remember
     };
     journal_stored(state, memory, user_id, std::slice::from_ref(&id), kind);
+    memory.read().enqueue_embedding(&id);
     Ok((id, was_update))
 }
 
-/// [`embed_journaled`] on the task tracker.
-fn spawn_journaled_embed(
+/// Queue a journaled write's memory for its vectors and drain the queue in the background.
+/// Call it only once the memory's frame is journaled: when the write gate absorbs the memory
+/// into an existing one, both records change and their snapshots are journaled by the drain,
+/// and an absorbed snapshot with the lower LSN would let replay bring back the unflagged
+/// memory.
+fn queue_journaled_embed(
     state: &AppState,
     memory: &SharedUserMemory,
     user_id: &str,
     memory_id: &crate::memory::MemoryId,
 ) {
-    let state_bg = state.clone();
-    let memory_bg = memory.clone();
+    memory.read().enqueue_embedding(memory_id);
+    spawn_embed_queue_drain(state, memory, user_id);
+}
+
+/// Drain the tenant's embed queue in the background, one embedder call per batch, journaling
+/// the records the write gate changed. Concurrent writes coalesce: a drain that finds the queue
+/// taken returns at once.
+fn spawn_embed_queue_drain(state: &AppState, memory: &SharedUserMemory, user_id: &str) {
+    let state = state.clone();
+    let memory = memory.clone();
     let user_id = user_id.to_string();
-    let mid = memory_id.clone();
-    state
-        .task_tracker
-        .spawn_blocking(move || embed_journaled(&state_bg, &memory_bg, &user_id, &mid));
+    state.clone().task_tracker.spawn_blocking(move || loop {
+        let drained = memory.read().drain_embed_queue_journaled(64);
+        journal_stored(
+            &state,
+            &memory,
+            &user_id,
+            &drained.rewritten,
+            SnapshotKind::Update,
+        );
+        if drained.taken == 0 {
+            break;
+        }
+    });
 }
 
 // =============================================================================
@@ -1398,7 +1420,7 @@ pub async fn remember(
     // Background: complete embedding + vector indexing; vector search follows
     // in ~150ms. Spawned after the journal so a write-gate Forget follows the
     // Remember in LSN order.
-    spawn_journaled_embed(&state, &memory, &req.user_id, &memory_id);
+    queue_journaled_embed(&state, &memory, &req.user_id, &memory_id);
 
     // Record metrics + session + broadcast BEFORE returning response (fast, <1ms)
     let duration = op_start.elapsed().as_secs_f64();
@@ -2089,7 +2111,11 @@ pub async fn batch_remember(
             let mut errors: Vec<BatchErrorItem> = Vec::new();
 
             for (index, experience, created_at) in experiences {
-                match memory_guard.remember_detailed_journaled(experience.clone(), created_at) {
+                match memory_guard.remember_deferred_detailed_journaled(
+                    experience.clone(),
+                    created_at,
+                    None,
+                ) {
                     Ok(outcome) => {
                         let rebuild = outcome.needs_graph_rebuild();
                         let effective = outcome.merged_experience.unwrap_or(experience);
@@ -2145,6 +2171,10 @@ pub async fn batch_remember(
                     .collect()
             };
             journal_batch(&state, &user_id, &payloads);
+            let guard = memory_for_journal.read();
+            for id in &ids {
+                guard.enqueue_embedding(id);
+            }
         });
         if let Err(e) = journal_join.await {
             tracing::warn!(
@@ -2507,6 +2537,7 @@ pub async fn batch_remember(
             .inc();
     }
 
+    spawn_embed_queue_drain(&state, &memory, &req.user_id);
     Ok(Json(BatchRememberResponse {
         created,
         failed,
@@ -2801,6 +2832,7 @@ pub async fn upsert_memory(
         }
         stage_timer.record("journal", journal_start);
     }
+    queue_journaled_embed(&state, &memory_system, &req.user_id, &memory_id);
 
     // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the
     // graph does not keep the old entity set.

@@ -122,6 +122,69 @@ Comprehensive performance measurements for Veld - Agentic Memory v0.1.5+.
 
 ---
 
+### Embedding spaces (per-space cost, step 12 of the embedding-spaces plan)
+
+`cargo bench --bench embedding_spaces` measures what each embedding space costs: vector-leg
+search latency over one space and over two, the query path (embedding included) over one space
+and over two, in sequence and at once, the bytes and RSS each space holds as full vectors
+and as product-quantized codes, inline write cost with an embedder paced like a remote host,
+and drain throughput per batch size against a real host when `VELD_BENCH_EMBEDDER_URL` is set.
+It writes a JSON report under `evaluations/spaces/`. The plan's rows use
+`VELD_BENCH_SPACE_SIZES=10000,100000`.
+
+Measured 2026-10-24 on the operator's M5 Pro, both runs back to back, compiled without LTO and
+with 16 codegen units (the `local` profile's settings, by `CARGO_PROFILE_BENCH_*`), under load from
+other sessions: load average about 45 during the baseline, about 40 during the head run. Absolute
+latencies are noisy at that load; the ratios are measured within one run and hold better.
+
+| Step | Commit | Memories | Search p95, 1 / 2 spaces | Query p95, 2 spaces ÷ 1 (sequential / at once) | Stored, 2 spaces ÷ 1 | pq recall@10 | Write per memory, 1 / 2 spaces |
+|---|---|---|---|---|---|---|---|
+| baseline (before step 9) | `fc38cc63` | 10k | 2.26 / 5.27 ms | not measured (rows added in step 10) | 1.50x (second space f32) | not measured | 12.7 / 18.4 ms |
+| baseline (before step 9) | `fc38cc63` | 100k | 4.80 / 4.08 ms | not measured | 1.50x | not measured | (as above) |
+| branch head | `bedbe286` | 10k | 1.67 / 1.99 ms (f32), 2.12 ms (pq) | 1.69x / **1.13x** | **1.03x** (second space pq) | 0.886 | 6.2 / 10.3 ms |
+| branch head | `bedbe286` | 100k | 6.52 / 9.21 ms (f32), 6.29 ms (pq) | 1.87x / **1.29x** | **1.02x** | 0.756 | (as above) |
+
+Re-measured 2026-10-29 with a memory probe that works on macOS. The probe reads the process's
+physical footprint (`proc_pid_rusage`, `ri_phys_footprint`), which, unlike `sysinfo`'s RSS,
+counts compressed pages. Both runs used the same build settings and ran at the same time, at load
+average 37 rising to 58. The head is `c6ae0874`: the branch with `cb1c47ac`, where each text is
+embedded on its own, and origin/main `351f02a1` merged in. Memory growth is the footprint added
+while a space's index is built. The latency columns are a second run at high load and are noisy.
+
+| Step | Commit | Memories | Memory growth, primary | Second space f32: growth, 2 ÷ 1 | Second space pq: growth, 2 ÷ 1 | Query p95, 2 spaces ÷ 1 (sequential / at once) | Write per memory, 1 / 2 spaces |
+|---|---|---|---|---|---|---|---|
+| baseline (before step 9) | `fc38cc63` | 10k | 35 856 KiB | 18 944 KiB, 1.53x | 2 288 KiB, 1.06x | not measured | 11.2 / 15.7 ms |
+| baseline (before step 9) | `fc38cc63` | 100k | 339 136 KiB | 186 512 KiB, 1.55x | 13 664 KiB, 1.04x | not measured | (as above) |
+| branch head | `c6ae0874` | 10k | 35 616 KiB | 18 912 KiB, 1.53x | 11 808 KiB, 1.33x | 1.87x / **1.01x** | 6.4 / 10.9 ms |
+| branch head | `c6ae0874` | 100k | 453 584 KiB | 185 552 KiB, 1.41x | 55 056 KiB, **1.12x** | 1.93x / **1.06x** | (as above) |
+
+- **Step 10** is done when the query p95 with two spaces at once is within 1.3x of one space at
+  100k memories. It measured 1.29x on 2026-10-24 and 1.06x on 2026-10-29 at `c6ae0874`, against
+  1.87x and 1.93x in sequence. The query rows embed through a paced embedder (3.2 ms per call).
+  They leave out graph traversal and BM25, which the second space's search also overlaps in
+  recall.
+- **Step 11** is done when two spaces, the second as `pq`, hold under 1.3x of one at 100k. It
+  measures 1.02x by stored bytes (305 071 KiB against 300 000 KiB) and 1.12x by memory growth. The
+  baseline's second space in full vectors held 1.50x stored and 1.55x in memory.
+- The head's `pq` space grows more in memory than the baseline's: 55 056 against 13 664 KiB at
+  100k. It searches faster: at 100k, two-space p95 was 4.9 ms against 12.9 ms.
+- At 100k the head's primary index grew 34% more than the baseline's (453 584 against
+  339 136 KiB). At 10k the two match. This rests on one run each, under memory pressure, and is
+  not explained.
+- **pq recall@10** is the share of each query's exact top ten the `pq` index returns after
+  reranking twice the results asked for against the full vectors. The f32 row in the JSON
+  (1.000 at 10k, 0.378 at 100k) searches the graph with 60 candidates, an eighth of the 480 recall asks
+  the primary for, so it is not comparable with the `pq` row.
+- **Write per memory** is inline, through the retrieval engine, with the paced embedder; the head's
+  second space is a `pq` index, cheaper to add to than a second graph. The baseline ran at the
+  higher load.
+- **Drain at 64** is not measured: it needs `VELD_BENCH_EMBEDDER_URL`, and the only embedder hosts
+  here serve the live servers.
+- The step-12 goal of a LoCoMo gate per space configuration is not met: the gate in CI
+  (`.github/workflows/recall.yml`) runs one embedder.
+
+---
+
 ## 4. Associative Retrieval (Density-Dependent Hybrid)
 
 ### Cross-Domain Association Discovery

@@ -26,6 +26,7 @@ pub mod alignment_config;
 pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
+pub mod alignment_spaces;
 pub mod arctic;
 pub mod chunking;
 pub mod circuit_breaker;
@@ -38,6 +39,7 @@ pub mod minilm;
 pub mod model_tape;
 pub mod ner;
 pub mod nomic;
+pub mod space;
 #[cfg(feature = "zenoh")]
 pub mod zenoh_embedder;
 
@@ -68,6 +70,7 @@ pub use circuit_breaker::{
 
 // Re-export competitive embedder
 pub use competitive::CompetitiveEmbedder;
+pub use space::SpaceId;
 
 pub use minilm::OrtThreading;
 
@@ -242,7 +245,11 @@ pub trait Embedder: Send + Sync {
         self.encode(text).map(|v| (v, false))
     }
 
-    /// Batch encode multiple texts (default: sequential)
+    /// Encode several texts. Element `i` must be exactly what `encode(texts[i])` returns: a
+    /// stored vector may not depend on which other texts shared its call. A batched model run
+    /// breaks that (the quantized ONNX models scale activations over the whole batch, and an
+    /// OpenAI-compatible server measured 2026-10-28 moved a vector by up to 5.9e-5), so the
+    /// local and HTTP embedders encode one text at a time; an override must keep the contract.
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|text| self.encode(text)).collect()
     }

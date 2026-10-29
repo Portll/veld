@@ -41,6 +41,18 @@ pub struct HealthResponse {
     /// Tenants holding data on each backend at boot. `users_count` over an empty
     /// store is the 2026-09-10 outage; this is what tells the two apart.
     pub tenants_with_data: crate::storage::boot_guard::BackendCensus,
+    /// Embedding spaces across the users in cache, summed by space: memories each index holds,
+    /// backlog rows waiting for a vector in the space, and memories stored in it that an index
+    /// in another space refused. Space ids name models and widths, never a tenant.
+    pub embedding_spaces: Vec<crate::embeddings::space::SpaceSummary>,
+    /// Users in cache whose corpus no index here can search by vector: memories stored, none
+    /// indexed, vectors waiting. Any makes `status` degraded. A count, never a tenant id.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub orphaned_corpora: usize,
+    /// Space migrations under way for users in cache: a change of embedder re-embedding in the
+    /// background, or the one-time stamp of spaces. Absent when none is running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub space_migrations: Vec<crate::memory::space_migration::MigrationProgress>,
     /// One entry per store currently refusing writes; absent when none is.
     /// Measured 2026-10-11: this endpoint served `healthy` through 11,088
     /// consecutive failed writes.
@@ -94,6 +106,12 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let user_evictions = state.user_evictions();
     let config = state.server_config();
     let (status, write_latch) = write_latch_fields(crate::storage::write_latch::global());
+    let (embedding_spaces, orphaned_corpora, space_migrations) = embedding_spaces(&state);
+    let status = if orphaned_corpora > 0 {
+        "degraded".to_string()
+    } else {
+        status
+    };
 
     Json(HealthResponse {
         status,
@@ -108,8 +126,55 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         max_cache_size: config.max_users_in_memory,
         embedder: crate::embeddings::primary_embedder_info(),
         tenants_with_data: state.backend_census.clone(),
+        embedding_spaces,
+        orphaned_corpora,
+        space_migrations,
         write_latch,
     })
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Cached users only, and only those not busy: a probe must neither load a tenant nor wait on
+/// one. Returns the summed spaces, how many corpora are cut off from vector search, and the
+/// migrations under way.
+fn embedding_spaces(
+    state: &MultiUserMemoryManager,
+) -> (
+    Vec<crate::embeddings::space::SpaceSummary>,
+    usize,
+    Vec<crate::memory::space_migration::MigrationProgress>,
+) {
+    let mut summaries = Vec::new();
+    let mut orphaned = 0usize;
+    let mut migrations = Vec::new();
+    for user_id in state.list_cached_users() {
+        // The cache itself, not get_user_memory: a user evicted since the listing is skipped,
+        // never loaded.
+        let Some(memory) = state.user_memories.get(&user_id) else {
+            continue;
+        };
+        let Some(guard) = memory.try_read() else {
+            continue;
+        };
+        match guard.space_health() {
+            Ok((spaces, cut_off)) => {
+                summaries.extend(spaces);
+                orphaned += usize::from(cut_off);
+            }
+            Err(e) => tracing::debug!("embedding spaces unreadable for a cached user: {e}"),
+        }
+        if let Some(m) = guard.space_migration().filter(|m| !m.is_finished()) {
+            migrations.push((&m).into());
+        }
+    }
+    (
+        crate::embeddings::space::merge_summaries(summaries),
+        orphaned,
+        migrations,
+    )
 }
 
 /// Liveness probe - indicates if process is alive and not deadlocked
@@ -383,6 +448,16 @@ pub async fn health_index_user(
                 "needs_rebuild": s.needs_rebuild,
                 "deletion_ratio": s.deletion_ratio,
             })),
+            "spaces": health.spaces.iter().map(|s| serde_json::json!({
+                "space": s.space,
+                "codec": s.codec,
+                "memories": s.memories,
+                "total_vectors": s.total_vectors,
+                "vector_bytes": s.vector_bytes,
+                "deleted_count": s.deleted_count,
+                "needs_rebuild": s.needs_rebuild,
+                "needs_compaction": s.needs_compaction,
+            })).collect::<Vec<_>>(),
             "timestamp": chrono::Utc::now().to_rfc3339()
         })),
     ))
@@ -593,6 +668,9 @@ mod write_latch_reporting {
                 redb: None,
                 measured_at: chrono::Utc::now(),
             },
+            embedding_spaces: Vec::new(),
+            orphaned_corpora: 0,
+            space_migrations: Vec::new(),
             write_latch,
         };
         serde_json::to_value(&response).expect("HealthResponse serializes")

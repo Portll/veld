@@ -240,13 +240,6 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-/// Batch request
-#[derive(Serialize)]
-struct BatchEmbeddingRequest<'a> {
-    model: &'a str,
-    input: Vec<&'a str>,
-}
-
 /// HTTP-backed embedder using OpenAI-compatible /v1/embeddings endpoint.
 ///
 /// Connects to any declared OpenAI-compatible server — see `crate::llm_hosts`.
@@ -548,36 +541,6 @@ impl Embedder for HttpEmbedder {
     /// Measured by `probe()` or the first successful call; 768 (nomic's width) until then.
     fn dimension(&self) -> usize {
         *self.cached_dimension.get().unwrap_or(&768)
-    }
-
-    fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // A text longer than the window is embedded in pieces, so the batch goes one by one.
-        if texts.iter().any(|t| !self.fits(&self.document_text(t))) {
-            return texts.iter().map(|t| self.encode(t)).collect();
-        }
-        // Use batch endpoint if available
-        let prefixed: Vec<std::borrow::Cow<'_, str>> =
-            texts.iter().map(|t| self.document_text(t)).collect();
-        let req = BatchEmbeddingRequest {
-            model: &self.config.model,
-            input: prefixed.iter().map(|c| c.as_ref()).collect(),
-        };
-
-        let parsed = match self.post_embeddings_with_fallback(&req) {
-            Ok(parsed) => parsed,
-            Err(_) => return texts.iter().map(|t| self.encode(t)).collect(),
-        };
-
-        if parsed.data.len() != texts.len() {
-            // Batch size mismatch — fall back to sequential
-            return texts.iter().map(|t| self.encode(t)).collect();
-        }
-
-        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
-        if let Some(first) = embeddings.first() {
-            let _ = self.cached_dimension.set(first.len());
-        }
-        Ok(embeddings)
     }
 }
 

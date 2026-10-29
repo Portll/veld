@@ -400,6 +400,10 @@ name = "softmax_benchmarks"
 harness = false
 
 [[bench]]
+name = "embedding_spaces"
+harness = false
+
+[[bench]]
 name = "storage_engine_benchmarks"
 harness = false
 

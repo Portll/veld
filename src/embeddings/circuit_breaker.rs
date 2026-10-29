@@ -345,7 +345,7 @@ impl Embedder for ResilientEmbedder {
         self.total_calls
             .fetch_add(texts.len() as u64, Ordering::Relaxed);
 
-        // One batched inference; only a failed batch falls back to per-text encoding.
+        // One call to the inner embedder; only a failed call falls back to per-text encoding.
         match self.inner.encode_batch(texts) {
             Ok(embeddings) => {
                 self.record_success();

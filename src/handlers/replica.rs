@@ -184,6 +184,11 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     ("POST", "/api/index/reembed", Write),
     ("GET", "/api/embeddings/backlog", Read),
     ("POST", "/api/embeddings/backlog/drain", Write),
+    ("GET", "/api/spaces", Read),
+    // A fitted map is this instance's own projection, as its follower loop fits one on
+    // its own. Retiring a space drops kept vectors from the records.
+    ("POST", "/api/spaces/align", Local),
+    ("POST", "/api/spaces/retire", Write),
     ("POST", "/api/storage/cleanup", Write),
     ("POST", "/api/storage/migrate", Write),
     ("POST", "/api/consolidate", Write),
@@ -752,6 +757,7 @@ mod tests {
                 "/api/backup/purge" | "/api/backups/purge" => json!({"keep_count": 5}),
                 "/api/search/multimodal" | "/api/search/robotics" => json!({"mode": "hybrid"}),
                 "/api/search/advanced" => json!({"entity_name": "harbour"}),
+                "/api/spaces/align" => json!({"from": "minilm@384", "to": "nomic@768"}),
                 _ => json!({}),
             };
             let mut body = shared.clone();
@@ -764,8 +770,9 @@ mod tests {
         // Requests this harness cannot make succeed; each still passes the guard. No
         // user-auth store and no sleep-time orchestrator are set up, the monitor is a
         // WebSocket upgrade, the planner takes its own query language, and no memory
-        // carries the external id asked for. The admin export opens the engine's files
-        // beside the live store, which redb, one open per database, refuses.
+        // carries the external id asked for. A space map fit needs memories holding
+        // vectors in two spaces. The admin export opens the engine's files beside the
+        // live store, which redb, one open per database, refuses.
         let serves_redb = harness.state().server_config().effective_storage_backend
             == crate::config::StorageBackend::Redb;
         let unanswerable = |template: &str| {
@@ -774,7 +781,7 @@ mod tests {
                 .any(|prefix| template.starts_with(prefix))
                 || matches!(
                     template,
-                    "/api/context/monitor" | "/api/memory/by-external-id"
+                    "/api/context/monitor" | "/api/memory/by-external-id" | "/api/spaces/align"
                 )
                 || (serves_redb && template == "/api/admin/storage/export")
         };
@@ -898,7 +905,7 @@ mod tests {
         };
         let state = harness.state();
         let journaled = tokio::task::spawn_blocking(move || {
-            crate::replication::apply_replicated_page(&state, USER, vec![(0, frame)])
+            crate::replication::apply_replicated_page(&state, USER, vec![(0, frame)], None)
         })
         .await
         .unwrap()
@@ -1112,7 +1119,7 @@ mod tests {
             .collect();
         let state = harness.state();
         tokio::task::spawn_blocking(move || {
-            crate::replication::apply_replicated_page(&state, USER, forgets).unwrap();
+            crate::replication::apply_replicated_page(&state, USER, forgets, None).unwrap();
             state.run_maintenance_all_users()
         })
         .await

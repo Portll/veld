@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::embeddings::{
-    read_alignment_file, resolve_alignment_path, save_alignment, Alignment, AlignmentPairId,
-    Embedder, ProcrustesAlignment, RidgeAlignment,
+    resolve_alignment_path, save_alignment, Alignment, AlignmentPairId, Embedder,
+    ProcrustesAlignment,
 };
 
 /// Returns an alignment for the given pair, fitting if necessary.
@@ -53,29 +53,21 @@ fn resolve_or_fit_inner(
     live_secondary: Option<Arc<dyn Embedder>>,
 ) -> Result<Option<Arc<dyn Alignment>>> {
     if let Some(path) = resolve_alignment_path(pair_id) {
-        let (header, payload) = read_alignment_file(&path)?;
-        if header.pair_id != *pair_id {
+        let alignment = match crate::embeddings::alignment_spaces::load_alignment(&path) {
+            Ok(alignment) => alignment,
+            Err(e) => {
+                tracing::warn!("{e:#}; ignoring");
+                return Ok(None);
+            }
+        };
+        if alignment.pair_id() != pair_id {
             tracing::warn!(
                 "alignment file pair_id {:?} != current {:?}; ignoring",
-                header.pair_id,
+                alignment.pair_id(),
                 pair_id
             );
             return Ok(None);
         }
-        let alignment: Arc<dyn Alignment> = match header.method.as_str() {
-            "orthogonal_procrustes" => {
-                Arc::new(ProcrustesAlignment::from_payload(header, &payload)?)
-            }
-            "ridge" => Arc::new(RidgeAlignment::from_payload(header, &payload)?),
-            other => {
-                tracing::warn!(
-                    "unknown alignment method `{}` in {}; ignoring",
-                    other,
-                    path.display()
-                );
-                return Ok(None);
-            }
-        };
         tracing::info!("loaded alignment from {}", path.display());
         return Ok(Some(alignment));
     }

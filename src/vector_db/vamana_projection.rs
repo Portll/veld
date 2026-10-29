@@ -89,6 +89,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::embeddings::space::SpaceId;
 use crate::intent_log::{
     CheckpointStore, CheckpointStoreError, IntentPayload, IntentRecord, Lsn, PayloadError,
     Projection, TypedProjection,
@@ -198,6 +199,20 @@ impl VamanaEmbeddingKind {
             VamanaEmbeddingKind::Image => memory.experience.image_embeddings.clone(),
             VamanaEmbeddingKind::Audio => memory.experience.audio_embeddings.clone(),
             VamanaEmbeddingKind::Video => memory.experience.video_embeddings.clone(),
+        }
+    }
+
+    /// The space the memory records for this kind's vector. Only the text kinds carry one; an
+    /// absent space is a vector written before spaces were recorded.
+    pub fn recorded_space(self, memory: &Memory) -> Option<SpaceId> {
+        match self {
+            VamanaEmbeddingKind::TextPrimary => memory.experience.embedding_space.clone(),
+            VamanaEmbeddingKind::TextSecondary => {
+                memory.experience.embedding_space_secondary.clone()
+            }
+            VamanaEmbeddingKind::Image
+            | VamanaEmbeddingKind::Audio
+            | VamanaEmbeddingKind::Video => None,
         }
     }
 
@@ -322,6 +337,13 @@ pub struct VamanaProjection {
     /// LSN of the last record this projection successfully applied. Lives
     /// in memory; `persist_checkpoint` synchronises it to disk.
     checkpoint: Option<Lsn>,
+    /// The embedding space this projection's index holds, bound from the first vector that
+    /// records one. A vector in another space, or of another width, is skipped: one index holds
+    /// one space, and a log spanning an embedder change holds several.
+    space: Option<SpaceId>,
+    /// Vectors skipped for being in another space or width than the index's.
+    skipped_other_space: u64,
+
     /// `memories` differs from the latest durable side-data snapshot, so the
     /// checkpoint cannot advance on disk until a new snapshot is written.
     map_dirty: bool,
@@ -386,6 +408,8 @@ impl VamanaProjection {
             checkpoint_store,
             memories,
             checkpoint,
+            space: None,
+            skipped_other_space: 0,
             map_dirty,
             dirty_applies: 0,
             persisted_checkpoint: checkpoint,
@@ -409,6 +433,8 @@ impl VamanaProjection {
             checkpoint_store,
             memories,
             checkpoint,
+            space: None,
+            skipped_other_space: 0,
             map_dirty: load == MapLoad::Discarded,
             dirty_applies: 0,
             persisted_checkpoint: checkpoint,
@@ -444,6 +470,27 @@ impl VamanaProjection {
         }
         // Safe because we just set Ready above (or it was already Ready).
         Ok(self.state.as_ready().expect("projection index ready"))
+    }
+
+    /// Bind the index to `space` before any vector arrives: the tenant's active space, known
+    /// when the projection opens. A log replayed from the start then builds the index in that
+    /// space and skips every vector of another, instead of taking the width of whatever the log
+    /// holds first — on a tenant whose log spans an embedder change, the old one.
+    pub fn bind_space(mut self, space: Option<SpaceId>) -> Self {
+        if let Some(space) = space.filter(SpaceId::is_recorded) {
+            self.space = Some(space);
+        }
+        self
+    }
+
+    /// The space this projection's index is bound to, once a vector recorded one.
+    pub fn space(&self) -> Option<&SpaceId> {
+        self.space.as_ref()
+    }
+
+    /// Vectors skipped for being in another space or width than the index's.
+    pub fn skipped_other_space(&self) -> u64 {
+        self.skipped_other_space
     }
 
     /// Borrow the underlying index if it has been materialised. Returns
@@ -548,24 +595,70 @@ impl VamanaProjection {
                     }
                 };
 
+                // A bound space decides the width before the index exists, so the first vector
+                // off the log cannot set it to another space's.
+                if self
+                    .space
+                    .as_ref()
+                    .is_some_and(|bound| bound.dimension() != embedding.len())
+                {
+                    if let (Some(existing), Some(index)) =
+                        (self.memories.remove(memory_id), self.state.as_ready())
+                    {
+                        index.read().mark_deleted(existing.vector_id);
+                    }
+                    self.skipped_other_space += 1;
+                    if self.skipped_other_space.is_power_of_two() {
+                        tracing::warn!(
+                            projection = self.kind.projection_name(),
+                            memory_id = %memory_id,
+                            memory_dim = embedding.len(),
+                            index_space = ?self.space,
+                            skipped = self.skipped_other_space,
+                            "vamana projection: skipping a vector of another width than the bound space",
+                        );
+                    }
+                    self.checkpoint = Some(self.bumped_checkpoint(lsn));
+                    return Ok(());
+                }
+
                 // Materialise the index (no-op if eager / already
                 // ready). Lazy projections learn their dim here from
                 // the first embedded memory off the log.
                 let index_arc = self.ensure_ready(embedding.len())?.clone();
 
-                // Dimension check is a hard error — silently indexing a
-                // wrong-dim vector would corrupt the graph (see
-                // `VamanaIndex::add_vector`'s own guard). After
-                // `ensure_ready`, the index dim is fixed for the
-                // lifetime of the projection; subsequent applies must
-                // match it or fail loudly.
+                // One index holds one space. A vector of another width would corrupt the graph
+                // (see `VamanaIndex::add_vector`'s own guard), and one recording another space
+                // would be compared by a cosine that means nothing. Either is skipped, not an
+                // error: a log spanning an embedder change holds several spaces, and replay
+                // must pass them. A skipped memory loses any vector it had here, since its
+                // current one is no longer in this space.
                 let index_dim = index_arc.read().config_dimension();
-                if embedding.len() != index_dim {
-                    return Err(VamanaProjectionError::DimensionMismatch {
-                        memory_id: memory_id.clone(),
-                        memory_dim: embedding.len(),
-                        index_dim,
-                    });
+                let recorded = self.kind.recorded_space(&memory);
+                let other_space =
+                    matches!((&self.space, &recorded), (Some(bound), Some(s)) if bound != s);
+                if embedding.len() != index_dim || other_space {
+                    if let Some(existing) = self.memories.remove(memory_id) {
+                        index_arc.read().mark_deleted(existing.vector_id);
+                    }
+                    self.skipped_other_space += 1;
+                    if self.skipped_other_space.is_power_of_two() {
+                        tracing::warn!(
+                            projection = self.kind.projection_name(),
+                            memory_id = %memory_id,
+                            memory_dim = embedding.len(),
+                            index_dim,
+                            memory_space = ?recorded,
+                            index_space = ?self.space,
+                            skipped = self.skipped_other_space,
+                            "vamana projection: skipping a vector in another space than the index's",
+                        );
+                    }
+                    self.checkpoint = Some(self.bumped_checkpoint(lsn));
+                    return Ok(());
+                }
+                if self.space.is_none() {
+                    self.space = recorded.filter(SpaceId::is_recorded);
                 }
 
                 // Re-applying the same memory_id at a NEWER LSN means
@@ -1569,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn dimension_mismatch_is_a_hard_error() {
+    fn a_vector_of_another_width_is_skipped_and_replay_moves_on() {
         let (_index, _ckpt, mut proj, _log, _ckptp) = open_projection();
 
         let id = MemoryId(Uuid::new_v4());
@@ -1582,20 +1675,88 @@ mod tests {
         let memory = Memory::new(id.clone(), experience, 0.5, None, None, None, None);
         let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
 
-        let err = proj
-            .apply_typed(Lsn(0), &mk_remember(&id.0.to_string(), bytes))
-            .unwrap_err();
-        match err {
-            VamanaProjectionError::DimensionMismatch {
-                memory_dim,
-                index_dim,
-                ..
-            } => {
-                assert_eq!(memory_dim, TEST_DIM + 4);
-                assert_eq!(index_dim, TEST_DIM);
-            }
-            other => panic!("expected DimensionMismatch, got {other:?}"),
-        }
+        proj.apply_typed(Lsn(0), &mk_remember(&id.0.to_string(), bytes))
+            .expect("another width is skipped, not an error");
+        assert_eq!(proj.skipped_other_space(), 1);
+        assert!(proj.vector_id_for(&id.0.to_string()).is_none());
+        assert_eq!(proj.checkpoint(), Some(Lsn(0)));
+    }
+
+    /// A tenant whose log spans an embedder change, replayed from the start: the old width
+    /// comes first and must not decide the index.
+    #[test]
+    fn a_bound_space_skips_an_older_width_that_comes_first() {
+        let (_log_path, ckpt_path) = tmp_paths("bound_space");
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let mut proj = VamanaProjection::lazy(
+            VamanaEmbeddingKind::TextPrimary,
+            VamanaProjectionBootstrap {
+                storage_path: None,
+                config_template: VamanaConfig {
+                    dimension: 0,
+                    ..VamanaConfig::default()
+                },
+            },
+            ckpt,
+        )
+        .bind_space(Some(SpaceId::new("model-new", TEST_DIM)));
+
+        let old = MemoryId(Uuid::new_v4());
+        let experience = Experience {
+            content: "written by the old embedder".to_string(),
+            embeddings: Some(vec![1.0f32; TEST_DIM + 4]),
+            ..Experience::default()
+        };
+        let m = Memory::new(old.clone(), experience, 0.5, None, None, None, None);
+        let bytes = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
+        proj.apply_typed(Lsn(0), &mk_remember(&old.0.to_string(), bytes))
+            .unwrap();
+        assert!(
+            proj.index().is_none(),
+            "the old width did not build the index"
+        );
+
+        let new = MemoryId(Uuid::new_v4());
+        let experience = Experience {
+            content: "written by the new embedder".to_string(),
+            embeddings: Some(vec![1.0f32; TEST_DIM]),
+            ..Experience::default()
+        };
+        let m = Memory::new(new.clone(), experience, 0.5, None, None, None, None);
+        let bytes = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
+        proj.apply_typed(Lsn(1), &mk_remember(&new.0.to_string(), bytes))
+            .unwrap();
+        assert!(proj.vector_id_for(&new.0.to_string()).is_some());
+        assert_eq!(proj.skipped_other_space(), 1);
+    }
+
+    #[test]
+    fn the_first_recorded_space_binds_the_index_and_another_is_skipped() {
+        let (_index, _ckpt, mut proj, _log, _ckptp) = open_projection();
+        let bound = SpaceId::new("model-a", TEST_DIM);
+        let other = SpaceId::new("model-b", TEST_DIM);
+
+        let first = MemoryId(Uuid::new_v4());
+        let mut experience = Experience {
+            content: "in model a".to_string(),
+            ..Experience::default()
+        };
+        experience.set_primary_vector(vec![1.0f32; TEST_DIM], bound.clone());
+        let m = Memory::new(first.clone(), experience, 0.5, None, None, None, None);
+        let bytes = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
+        proj.apply_typed(Lsn(0), &mk_remember(&first.0.to_string(), bytes))
+            .unwrap();
+        assert_eq!(proj.space(), Some(&bound));
+
+        // The same memory re-embedded into another space leaves this index.
+        let mut moved = m.experience.clone();
+        moved.set_primary_vector(vec![0.5f32; TEST_DIM], other);
+        let m2 = Memory::new(first.clone(), moved, 0.5, None, None, None, None);
+        let bytes = bincode::serde::encode_to_vec(&m2, bincode::config::standard()).unwrap();
+        proj.apply_typed(Lsn(1), &mk_remember(&first.0.to_string(), bytes))
+            .unwrap();
+        assert_eq!(proj.skipped_other_space(), 1);
+        assert!(proj.vector_id_for(&first.0.to_string()).is_none());
     }
 
     // ----------------------------------------------------------------
