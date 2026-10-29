@@ -15,6 +15,7 @@ pub mod compression;
 pub mod context;
 pub mod context_blocks;
 pub mod dials;
+pub mod duplicates;
 pub mod embedding_backlog;
 pub mod facets;
 pub mod facts;
@@ -71,7 +72,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::metrics::{EMBEDDING_CACHE_CONTENT, EMBEDDING_CACHE_CONTENT_SIZE};
-use crate::similarity::bars::{SimilarityBar, WritePath};
+use crate::similarity::bars::WritePath;
 
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
@@ -925,20 +926,6 @@ enum VectorIndexing {
     Deferred,
     /// Vector indexing failed; memory stored without a mapping.
     Failed(anyhow::Error),
-}
-
-/// Whether every word of `incoming` already appears in `existing`, compared
-/// case-insensitively over alphanumeric runs. The write gate's test that a memory is
-/// redundant and not merely similar: a number, name or date the neighbour lacks is a
-/// word it lacks, so the memory is kept.
-fn adds_no_new_words(incoming: &str, existing: &str) -> bool {
-    fn words(text: &str) -> std::collections::HashSet<String> {
-        text.split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(str::to_lowercase)
-            .collect()
-    }
-    words(incoming).is_subset(&words(existing))
 }
 
 impl MemorySystem {
@@ -2899,75 +2886,83 @@ impl MemorySystem {
 
         // Write gate + interference detection (retroactive + proactive)
         if let Some(embedding) = &memory_arc.experience.embeddings {
-            if let Ok(similar_ids) =
-                self.retriever
-                    .search_by_embedding(embedding, 5, Some(&memory_arc.id))
-            {
+            if let Ok(similar_ids) = self.retriever.search_by_embedding(
+                embedding,
+                crate::constants::WRITE_GATE_NEIGHBOURS,
+                Some(&memory_arc.id),
+            ) {
                 if !similar_ids.is_empty() {
-                    let similar_memories: Vec<_> = similar_ids
+                    let neighbours: Vec<(f32, Memory)> = similar_ids
                         .iter()
                         .filter_map(|(id, similarity)| {
                             self.retriever.get_from_storage(id).ok().map(|m| {
-                                (
-                                    id.0.to_string(),
-                                    // Interference's bars are MiniLM-tuned; read on that scale.
-                                    crate::similarity::scale::to_reference(*similarity),
-                                    m.importance(),
-                                    m.created_at,
-                                    m.experience.content.chars().take(50).collect::<String>(),
-                                )
+                                // Interference's bars are MiniLM-tuned; read on that scale.
+                                (crate::similarity::scale::to_reference(*similarity), m)
                             })
                         })
                         .collect();
+                    let similar_memories: Vec<_> = neighbours
+                        .iter()
+                        .map(|(similarity, m)| {
+                            (
+                                m.id.0.to_string(),
+                                *similarity,
+                                m.importance(),
+                                m.created_at,
+                                m.experience.content.chars().take(50).collect::<String>(),
+                            )
+                        })
+                        .collect();
 
-                    // ── Write gate: absorption ──────────────────────────────
-                    // A nearest neighbour above the absorption threshold is only a
-                    // candidate: similar vectors can carry different facts, and
-                    // the caller already holds this memory's id. It is absorbed
-                    // only when its text adds nothing the neighbour lacks.
-                    // `similar_memories` already holds cosines on MiniLM's scale, so the
-                    // MiniLM-tuned bar applies as is; mapping `best_sim` again would double it.
-                    let total_memories = self.stats.read().total_memories;
-                    if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
-                        if let Some((best_id, best_sim, _, _, _)) =
-                            similar_memories.iter().max_by(|a, b| {
-                                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                        {
-                            let candidate = SimilarityBar::WriteGateCandidate.record(
-                                *best_sim >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD,
+                    // ── Write gate: duplicates ──────────────────────────────
+                    // Decided on the text, so the bar is the same under every embedder.
+                    // Only an exact copy is absorbed; a near-exact one is kept, tagged and
+                    // ranked below what it repeats; anything else is left alone. The
+                    // closest neighbour wins a tie between two of the same kind.
+                    let repeated = neighbours
+                        .iter()
+                        .filter(|(_, existing)| !existing.is_forgotten())
+                        .map(|(similarity, existing)| {
+                            let kind = duplicates::classify(
+                                &memory_arc.experience.content,
+                                &existing.experience.content,
                             );
-                            let survivor = candidate
-                                .then(|| uuid::Uuid::parse_str(best_id).ok())
-                                .flatten()
-                                .and_then(|id| self.long_term_memory.get(&MemoryId(id)).ok())
-                                .filter(|existing| {
-                                    !existing.is_forgotten()
-                                        && adds_no_new_words(
-                                            &memory_arc.experience.content,
-                                            &existing.experience.content,
-                                        )
-                                });
-                            if candidate {
-                                SimilarityBar::WriteGateAbsorbed.record(survivor.is_some());
-                            }
-                            if let Some(survivor) = survivor {
-                                outcome.note_rewritten(memory_id);
-                                outcome.note_rewritten(&survivor.id);
-                                self.absorb_redundant_memory(
-                                    &memory_arc,
-                                    survivor,
-                                    importance,
-                                    *best_sim,
-                                    bm25,
-                                );
-                                let elapsed = start.elapsed();
-                                crate::metrics::EMBED_BACKGROUND_DURATION
-                                    .observe(elapsed.as_secs_f64());
-                                return Ok(outcome);
+                            (kind, *similarity, existing)
+                        })
+                        .filter(|(kind, _, _)| *kind != duplicates::DuplicateKind::Distinct)
+                        .min_by_key(|(kind, _, _)| std::cmp::Reverse(*kind));
+                    let memory_arc = match repeated {
+                        Some((duplicates::DuplicateKind::Exact, similarity, survivor)) => {
+                            outcome.note_rewritten(memory_id);
+                            outcome.note_rewritten(&survivor.id);
+                            self.absorb_redundant_memory(
+                                &memory_arc,
+                                survivor.clone(),
+                                importance,
+                                similarity,
+                                bm25,
+                            );
+                            let elapsed = start.elapsed();
+                            crate::metrics::EMBED_BACKGROUND_DURATION
+                                .observe(elapsed.as_secs_f64());
+                            return Ok(outcome);
+                        }
+                        Some((_, similarity, original)) => {
+                            match self.keep_near_exact_duplicate(
+                                &memory_arc,
+                                original.clone(),
+                                similarity,
+                            ) {
+                                Some(tagged) => {
+                                    outcome.note_rewritten(memory_id);
+                                    outcome.note_rewritten(&original.id);
+                                    tagged
+                                }
+                                None => Arc::clone(&memory_arc),
                             }
                         }
-                    }
+                        None => Arc::clone(&memory_arc),
+                    };
 
                     // ── Standard interference detection ─────────────────────
                     if !similar_memories.is_empty() {
@@ -3059,8 +3054,8 @@ impl MemorySystem {
         Ok(outcome)
     }
 
-    /// Fold a redundant new memory into `survivor`: the survivor gains importance and
-    /// any tag it lacked, and the redundant memory is soft-forgotten rather than
+    /// Fold a new memory whose text exactly repeats `survivor` into it: the survivor gains
+    /// importance and any tag it lacked, and the copy is soft-forgotten rather than
     /// deleted. Its id was returned when it was remembered, so the record stays
     /// readable, marked `absorbed_by`, while recall, listing and the indexes drop it.
     fn absorb_redundant_memory(
@@ -3121,6 +3116,84 @@ impl MemorySystem {
             similarity = %similarity,
             "Write gate: absorbed redundant memory"
         );
+    }
+
+    /// Keep `duplicate`, a near-exact copy of `original`: tag it and name what it repeats,
+    /// so recall ranks it below that memory, and give `original` the importance a repeat
+    /// earns. Returns the tagged record, or `None` when it could not be stored and the
+    /// memory stays as it was.
+    fn keep_near_exact_duplicate(
+        &self,
+        duplicate: &Memory,
+        original: Memory,
+        similarity: f32,
+    ) -> Option<Arc<Memory>> {
+        let mut tagged = duplicate.clone();
+        if !tagged
+            .experience
+            .tags
+            .iter()
+            .any(|tag| tag == duplicates::DUPLICATE_TAG)
+        {
+            tagged
+                .experience
+                .tags
+                .push(duplicates::DUPLICATE_TAG.to_string());
+        }
+        let metadata = &mut tagged.experience.metadata;
+        metadata.insert(
+            duplicates::DUPLICATE_OF_KEY.to_string(),
+            original.id.0.to_string(),
+        );
+        metadata.insert(
+            duplicates::DUPLICATE_KIND_KEY.to_string(),
+            duplicates::DuplicateKind::NearExact.label().to_string(),
+        );
+        if let Err(e) = self.long_term_memory.update(&tagged) {
+            tracing::warn!(
+                memory_id = %duplicate.id.0,
+                "Write gate: could not tag a near-exact duplicate, so it stays untagged: {e}"
+            );
+            return None;
+        }
+        let tagged = Arc::new(tagged);
+        // Recall reads a resident copy before storage, so an untagged one would escape the
+        // de-rank until it left the tier.
+        {
+            let mut working = self.working_memory.write();
+            if working.contains(&tagged.id) {
+                let _ = working.remove(&tagged.id);
+                let _ = working.add_shared(Arc::clone(&tagged));
+            }
+        }
+        {
+            let mut session = self.session_memory.write();
+            if session.contains(&tagged.id) {
+                let _ = session.remove(&tagged.id);
+                let _ = session.add_shared(Arc::clone(&tagged));
+            }
+        }
+
+        let original_importance = original.importance();
+        original.boost_importance(crate::constants::WRITE_GATE_ABSORPTION_BOOST);
+        match self.long_term_memory.update(&original) {
+            Ok(()) => self.note_importance_change(original_importance, original.importance()),
+            Err(e) => tracing::warn!(
+                original = %original.id.0,
+                "Write gate: could not reinforce the memory a duplicate repeats: {e}"
+            ),
+        }
+
+        crate::metrics::WRITE_GATE_DUPLICATES
+            .with_label_values(&[duplicates::DuplicateKind::NearExact.label()])
+            .inc();
+        tracing::info!(
+            memory_id = %duplicate.id.0,
+            duplicate_of = %original.id.0,
+            similarity = %similarity,
+            "Write gate: kept a near-exact duplicate, tagged and de-ranked"
+        );
+        Some(tagged)
     }
 
     /// Remember with agent context for multi-agent systems
@@ -11081,25 +11154,143 @@ mod lifecycle_tests {
         forgotten.id
     }
 
+    fn observation(content: &str) -> Experience {
+        Experience {
+            experience_type: ExperienceType::Observation,
+            content: content.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn the_write_gate_counts_only_text_that_adds_no_word_as_redundant() {
-        assert!(adds_no_new_words(
-            "Deploy failed, rolled back.",
-            "rolled back: the deploy FAILED"
-        ));
-        assert!(adds_no_new_words(
-            "the deploy failed",
-            "the deploy failed at 3pm on Tuesday"
-        ));
-        assert!(!adds_no_new_words(
-            "Item 10: the deploy failed",
-            "Item 11: the deploy failed"
-        ));
-        assert!(!adds_no_new_words(
-            "the deploy succeeded",
-            "the deploy failed"
-        ));
-        assert!(!adds_no_new_words("alice owns billing", "bob owns billing"));
+    fn the_write_gate_absorbs_a_copy_that_differs_only_in_whitespace_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let original = system
+                .remember(
+                    observation("the nightly batch stalled on a stale lock file"),
+                    None,
+                )
+                .unwrap();
+            let copy = system
+                .remember_deferred(
+                    observation("the nightly batch  stalled\non a stale lock file"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_ne!(
+                copy, original,
+                "{backend}: raw bytes differ, so remember keeps both"
+            );
+
+            let outcome = system.embed_and_index_journaled(&copy).unwrap();
+
+            let absorbed = system.get_memory(&copy).unwrap();
+            assert!(absorbed.is_forgotten(), "{backend}");
+            assert_eq!(
+                absorbed.experience.metadata.get("absorbed_by"),
+                Some(&original.0.to_string()),
+                "{backend}"
+            );
+            assert!(
+                outcome.rewritten.contains(&copy) && outcome.rewritten.contains(&original),
+                "{backend}: both records owe the journal an update"
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_gate_keeps_a_near_exact_copy_tagged_as_a_duplicate_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let original = system
+                .remember(
+                    observation("The nightly batch stalled on a stale lock file."),
+                    None,
+                )
+                .unwrap();
+            let copy = system
+                .remember_deferred(
+                    observation("the nightly batch stalled, on a stale lock file"),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let outcome = system.embed_and_index_journaled(&copy).unwrap();
+
+            let kept = system.get_memory(&copy).unwrap();
+            assert!(!kept.is_forgotten(), "{backend}: a near-exact copy is kept");
+            assert!(
+                kept.experience
+                    .tags
+                    .contains(&duplicates::DUPLICATE_TAG.to_string()),
+                "{backend}"
+            );
+            assert_eq!(
+                kept.experience.metadata.get(duplicates::DUPLICATE_OF_KEY),
+                Some(&original.0.to_string()),
+                "{backend}"
+            );
+            assert_eq!(
+                kept.experience
+                    .metadata
+                    .get(duplicates::DUPLICATE_KIND_KEY)
+                    .map(String::as_str),
+                Some("near-exact"),
+                "{backend}"
+            );
+            assert!(
+                outcome.rewritten.contains(&copy) && outcome.rewritten.contains(&original),
+                "{backend}: both records owe the journal an update"
+            );
+            assert!(
+                system
+                    .working_memory
+                    .read()
+                    .get(&copy)
+                    .is_none_or(|resident| resident
+                        .experience
+                        .metadata
+                        .contains_key(duplicates::DUPLICATE_OF_KEY)),
+                "{backend}: a resident copy carries the tag recall de-ranks on"
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_gate_leaves_a_reply_whose_words_all_appear_in_a_longer_memory_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            system
+                .remember(
+                    observation(
+                        "Thanks, I will check the stale lock file on the nightly batch tonight",
+                    ),
+                    None,
+                )
+                .unwrap();
+            let reply = system
+                .remember_deferred(observation("Thanks, I will check"), None, None)
+                .unwrap();
+
+            system.embed_and_index_journaled(&reply).unwrap();
+
+            let kept = system.get_memory(&reply).unwrap();
+            assert!(!kept.is_forgotten(), "{backend}");
+            assert!(
+                !kept
+                    .experience
+                    .metadata
+                    .contains_key(duplicates::DUPLICATE_OF_KEY),
+                "{backend}"
+            );
+            assert!(
+                !kept
+                    .experience
+                    .tags
+                    .contains(&duplicates::DUPLICATE_TAG.to_string()),
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -11113,7 +11304,7 @@ mod lifecycle_tests {
             system.long_term_memory.store(&survivor).unwrap();
             let mut redundant = memory(
                 ExperienceType::Observation,
-                "The nightly batch stalled: stale lock file.",
+                "the nightly batch  stalled on a stale lock file",
             );
             redundant.experience.tags = vec!["batch".to_string(), "incident".to_string()];
             system.long_term_memory.store(&redundant).unwrap();

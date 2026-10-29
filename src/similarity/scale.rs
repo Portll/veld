@@ -1,7 +1,7 @@
 //! Reading a cosine on one reference scale, whatever embedder produced it.
 //!
-//! veld's similarity bars (interference 0.85, write-gate absorption 0.90, fact dedup 0.80,
-//! merge 0.97, the dream-replay band, query repetition) were all tuned on MiniLM. Embedders spread cosines very
+//! veld's similarity bars (interference 0.85, fact dedup 0.80, merge 0.97, the dream-replay
+//! band, query repetition) were all tuned on MiniLM. Embedders spread cosines very
 //! differently: on the LoCoMo gate corpus the median pair cosine is 0.385 under MiniLM,
 //! 0.594 under bge-m3, 0.752 under nomic and 0.838 under arctic-embed-xs. A bar of 0.85 marks
 //! a rare pair under MiniLM and an ordinary one under arctic.

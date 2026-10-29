@@ -3622,6 +3622,18 @@ impl super::MemorySystem {
         }
 
         // =====================================================================
+        // LAYER 5.38: NEAR-EXACT DUPLICATE DE-RANK
+        // =====================================================================
+        // A memory the write gate kept as a near-exact copy of another ranks below what it
+        // repeats. Before MMR, so diversification sees the demoted order.
+        // [signal: duplicate_derank] Gated by the disabled_signals dial; on by default.
+        if dials_snapshot.signal_enabled("duplicate_derank")
+            && crate::memory::duplicates::derank(&mut memories)
+        {
+            tracing::debug!("Layer 5.38: de-ranked near-exact duplicates");
+        }
+
+        // =====================================================================
         // LAYER 5.4: MMR DIVERSIFICATION (FIX-R3)
         // =====================================================================
         // After cross-encoder reranking and fragment demotion, apply Maximal
