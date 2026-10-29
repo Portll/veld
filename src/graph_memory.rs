@@ -8792,15 +8792,23 @@ impl EntityExtractor {
         // POS-based extraction for comprehensive coverage
         let chunk_extraction = extract_chunks(text);
 
-        // Add all proper nouns (these are likely named entities we might have missed)
+        // Add all proper nouns (these are likely named entities we might have missed). A proper
+        // noun is a Person only when the text marks it as one (see `person_cued_names`): in
+        // technical text most capitalised words are products and tools (`Redis`, `Redlock`).
+        let cued_people = Self::person_cued_names(text);
         for proper_noun in &chunk_extraction.proper_nouns {
             let term_lower = proper_noun.to_lowercase();
             if !seen.contains(&term_lower) && term_lower.len() >= 3 {
                 // Boost salience if YAKE identified this as discriminative
                 let yake_boost = yake_importance.get(&term_lower).copied().unwrap_or(0.0);
+                let label = if cued_people.contains(proper_noun) {
+                    EntityLabel::Person
+                } else {
+                    EntityLabel::Other("ProperNoun".to_string())
+                };
                 let entity = ExtractedEntity {
                     name: proper_noun.clone(),
-                    label: EntityLabel::Person,
+                    label,
                     base_salience: 0.7 + (yake_boost * 0.2), // 0.7-0.9
                 };
                 entities.push(entity);
@@ -8856,7 +8864,158 @@ impl EntityExtractor {
             }
         }
 
+        Self::promote_people_by_context(text, &cued_people, &mut entities, &mut seen);
         entities
+    }
+
+    /// Whitespace tokens with surrounding punctuation trimmed, apostrophes kept.
+    fn cue_tokens(text: &str) -> impl Iterator<Item = &str> {
+        text.split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '\''))
+    }
+
+    /// `token` without its possessive or trailing apostrophe, and whether it had a possessive.
+    fn strip_possessive(token: &str) -> (&str, bool) {
+        match token
+            .strip_suffix("'s")
+            .or_else(|| token.strip_suffix("\u{2019}s"))
+        {
+            Some(stem) => (stem, true),
+            None => (token.trim_end_matches('\''), false),
+        }
+    }
+
+    /// Whether `name` is a single title-case word (`Sarah`, not `SARAH`, `iPhone`, `GraphQL`).
+    fn looks_like_a_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        (2..=20).contains(&name.chars().count())
+            && chars.next().is_some_and(char::is_uppercase)
+            && chars.all(char::is_lowercase)
+    }
+
+    /// Names the text itself marks as people: a possessive (`Sarah's`), a parenthetical
+    /// (`(Raj)`), a relative `who` after the name, a verb that takes a human agent after it
+    /// (`Raj found`, `Elena approved`), or a verb that takes a human object before it
+    /// (`asked Priya`). Verbs any subject can take (`went`, `started`, `completed`) and
+    /// prepositions (`with`, `from`) are left out on purpose: `Production went down` and
+    /// `with Redlock` are not people. Only single title-case words qualify. One pass over the
+    /// tokens, because every write runs it.
+    fn person_cued_names(text: &str) -> HashSet<String> {
+        const AGENT_VERBS_AFTER: &[&str] = &[
+            "said",
+            "says",
+            "mentioned",
+            "asked",
+            "told",
+            "wrote",
+            "presented",
+            "approved",
+            "flagged",
+            "reported",
+            "noticed",
+            "suggested",
+            "agreed",
+            "invited",
+            "met",
+            "emailed",
+            "thanked",
+            "replied",
+            "responded",
+            "confirmed",
+            "promised",
+            "recommended",
+            "prefers",
+            "loves",
+            "likes",
+            "hates",
+            "feels",
+            "felt",
+            "thinks",
+            "thought",
+            "wants",
+            "wanted",
+            "emphasized",
+            "emphasised",
+            "proposed",
+            "explained",
+            "complained",
+            "joined",
+            "found",
+            "volunteered",
+            "offered",
+            "insisted",
+        ];
+        const OBJECT_VERBS_BEFORE: &[&str] = &[
+            "asked",
+            "told",
+            "thanked",
+            "invited",
+            "met",
+            "emailed",
+            "pinged",
+            "assigned",
+            "hired",
+            "introduced",
+            "congratulated",
+        ];
+        let raw: Vec<&str> = text.split_whitespace().collect();
+        let tokens: Vec<&str> = Self::cue_tokens(text).collect();
+        let mut cued = HashSet::new();
+        for (i, token) in tokens.iter().enumerate() {
+            let (name, possessive) = Self::strip_possessive(token);
+            if !Self::looks_like_a_name(name) || cued.contains(name) {
+                continue;
+            }
+            let parenthetical = raw[i]
+                .trim_end_matches([',', '.', ';', ':'])
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                == Some(name);
+            let next = tokens.get(i + 1).map(|t| t.to_lowercase());
+            let prev = i.checked_sub(1).map(|j| tokens[j].to_lowercase());
+            if possessive
+                || parenthetical
+                || next
+                    .as_deref()
+                    .is_some_and(|n| n == "who" || AGENT_VERBS_AFTER.contains(&n))
+                || prev
+                    .as_deref()
+                    .is_some_and(|p| OBJECT_VERBS_BEFORE.contains(&p))
+            {
+                cued.insert(name.to_string());
+            }
+        }
+        cued
+    }
+
+    /// Promote unclaimed entities the text cues as people, and add cued names the extraction
+    /// never produced: a name that opens a sentence (`Raj found the bug.`) is not a proper-noun
+    /// chunk, so nothing above yields it.
+    fn promote_people_by_context(
+        text: &str,
+        cued_people: &HashSet<String>,
+        entities: &mut Vec<ExtractedEntity>,
+        seen: &mut HashSet<String>,
+    ) {
+        if cued_people.is_empty() {
+            return;
+        }
+        for entity in entities.iter_mut() {
+            if matches!(entity.label, EntityLabel::Other(_)) && cued_people.contains(&entity.name) {
+                entity.label = EntityLabel::Person;
+                entity.base_salience = Self::calculate_base_salience(&EntityLabel::Person, true);
+            }
+        }
+        for token in Self::cue_tokens(text) {
+            let (name, _) = Self::strip_possessive(token);
+            if cued_people.contains(name) && seen.insert(name.to_lowercase()) {
+                entities.push(ExtractedEntity {
+                    name: name.to_string(),
+                    label: EntityLabel::Person,
+                    base_salience: Self::calculate_base_salience(&EntityLabel::Person, true),
+                });
+            }
+        }
     }
 
     /// Extract co-occurrence pairs from text for graph edge creation
@@ -12526,5 +12685,69 @@ mod edge_index_tests {
         graph.flush_pending_maintenance().unwrap();
         assert!(graph.get_relationship(&ids[0]).unwrap().is_some());
         assert!(graph.get_relationship(&ids[1]).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod person_cue_tests {
+    use super::{EntityExtractor, EntityLabel};
+
+    fn label_of(text: &str, name: &str) -> Option<EntityLabel> {
+        EntityExtractor::new()
+            .extract_with_salience(text)
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| e.label)
+    }
+
+    fn is_person(text: &str, name: &str) -> bool {
+        matches!(label_of(text, name), Some(EntityLabel::Person))
+    }
+
+    #[test]
+    fn names_with_a_cue_become_people() {
+        assert!(is_person(
+            "Raj found the Redis cache invalidation bug.",
+            "Raj"
+        ));
+        assert!(is_person(
+            "Key items: payment integration (Sarah) and the cache layer.",
+            "Sarah"
+        ));
+        assert!(is_person(
+            "Everyone was there except Marcus who was working remotely.",
+            "Marcus"
+        ));
+        assert!(is_person(
+            "His replacement will be Priya, who has five years of experience.",
+            "Priya"
+        ));
+        assert!(is_person("We asked Joanna about the screenplay.", "Joanna"));
+        assert!(is_person("Nate's tournament went well.", "Nate"));
+        assert!(is_person(
+            "The draft is Joanna\u{2019}s second screenplay.",
+            "Joanna"
+        ));
+    }
+
+    #[test]
+    fn capitalised_words_without_a_cue_stay_unclaimed() {
+        assert!(!is_person(
+            "Architecture decision: we chose one database.",
+            "Architecture"
+        ));
+        assert!(!is_person("Production went down at 3 AM.", "Production"));
+        assert!(!is_person(
+            "Deployment completed after the review.",
+            "Deployment"
+        ));
+        assert!(!is_person(
+            "Added distributed locking with Redlock.",
+            "Redlock"
+        ));
+        assert!(!is_person(
+            "Key items: Stripe integration (Sarah), Redis caching layer (Raj).",
+            "Redis"
+        ));
     }
 }

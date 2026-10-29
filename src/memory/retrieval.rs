@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
 pub(crate) use super::space_index::IdMapping;
+use super::recall::order_score_ties_by_content;
 use super::space_index::{ExactVectors, SpaceCodec, SpaceIndex, SpaceIndexHealth};
 use super::space_legs::{self, Leg, LegDepth, LegHits, LegIndex, LegKind};
 use super::space_migration::{MigrationKind, MigrationStep, SpaceMigration, SpaceMigrationStore};
@@ -2012,7 +2013,7 @@ impl RetrievalEngine {
         // but whose best single chunk only scores 0.3 should outrank a memory with
         // one chunk at 0.35 and nothing else. When a memory has multiple high-scoring
         // chunks, this is evidence of distributed relevance across the content.
-        let mut memory_ids: Vec<(MemoryId, f32)> = all_chunk_scores
+        let memory_ids: Vec<(MemoryId, f32)> = all_chunk_scores
             .into_iter()
             .map(|(id, mut scores)| {
                 scores.sort_by(|a, b| b.total_cmp(a));
@@ -2026,9 +2027,7 @@ impl RetrievalEngine {
                 (id, agg)
             })
             .collect();
-        // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
+        let memory_ids = self.rank_by_similarity(memory_ids, limit);
         self.observe_scores(&self.index_space, &memory_ids);
 
         Ok(memory_ids)
@@ -2076,7 +2075,7 @@ impl RetrievalEngine {
     }
 
     /// Search `space`'s index with a query vector in that space: one score per memory (its
-    /// best vector), best first, ties broken by id. Empty when no index here holds the space.
+    /// best vector), best first, ties ordered by content. Empty when no index here holds the space.
     /// The primary space searches the primary index, chunk aggregation included.
     pub fn search_space(
         &self,
@@ -2084,7 +2083,7 @@ impl RetrievalEngine {
         query: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        let results = if *space == self.index_space {
+        let mut results = if *space == self.index_space {
             self.search_by_embedding(query, limit, None)?
         } else {
             match self.space_index(space) {
@@ -2097,6 +2096,7 @@ impl RetrievalEngine {
                 None => Vec::new(),
             }
         };
+        self.order_ties_by_content(&mut results);
         self.observe_scores(space, &results);
         Ok(results)
     }
@@ -2290,6 +2290,31 @@ impl RetrievalEngine {
         }
     }
 
+    /// A vector leg in similarity order, cut to `limit`. Equal similarities order by content
+    /// (RH-10, [`order_score_ties_by_content`]), so neither the ranks nor the cut depend on the
+    /// ids the memories were minted with.
+    fn rank_by_similarity(
+        &self,
+        mut ranked: Vec<(MemoryId, f32)>,
+        limit: usize,
+    ) -> Vec<(MemoryId, f32)> {
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.order_ties_by_content(&mut ranked);
+        ranked.truncate(limit);
+        ranked
+    }
+
+    /// Reorder runs of equal scores in a ranked list by content (RH-10,
+    /// [`order_score_ties_by_content`]).
+    pub fn order_ties_by_content(&self, ranked: &mut [(MemoryId, f32)]) {
+        order_score_ties_by_content(ranked, &|id| {
+            self.storage
+                .get(id)
+                .ok()
+                .map(|memory| memory.experience.content)
+        });
+    }
+
     /// Get memory from storage by ID
     pub fn get_from_storage(&self, id: &MemoryId) -> Result<Memory> {
         self.storage.get(id)
@@ -2355,13 +2380,7 @@ impl RetrievalEngine {
             }
         }
 
-        // Convert to vec and sort by similarity descending (highest first).
-        // Tie-break by MemoryId for deterministic rank order across runs/CPUs (RH-10).
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        memory_ids.truncate(limit);
-
-        Ok(memory_ids)
+        Ok(self.rank_by_similarity(best_scores.into_iter().collect(), limit))
     }
 
     /// Search for memories using multiple retrieval modes (zero-copy with Arc)
