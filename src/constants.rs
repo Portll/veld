@@ -391,8 +391,9 @@ pub const GRAPH_PMI_GATE_MIN_ENV: &str = "SHODH_GRAPH_PMI_GATE_MIN";
 /// has run, no entity is low and the skip is inert, as it is upstream before its first cycle.
 pub const GRAPH_LOW_SELECTIVITY: f32 = 0.2;
 
-/// Env switch for the selectivity skip and the scoring pass behind it: `0` or `false` turns
-/// both off. On by default.
+/// Env switch for the selectivity skip and the scoring pass behind it: `1` or `true` turns
+/// both on. Off by default: the scores come only from heavy maintenance, which the recall
+/// harness never runs, so no gate or hold-out arm has measured the skip.
 pub const GRAPH_SELECTIVITY_SKIP_ENV: &str = "VELD_GRAPH_SELECTIVITY_SKIP";
 
 /// Fewest edges a graph needs before its selectivity is scored (upstream's

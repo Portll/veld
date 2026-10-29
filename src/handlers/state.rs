@@ -3441,7 +3441,7 @@ impl MultiUserMemoryManager {
 
             // Selectivity for the edge-birth skip, scored on the post-decay graph as upstream
             // scores its curvature. Held in memory by the graph, replaced whole each pass.
-            if is_heavy && env_switch(crate::constants::GRAPH_SELECTIVITY_SKIP_ENV, true) {
+            if is_heavy && env_switch(crate::constants::GRAPH_SELECTIVITY_SKIP_ENV, false) {
                 if let Ok(graph) = self.get_user_graph(&user_id) {
                     let graph_guard = graph.read();
                     let edges = graph_guard.get_stats().map_or(0, |s| s.relationship_count);
@@ -6146,7 +6146,7 @@ impl GraphAdmission {
                 .min(c::MAX_ENTITY_DEGREE - 1),
             pmi_gate: env_switch(c::GRAPH_PMI_GATE_ENV, true),
             pmi_gate_min: env_number(c::GRAPH_PMI_GATE_MIN_ENV, c::GRAPH_PMI_GATE_MIN),
-            selectivity_skip: env_switch(c::GRAPH_SELECTIVITY_SKIP_ENV, true),
+            selectivity_skip: env_switch(c::GRAPH_SELECTIVITY_SKIP_ENV, false),
             label_pair_typing: env_switch(c::GRAPH_LABEL_PAIR_TYPING_ENV, true),
             person_person_knows: env_switch(c::GRAPH_PERSON_PERSON_KNOWS_ENV, false),
             semantic_relations: env_switch(c::SEMANTIC_RELATIONS_ENV, true),
