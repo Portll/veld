@@ -4832,10 +4832,15 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
-        // Extract verbs for multi-hop reasoning
-        let analysis = query_parser::analyze_query(&experience.content);
+        // Verb nodes, off unless switched on (upstream #260 dropped them): each took a slot
+        // of the per-memory cap and joined every memory that used the same verb.
+        let relational_context = if admission.verb_entities {
+            query_parser::analyze_query(&experience.content).relational_context
+        } else {
+            Vec::new()
+        };
         let mut verb_entities: Vec<(String, EntityNode)> = Vec::new();
-        for verb in &analysis.relational_context {
+        for verb in &relational_context {
             let verb_text = verb.text.as_str();
             let verb_stem = verb.stem.as_str();
 
@@ -5876,6 +5881,8 @@ struct GraphAdmission {
     ner_noise_gate: bool,
     /// A tag becomes a node only on an authority, and never beside the NER node it twins.
     tag_admission: bool,
+    /// Relational verbs and their stems become nodes (off: upstream #260).
+    verb_entities: bool,
 }
 
 impl GraphAdmission {
@@ -5884,6 +5891,7 @@ impl GraphAdmission {
         Self {
             ner_noise_gate: env_switch(c::NER_GRAPH_NOISE_GATE_ENV, true),
             tag_admission: env_switch(c::GRAPH_TAG_ADMISSION_ENV, true),
+            verb_entities: env_switch(c::GRAPH_VERB_ENTITIES_ENV, false),
         }
     }
 }
@@ -6083,6 +6091,8 @@ mod graph_admission_tests {
         let mut admission = GraphAdmission::from_env();
         admission.ner_noise_gate = false;
         admission.tag_admission = false;
+        // Except verb nodes: they would join every memory through "met".
+        admission.verb_entities = false;
         admission
     }
 
@@ -6188,6 +6198,32 @@ mod graph_admission_tests {
             edges.iter().all(|e| e.from_entity != e.to_entity),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn verbs_become_nodes_only_when_switched_on() {
+        let verb_nodes = |admission: GraphAdmission| {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            let experience = Experience {
+                content: "Caroline wanted a kestrel and tried painting one.".into(),
+                ner_entities: vec![person("Caroline")],
+                ..Default::default()
+            };
+            let id = MemoryId(uuid::Uuid::new_v4());
+            mgr.build_experience_graph(USER, &experience, &id, &[], None, admission)
+                .unwrap();
+            let graph = mgr.get_user_graph(USER).unwrap();
+            let entities = graph.read().get_all_entities().unwrap();
+            entities
+                .iter()
+                .filter(|e| e.labels.contains(&EntityLabel::Other("Verb".into())))
+                .count()
+        };
+        let mut verbs_on = GraphAdmission::from_env();
+        verbs_on.verb_entities = true;
+        assert_eq!(verb_nodes(GraphAdmission::from_env()), 0);
+        assert!(verb_nodes(verbs_on) > 0);
     }
 }
 

@@ -349,6 +349,12 @@ pub const NER_GRAPH_NOISE_GATE_ENV: &str = "VELD_GRAPH_NER_NOISE_GATE";
 /// same surface. `0` or `false` restores every tag as a Technology node. On by default.
 pub const GRAPH_TAG_ADMISSION_ENV: &str = "VELD_GRAPH_TAG_ADMISSION";
 
+/// Env switch for verb nodes: `1` or `true` makes each relational verb of a memory, and its
+/// stem, an `Other("Verb")` node. Off by default, as upstream #260 dropped them: they took two
+/// to four of the per-memory entity slots and joined every memory using the same verb. With
+/// them off, the query verbs `memory::recall` resolves against entity names match nothing.
+pub const GRAPH_VERB_ENTITIES_ENV: &str = "VELD_GRAPH_VERB_ENTITIES";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay
