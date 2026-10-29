@@ -213,6 +213,8 @@ crew.kickoff()
 
 # Agents recall from veld before each task and save their results after it.
 # Veld embeds and ranks on the server: no CrewAI embedder or analysis LLM calls.
+# Recall returns only memories veld trusts, and veld trusts nothing written over
+# its HTTP API; pass trusted_only=False to recall the crew's own memories, labelled.
 ```
 
 See [examples/crewai](../examples/crewai) for options and error handling.

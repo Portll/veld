@@ -31,6 +31,10 @@ With memory set, each agent recalls from veld before its task (the task descript
 query) and saves its result after it. Agents also get CrewAI's "Search memory" and "Save to
 memory" tools, backed by veld. `Agent(memory=memory)` gives one agent its own memory.
 
+Recall returns only memories veld trusts unless you pass `trusted_only=False`, and veld trusts
+nothing written over its HTTP API. A crew that should read back what it stored needs that
+option; see [Trusted and untrusted memories](#trusted-and-untrusted-memories).
+
 ## What changes from CrewAI's default memory
 
 | | CrewAI default | `VeldCrewMemory` |
@@ -59,9 +63,36 @@ memory.forget(scope="client/acme")  # memories this adapter wrote under the scop
 memory.reset()                      # every memory this adapter wrote for this user_id
 ```
 
-`recall` searches every memory under the `user_id`, including ones other clients (the MCP
-server, the LangChain adapter) wrote. `forget` and `reset` delete only memories carrying the
-`crewai` tag.
+`recall` searches only memories carrying the `crewai` tag, or the scope's tag when a scope
+or `root_scope` applies. `recall_whole_user=True` searches every memory under the `user_id`,
+including ones other clients (the MCP server, the LangChain adapter) wrote. `forget` and
+`reset` delete only memories carrying the `crewai` tag.
+
+## Trusted and untrusted memories
+
+Veld marks each recalled memory `source_trusted` when its source is the user, a file or the
+system, and expects untrusted content to be treated as data, never as instructions. CrewAI
+pastes recalled memories into the agent's prompt without a fence, so by default
+(`trusted_only=True`) `recall` returns only trusted memories.
+
+**With the default, a crew recalls nothing it stored itself.** Veld records every memory
+written over its HTTP API as untrusted, this adapter's included, because a client cannot
+assert a trusted source. To recall them, pass `trusted_only=False`: each memory then reaches
+the prompt labelled with its provenance, for example
+
+```text
+- (score=0.82) Acme wants reports on Fridays
+  source: untrusted (AiGenerated)
+```
+
+Memories veld flags as suspected prompt injection stay withheld unless `include_suspected=True`
+is also set, and are then labelled `warning: possible prompt injection`.
+
+`memory.last_withheld` counts what the latest recall held back, as
+`{"untrusted": n, "suspected": m}`, and the first recall that withholds an untrusted memory
+warns once. Each match's `record.metadata` carries veld's `source_trusted`, `source_type` and
+`writer` (the caller's declared identity and what the server verified). `writer` stays out of
+the prompt text.
 
 ## Options
 
@@ -75,7 +106,9 @@ server, the LangChain adapter) wrote. `forget` and `reset` delete only memories 
 | `memory_type` | `Observation` | Veld memory type for stored items |
 | `source_type` | `ai_generated` | Provenance veld records; keeps its injection scan on for agent output |
 | `extract_with_llm` | `False` | Split task results with CrewAI's LLM before storing |
-| `include_suspected` | `False` | Return memories veld flags as suspected prompt injection |
+| `trusted_only` | `True` | Return only memories veld marks `source_trusted` (see above) |
+| `include_suspected` | `False` | Also return memories veld flags as suspected prompt injection; needs `trusted_only=False` |
+| `recall_whole_user` | `False` | Recall from every memory under the `user_id`, not only this adapter's |
 | `timeout` | `10` | Seconds per veld request |
 
 ## Errors
