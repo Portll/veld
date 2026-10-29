@@ -2,7 +2,7 @@
 
 Give a Vercel AI SDK (v7) app persistent memory with
 [`@veld/vercel-ai`](../../integrations/vercel-ai): veld remember and recall as tools, and
-recalled memories added to each call's instructions.
+recalled memories put in front of the user's turn on each call.
 
 ## Installation
 
@@ -23,18 +23,24 @@ const veld = new VeldClient({ userId: "alice" }); // VELD_API_URL, VELD_API_KEY 
 
 const result = await generateText({
   model,
-  tools: veldTools(veld),
+  tools: veldTools(veld, { includeUntrusted: true }),
   stopWhen: stepCountIs(5),
-  ...(await withVeldMemories(veld, {
-    instructions: "You are a helpful assistant with long-term memory.",
-    messages,
-  })),
+  ...(await withVeldMemories(
+    veld,
+    { instructions: "You are a helpful assistant with long-term memory.", messages },
+    { includeUntrusted: true },
+  )),
 });
 ```
 
 - `veldTools(veld)` gives the model `veld_remember` and `veld_recall`.
-- `withVeldMemories(veld, fields)` recalls with the last user message and adds the
-  memories to `instructions`, fenced and marked as data rather than instructions.
+- `withVeldMemories(veld, fields)` recalls with the last user message and puts the
+  memories at the start of that message, fenced, escaped and labelled by trust, never in
+  `instructions`.
+- `includeUntrusted: true` is needed to read back what the model stored: veld records every
+  memory written over its HTTP API as untrusted, and both helpers withhold untrusted
+  memories by default. See the package README's
+  [Trusted and untrusted memories](../../integrations/vercel-ai/README.md#trusted-and-untrusted-memories).
 
 ## Available Tools
 

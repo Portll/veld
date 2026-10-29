@@ -1,7 +1,14 @@
 export { DEFAULT_BASE_URL, VeldClient, VeldError } from "./client.js";
 export type { ListInput, RecallInput, RememberInput, VeldClientOptions } from "./client.js";
-export { formatMemories, toRecalledMemory, visibleMemories } from "./format.js";
-export type { FormatOptions, RecalledMemory } from "./format.js";
+export {
+  escapeMarkup,
+  formatMemories,
+  isTrusted,
+  partitionMemories,
+  toRecalledMemory,
+  visibleMemories,
+} from "./format.js";
+export type { FormatOptions, RecalledMemory, Withheld } from "./format.js";
 export { queryFromPrompt, withVeldMemories } from "./prompt.js";
 export type { Instructions, MemoryPromptOptions, PromptFields, WithMemories } from "./prompt.js";
 export { veldTools } from "./tools.js";

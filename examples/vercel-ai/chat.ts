@@ -2,9 +2,9 @@
  * Veld - Agentic Memory + Vercel AI SDK Example
  *
  * A terminal chat that remembers across runs. Each turn recalls memories
- * relevant to your message into the instructions, and the model can store new
- * ones with veld_remember. Tell it something about yourself, quit, run it
- * again and ask.
+ * relevant to your message into your turn of the prompt, and the model can
+ * store new ones with veld_remember. Tell it something about yourself, quit,
+ * run it again and ask.
  *
  * The model is any OpenAI-compatible endpoint; the default is a local Ollama,
  * so nothing leaves the machine.
@@ -31,7 +31,12 @@ const model = provider(process.env.LLM_MODEL ?? "qwen3:8b");
 
 // VELD_API_URL and VELD_API_KEY come from the environment.
 const veld = new VeldClient({ userId: process.env.VELD_USER_ID ?? "vercel-ai-example" });
-const tools = veldTools(veld, { tags: ["vercel-ai-example"] });
+// Veld records every memory written over its HTTP API as untrusted, including the
+// ones this chat's model stores, and recall withholds untrusted memories by default.
+// This chat reads back what its model stored, so it opts in: each such memory
+// reaches the model fenced and labelled trust="untrusted".
+const includeUntrusted = true;
+const tools = veldTools(veld, { tags: ["vercel-ai-example"], includeUntrusted });
 
 const instructions =
   "You are a helpful assistant with long-term memory. When the user tells you something " +
@@ -55,7 +60,7 @@ for await (const line of terminal) {
       model,
       tools,
       stopWhen: stepCountIs(5),
-      ...(await withVeldMemories(veld, { instructions, messages })),
+      ...(await withVeldMemories(veld, { instructions, messages }, { includeUntrusted })),
     });
     messages.push(...result.responseMessages);
     console.log(result.text);

@@ -1,6 +1,6 @@
-import type { ModelMessage, SystemModelMessage } from "ai";
+import type { ModelMessage, SystemModelMessage, UserContent } from "ai";
 import type { VeldClient } from "./client.js";
-import { formatMemories } from "./format.js";
+import { formatMemories, partitionMemories, warnWithheldOnce } from "./format.js";
 import type { RetrievalMode } from "./types.js";
 
 /** The AI SDK's `instructions` value: a string or system messages. */
@@ -23,7 +23,16 @@ export interface MemoryPromptOptions {
   mode?: RetrievalMode;
   /** Recall only memories carrying at least one of these tags. */
   tags?: string[];
-  /** Keep memories veld flags as suspected prompt injection. Default: false. */
+  /**
+   * Use memories whose source veld does not trust, labelled `trust="untrusted"`.
+   * Default: false, they are withheld. Veld records every memory written over
+   * its HTTP API as untrusted, including the ones `veld_remember` stores.
+   */
+  includeUntrusted?: boolean;
+  /**
+   * Keep memories veld flags as suspected prompt injection, labelled. Takes
+   * effect with `includeUntrusted`. Default: false.
+   */
   includeSuspected?: boolean;
   signal?: AbortSignal;
 }
@@ -51,25 +60,55 @@ export function queryFromPrompt(fields: PromptFields): string {
   return "";
 }
 
-function appendInstructions(existing: Instructions | undefined, block: string): Instructions {
-  if (existing === undefined) return block;
-  if (typeof existing === "string") return existing ? `${existing}\n\n${block}` : block;
-  const messages = Array.isArray(existing) ? existing : [existing];
-  return [...messages, { role: "system", content: block }];
+function prependText(content: UserContent, block: string): UserContent {
+  if (typeof content === "string") {
+    return [
+      { type: "text", text: block },
+      { type: "text", text: content },
+    ];
+  }
+  return [{ type: "text", text: block }, ...content];
 }
 
 /**
- * Recall memories relevant to a prompt and add them to its `instructions`.
- * Spread the result into `generateText` or `streamText`:
+ * The messages with the block in front of the last user message's content, or,
+ * when there is no user message, in a user message of its own at the start.
+ * The input array and its messages are not modified.
+ */
+function withBlockInMessages(messages: readonly ModelMessage[], block: string): ModelMessage[] {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role === "user") {
+      const copy = [...messages];
+      copy[i] = { ...message, content: prependText(message.content, block) };
+      return copy;
+    }
+  }
+  return [{ role: "user", content: block }, ...messages];
+}
+
+/**
+ * Recall memories relevant to a prompt and put them in front of the user's
+ * turn. Spread the result into `generateText` or `streamText`:
  *
  *     const result = await generateText({
  *       model,
  *       ...(await withVeldMemories(veld, { instructions: "You are...", prompt })),
  *     });
  *
- * A deprecated `system` field is moved to `instructions`. With no query, or
- * when nothing relevant is recalled, the instructions are returned unchanged.
- * A failed recall throws `VeldError`.
+ * The memories go in the user turn, never in `instructions`: recalled text is
+ * data, and the system channel is for the developer's instructions. A string
+ * prompt gets the memory block before it; with messages, the block becomes a
+ * text part at the start of the last user message. The block fences the
+ * memories, escapes their text and labels each one's trust (see
+ * `formatMemories`).
+ *
+ * By default only memories veld trusts are used, and veld trusts nothing
+ * written over its HTTP API; `includeUntrusted` uses the rest, labelled.
+ *
+ * A deprecated `system` field is moved to `instructions`; the instructions are
+ * otherwise returned unchanged. With no query, or when no memory is left to
+ * use, the prompt is returned unchanged. A failed recall throws `VeldError`.
  */
 export async function withVeldMemories<T extends PromptFields>(
   client: VeldClient,
@@ -92,7 +131,15 @@ export async function withVeldMemories<T extends PromptFields>(
     },
     options.signal,
   );
+  warnWithheldOnce(client, partitionMemories(reply.memories, options).withheld);
   const block = formatMemories(reply.memories, options);
   if (!block) return result;
-  return { ...rest, instructions: appendInstructions(original, block) };
+
+  if (typeof fields.prompt === "string") {
+    return { ...result, prompt: `${block}\n\n${fields.prompt}` };
+  }
+  if (Array.isArray(fields.prompt)) {
+    return { ...result, prompt: withBlockInMessages(fields.prompt, block) };
+  }
+  return { ...result, messages: withBlockInMessages(fields.messages ?? [], block) };
 }

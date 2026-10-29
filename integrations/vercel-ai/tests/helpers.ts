@@ -37,6 +37,7 @@ export function json(status: number, body: unknown): Response {
   });
 }
 
+/** A recalled memory from a trusted source unless `extra` says otherwise. */
 export function recallMemory(
   id: string,
   content: string,
@@ -49,8 +50,19 @@ export function recallMemory(
     created_at: "2026-10-28T09:15:30.123456789+00:00",
     score: 0.9,
     tier: "Working",
+    source_type: "User",
+    source_trusted: true,
     ...extra,
   };
+}
+
+/** A memory a model stored over the HTTP API, as veld returns it: untrusted. */
+export function untrustedMemory(
+  id: string,
+  content: string,
+  extra: Partial<RecallMemory> = {},
+): RecallMemory {
+  return recallMemory(id, content, { source_type: "AiGenerated", source_trusted: false, ...extra });
 }
 
 /** A V4 model result carrying text, for MockLanguageModelV4. */

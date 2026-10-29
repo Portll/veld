@@ -222,7 +222,8 @@ See [examples/crewai](../examples/crewai) for options and error handling.
 **Vercel AI SDK (TypeScript)**
 
 [`@veld/vercel-ai`](../integrations/vercel-ai) exposes veld remember and recall as AI SDK
-tools and adds recalled memories to a prompt's instructions. See
+tools and puts recalled memories in the user's turn of a prompt, fenced and labelled by
+trust. See
 [examples/vercel-ai](../examples/vercel-ai).
 
 **ChatGPT (Custom GPT Actions)**
