@@ -522,18 +522,26 @@ pub async fn rebuild_user_graph(
         let state = state.clone();
         let user_id = user_id.clone();
         blocking(move || {
-            let memories: Vec<(MemoryId, Experience)> = memory_sys
-                .read()
-                .get_all_memories()?
-                .into_iter()
-                .map(|m| (m.id.clone(), m.experience.clone()))
-                .collect();
+            let (memories, tag_sources) = {
+                let guard = memory_sys.read();
+                let memories: Vec<(MemoryId, Experience)> = guard
+                    .get_all_memories()?
+                    .into_iter()
+                    .map(|m| (m.id.clone(), m.experience.clone()))
+                    .collect();
+                // A caller tag becomes a node only when the ledger says the caller wrote it.
+                (memories, guard.tag_source_store().all()?)
+            };
             let total_memories = memories.len();
             let mut processed = 0;
             for (memory_id, experience) in memories {
-                if let Err(e) =
-                    state.process_experience_into_graph(&user_id, &experience, &memory_id)
-                {
+                if let Err(e) = state.process_experience_into_graph_declared(
+                    &user_id,
+                    &experience,
+                    &memory_id,
+                    &[],
+                    tag_sources.get(&memory_id),
+                ) {
                     tracing::debug!("Failed to process memory {}: {}", memory_id.0, e);
                 } else {
                     processed += 1;
