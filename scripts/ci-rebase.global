@@ -1,0 +1,17 @@
+# Paths whose change on main voids a green verdict carried across a rebase (scripts/ci-rebase.sh):
+# what decides how every crate builds, which tests run, or what the gate checks. One path from the
+# repository root per line; a trailing / names a directory. The gate scripts themselves always count.
+Cargo.toml
+Cargo.lock
+build.rs
+.cargo/
+.config/
+.github/workflows/ci.yml
+veld-py/
+scripts/test-local.sh
+scripts/test-local.known-red
+scripts/cargo-dev.sh
+scripts/setup-libclang-env.sh
+scripts/upstream/
+mcp-server/package.json
+pyproject.toml

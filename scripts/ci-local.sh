@@ -27,11 +27,22 @@ if [ ! -x scripts/test-local.sh ]; then
   echo "scripts/test-local.sh is missing or not executable; it runs the format, clippy, test and bench legs" >&2
   exit 1
 fi
-step "format, clippy, tests and benches on every engine set"
+if [ "${1:-}" = "--rebase" ]; then
+  step "format, clippy, every test and bench target built on every engine set, the handler suite"
+  mode=--rebase
+else
+  step "format, clippy, tests and benches on every engine set"
+  mode=--full
+fi
 # Under ci-verdict every run uses one scratch checkout, so one target dir keeps its builds
 # incremental; test-local.sh's per-checkout default would otherwise be shared with a working tree
 # of the same name. Its --full lock serialises the runs that write it.
 if [ -n "${CI_VERDICT_SHA:-}" ]; then
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cargo-target-drive/veld-verdict}"
 fi
-exec scripts/test-local.sh --full
+status=0
+scripts/test-local.sh "$mode" || status=$?
+# test-local.sh exits 3 when another full matrix holds the machine. That is not a verdict:
+# ci-verdict reads 75 (EX_TEMPFAIL) as busy, records nothing, and with --wait tries again.
+if [ "$status" -eq 3 ]; then exit 75; fi
+exit "$status"

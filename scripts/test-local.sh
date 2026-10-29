@@ -36,6 +36,7 @@ usage() {
   cat <<'EOF'
 usage: scripts/test-local.sh <cargo test selectors and flags>
        scripts/test-local.sh --full
+       scripts/test-local.sh --rebase
 
 Tier 1 needs at least one selector. A test-name filter applies to every target it is given
 with, so run the touched module's tests and the whole handler suite as separate calls:
@@ -44,6 +45,8 @@ with, so run the touched module's tests and the whole handler suite as separate 
   scripts/test-local.sh --no-default-features --features storage-redb --test handler_tests
 Tier 2 runs what CI runs: fmt, clippy, then per feature leg nextest (ci profile), the
 doctests and a bench build, skipping the tests listed in scripts/test-local.known-red.
+--rebase is what a tier 2 verdict carried across a rebase still runs (scripts/ci-rebase.sh):
+fmt, clippy, every test and bench target built per feature leg, and the handler suite.
 EOF
 }
 
@@ -134,6 +137,69 @@ take_full_suite_lock() {
 
 step() { printf '\n== %s\n' "$*"; }
 
+# The nextest filter expression naming every known-red test, or nothing.
+known_red_expr() {
+  local name expr=""
+  while IFS= read -r name; do
+    expr="${expr:+$expr | }test(~$name)"
+  done < <(known_red_names)
+  printf '%s' "$expr"
+}
+
+# fmt, then clippy on CI's three legs; appends to the caller's `failed`.
+check_format_and_lints() {
+  step "fmt"
+  cargo fmt --all -- --check || failed+=("fmt")
+  local features
+  for features in "" "--no-default-features --features storage-redb" "--features zenoh"; do
+    step "clippy ${features:-default}"
+    # shellcheck disable=SC2086
+    cargo_niced clippy --all-targets $features -- -W clippy::all -D clippy::correctness \
+      >"$log_dir/clippy-${features// /_}.log" 2>&1 || failed+=("clippy ${features:-default}")
+  done
+}
+
+finish() {
+  if ((${#failed[@]})); then
+    printf '\nFAILED: %s\n' "${failed[@]}"
+    exit 1
+  fi
+  printf '\ngreen (filter: %s)\n' "${expr:-none}"
+  finished=1
+}
+
+run_rebase_check() {
+  take_full_suite_lock
+  local log_dir="${CARGO_TARGET_DIR:-$repo_root/target}-logs"
+  mkdir -p "$log_dir"
+  local expr
+  expr="$(known_red_expr)"
+  local -a filter=() failed=()
+  if [[ -n "$expr" ]]; then filter=(-E "not ($expr)"); fi
+
+  cd "$repo_root"
+  check_format_and_lints
+  # nextest builds through `cargo test --no-run`, so these reuse the carried full run's artefacts
+  # and rebuild only what the commits on main changed.
+  local features
+  for features in "" "--no-default-features --features storage-redb" "--no-default-features --features rocksdb"; do
+    local build_log="$log_dir/rebase-build-${features// /_}.log"
+    step "build every test and bench target ${features:-default} (log: $build_log)"
+    # shellcheck disable=SC2086
+    cargo_niced test --no-run $features >"$build_log" 2>&1 || failed+=("test build ${features:-default}")
+    # shellcheck disable=SC2086
+    cargo_niced test --benches --no-run $features >>"$build_log" 2>&1 || failed+=("bench build ${features:-default}")
+  done
+  local log="$log_dir/rebase-handler-tests.log"
+  step "nextest handler_tests default (log: $log)"
+  if ! cargo_niced nextest run --profile ci --test-threads "$RUST_TEST_THREADS" --test handler_tests \
+    ${filter[@]+"${filter[@]}"} >"$log" 2>&1; then
+    failed+=("handler_tests")
+  fi
+  grep -E '^\s+(FAIL|TIMEOUT|SIGSEGV|SIGABRT) |^\s+Summary ' "$log" | head -20 || true
+  finish
+}
+
 run_full_matrix() {
   take_full_suite_lock
   local log_dir="${CARGO_TARGET_DIR:-$repo_root/target}-logs"
@@ -142,26 +208,15 @@ run_full_matrix() {
   # test, per-test timeouts from .config/nextest.toml), then the doctests nextest does not run,
   # then a compile of the benches. A plain `cargo test` here missed a failure that only
   # per-process isolation shows (ner_tests::test_many_entities, 2026-10-23).
-  local -a filter=()
-  local name expr=""
-  while IFS= read -r name; do
-    expr="${expr:+$expr | }test(~$name)"
-  done < <(known_red_names)
+  local expr
+  expr="$(known_red_expr)"
+  local -a filter=() failed=()
   if [[ -n "$expr" ]]; then filter=(-E "not ($expr)"); fi
-  local failed=()
 
   cd "$repo_root"
-  step "fmt"
-  cargo fmt --all -- --check || failed+=("fmt")
+  check_format_and_lints
 
   local features
-  for features in "" "--no-default-features --features storage-redb" "--features zenoh"; do
-    step "clippy ${features:-default}"
-    # shellcheck disable=SC2086
-    cargo_niced clippy --all-targets $features -- -W clippy::all -D clippy::correctness \
-      >"$log_dir/clippy-${features// /_}.log" 2>&1 || failed+=("clippy ${features:-default}")
-  done
-
   for features in "" "--no-default-features --features storage-redb" "--no-default-features --features rocksdb"; do
     local log="$log_dir/test-${features// /_}.log"
     step "nextest ${features:-default} (log: $log)"
@@ -180,13 +235,7 @@ run_full_matrix() {
     cargo_niced test --benches --no-run $features >"$log_dir/bench-${features// /_}.log" 2>&1 \
       || failed+=("bench build ${features:-default}")
   done
-
-  if ((${#failed[@]})); then
-    printf '\nFAILED: %s\n' "${failed[@]}"
-    exit 1
-  fi
-  printf '\ngreen (filter: %s)\n' "${expr:-none}"
-  finished=1
+  finish
 }
 
 if [[ $# -eq 0 ]]; then
@@ -200,9 +249,9 @@ if [[ "$1" == "-h" || "$1" == "--help" ]]; then
 fi
 
 isolate_environment
-if [[ "$1" == "--full" ]]; then
-  [[ $# -eq 1 ]] || { echo "test-local: --full takes no other arguments" >&2; exit 2; }
-  run_full_matrix
+if [[ "$1" == "--full" || "$1" == "--rebase" ]]; then
+  [[ $# -eq 1 ]] || { echo "test-local: $1 takes no other arguments" >&2; exit 2; }
+  if [[ "$1" == "--full" ]]; then run_full_matrix; else run_rebase_check; fi
 else
   refuse_binary_builds "$@"
   cd "$repo_root"
