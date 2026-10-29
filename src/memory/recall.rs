@@ -1178,6 +1178,7 @@ impl super::MemorySystem {
                                 tracing::debug!(
                                     seeds = seeds.len(),
                                     expanded = ppr.expanded,
+                                    edge_reads = ppr.edge_reads,
                                     activated = ppr.mass.len(),
                                     pool = pool.len(),
                                     "Layer 2: personalized PageRank"

@@ -1082,14 +1082,22 @@ pub const RECALL_PPR_TOLERANCE: f32 = 1e-6;
 /// Hops of the entity subgraph recall's PPR expands from its seeds.
 pub const RECALL_PPR_EXPAND_HOPS: usize = 3;
 
-/// Entities recall's PPR subgraph holds at most.
-pub const RECALL_PPR_MAX_NODES: usize = 5000;
+/// Entities recall's PPR subgraph holds at most, checked as each is added. Upstream's 5000
+/// is cut to 2000: with an ontological intent naming labels, each node costs an entity read,
+/// and the mass past the strongest 2000 is too small to change which episodes the leg takes.
+pub const RECALL_PPR_MAX_NODES: usize = 2000;
 
-/// Entities whose edges recall's PPR reads at most: one adjacency read each, of the
-/// entity's 100 strongest edges. Upstream bounds the walk by node count alone; this bounds
-/// the storage reads on a sparse graph, where every node holds few edges and the node cap
-/// takes thousands of expansions to reach.
+/// Entities whose edge index recall's PPR reads at most. Upstream bounds the walk by node
+/// count alone; this bounds the index scans on a sparse graph, where every node holds few
+/// edges and the node cap takes thousands of expansions to reach.
 pub const RECALL_PPR_MAX_EXPANSIONS: usize = 500;
+
+/// Edge records recall's PPR decodes at most. Expanding an entity decodes every edge it
+/// stores before keeping the strongest 100, so a hub costs its whole degree: 500 expansions
+/// of 200-edge entities decode 100,000 edges and name as many tie peers under the graph read
+/// lock, a cost that grows with the store's graph. An entity with more stored edges than
+/// remain is skipped without decoding.
+pub const RECALL_PPR_MAX_EDGE_READS: usize = 6000;
 
 /// Stationary flow an edge must carry for a recall to strengthen it. Flows sum to at most
 /// `1 - RECALL_PPR_RESTART`, so one recall strengthens at most 50 edges.

@@ -46,9 +46,9 @@ use crate::constants::{
     QUERY_TYPE_EXPLORATORY_LINGUISTIC, QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH,
     QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, RECALL_GRAPH_LEG_ENTITIES,
     RECALL_GRAPH_LEG_EPISODES_PER_ENTITY, RECALL_GRAPH_LEG_EPISODE_READS, RECALL_GRAPH_LEG_POOL,
-    RECALL_PPR_EXPAND_HOPS, RECALL_PPR_MAX_EXPANSIONS, RECALL_PPR_MAX_ITERATIONS,
-    RECALL_PPR_MAX_NODES, RECALL_PPR_POTENTIATION_MIN_FLOW, RECALL_PPR_RESTART,
-    RECALL_PPR_TOLERANCE, SALIENCE_BOOST_FACTOR, SEED_COVERAGE_BONUS,
+    RECALL_PPR_EXPAND_HOPS, RECALL_PPR_MAX_EDGE_READS, RECALL_PPR_MAX_EXPANSIONS,
+    RECALL_PPR_MAX_ITERATIONS, RECALL_PPR_MAX_NODES, RECALL_PPR_POTENTIATION_MIN_FLOW,
+    RECALL_PPR_RESTART, RECALL_PPR_TOLERANCE, SALIENCE_BOOST_FACTOR, SEED_COVERAGE_BONUS,
     SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
     SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO,
     SPREADING_FRONTIER_CAP, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS,
@@ -318,10 +318,13 @@ struct SpreadEdge {
 }
 
 /// Per-query adjacency: each entity's edges are read and decayed once, however many hops,
-/// directions or threshold passes reach it.
+/// directions or threshold passes reach it, and each tie peer's name is read once.
 struct AdjacencyCache {
     now: DateTime<Utc>,
     edges: HashMap<Uuid, Vec<SpreadEdge>>,
+    peer_names: HashMap<Uuid, String>,
+    /// Edge records read so far.
+    decoded: usize,
 }
 
 impl AdjacencyCache {
@@ -329,14 +332,39 @@ impl AdjacencyCache {
         Self {
             now,
             edges: HashMap::new(),
+            peer_names: HashMap::new(),
+            decoded: 0,
         }
     }
 
     fn edges_of(&mut self, graph: &GraphMemory, entity: &Uuid) -> Result<&[SpreadEdge]> {
+        Ok(self
+            .edges_within(graph, entity, usize::MAX)?
+            .unwrap_or_default())
+    }
+
+    /// The entity's edges, or `None` when reading them would take more than `max_decodes`
+    /// edge records; then none is read.
+    fn edges_within(
+        &mut self,
+        graph: &GraphMemory,
+        entity: &Uuid,
+        max_decodes: usize,
+    ) -> Result<Option<&[SpreadEdge]>> {
         if !self.edges.contains_key(entity) {
             let now = self.now;
-            let edges = graph
-                .entity_edges_with_strength(entity, Some(MAX_EDGES_PER_SPREAD), now)?
+            let Some((ranked, decoded)) = graph.entity_edges_with_strength_bounded(
+                entity,
+                Some(MAX_EDGES_PER_SPREAD),
+                now,
+                max_decodes,
+                &mut self.peer_names,
+            )?
+            else {
+                return Ok(None);
+            };
+            self.decoded += decoded;
+            let edges = ranked
                 .into_iter()
                 .map(|(edge, effective)| {
                     // Edge-tier trust weight (SHO-D1, PIPE-4)
@@ -371,7 +399,7 @@ impl AdjacencyCache {
                 .collect();
             self.edges.insert(*entity, edges);
         }
-        Ok(&self.edges[entity])
+        Ok(Some(&self.edges[entity]))
     }
 }
 
@@ -707,8 +735,34 @@ pub(crate) struct PprActivation {
     /// Edges that carried at least `RECALL_PPR_POTENTIATION_MIN_FLOW` of the mass at
     /// convergence, each once: the edges a recall strengthens.
     pub(crate) carrying_edges: Vec<Uuid>,
-    /// Entities whose edges the walk read.
+    /// Entities whose edge index the walk read, those it then skipped as too large included.
     pub(crate) expanded: usize,
+    /// Edge records the walk decoded.
+    pub(crate) edge_reads: usize,
+}
+
+/// The work one PPR walk may do.
+///
+/// Worst case per walk: `max_expansions` prefix scans of an entity's edge index;
+/// `max_edge_reads` edge records decoded, an entity with more stored edges than remain being
+/// skipped undecoded; at most as many entity reads to name equal-strength peers, each peer
+/// once per walk, and two per decayed edge for the prune check; with an ontological intent
+/// naming entity labels, one entity read per subgraph node, at most `max_nodes`; and power
+/// iteration over at most `max_expansions × 100` adjacency entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PprLimits {
+    pub(crate) max_expansions: usize,
+    pub(crate) max_edge_reads: usize,
+    pub(crate) max_nodes: usize,
+}
+
+impl PprLimits {
+    /// The limits recall's graph leg walks under.
+    pub(crate) const RECALL: Self = Self {
+        max_expansions: RECALL_PPR_MAX_EXPANSIONS,
+        max_edge_reads: RECALL_PPR_MAX_EDGE_READS,
+        max_nodes: RECALL_PPR_MAX_NODES,
+    };
 }
 
 /// Intern `entity` into the walk's dense node index; true when it was not there yet.
@@ -728,22 +782,33 @@ fn ppr_intern(
     (i, true)
 }
 
-/// Personalized PageRank from `seeds`, each `(entity, restart weight)`.
-///
-/// The subgraph is expanded breadth-first from the seeds for `RECALL_PPR_EXPAND_HOPS` hops,
-/// reading at most `RECALL_PPR_MAX_EXPANSIONS` entities' edges (each entity's 100 strongest,
-/// decayed to `now`, followed to their true neighbour) and holding at most
-/// `RECALL_PPR_MAX_NODES` entities. Power iteration then solves
-/// `r = (1 − α)·Wᵀr + α·p`, α = `RECALL_PPR_RESTART`, `p` the L1-normalised restart weights,
-/// `W` each entity's edge weights normalised over its out-flow.
-///
-/// Expansion follows the seed order and each entity's edges strongest first, ties by peer
-/// name, so two stores ingested from the same content walk the same subgraph.
+/// Personalized PageRank from `seeds`, each `(entity, restart weight)`, under
+/// [`PprLimits::RECALL`].
 pub(crate) fn personalized_pagerank(
     graph: &GraphMemory,
     seeds: &[(Uuid, f32)],
     intent: Option<&OntologicalIntent>,
     now: DateTime<Utc>,
+) -> Result<PprActivation> {
+    personalized_pagerank_within(graph, seeds, intent, now, PprLimits::RECALL)
+}
+
+/// Personalized PageRank from `seeds`, each `(entity, restart weight)`.
+///
+/// The subgraph is expanded breadth-first from the seeds for `RECALL_PPR_EXPAND_HOPS` hops
+/// within `limits`, following each expanded entity's 100 strongest edges, decayed to `now`,
+/// to their true neighbour. Power iteration then solves `r = (1 − α)·Wᵀr + α·p`,
+/// α = `RECALL_PPR_RESTART`, `p` the L1-normalised restart weights, `W` each entity's edge
+/// weights normalised over its out-flow.
+///
+/// Expansion follows the seed order and each entity's edges strongest first, ties by peer
+/// name, so two stores ingested from the same content walk the same subgraph.
+pub(crate) fn personalized_pagerank_within(
+    graph: &GraphMemory,
+    seeds: &[(Uuid, f32)],
+    intent: Option<&OntologicalIntent>,
+    now: DateTime<Utc>,
+    limits: PprLimits,
 ) -> Result<PprActivation> {
     let mut edges = AdjacencyCache::new(now);
     let mut label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
@@ -762,12 +827,19 @@ pub(crate) fn personalized_pagerank(
     'expand: for _hop in 0..RECALL_PPR_EXPAND_HOPS {
         let mut next: Vec<Uuid> = Vec::new();
         for &entity in &frontier {
-            if nodes.len() >= RECALL_PPR_MAX_NODES || expanded >= RECALL_PPR_MAX_EXPANSIONS {
+            if expanded >= limits.max_expansions
+                || edges.decoded >= limits.max_edge_reads
+                || nodes.len() >= limits.max_nodes
+            {
                 break 'expand;
             }
             expanded += 1;
+            let remaining = limits.max_edge_reads - edges.decoded;
+            let Some(entity_edges) = edges.edges_within(graph, &entity, remaining)? else {
+                continue;
+            };
             let from = index[&entity];
-            for edge in edges.edges_of(graph, &entity)? {
+            for edge in entity_edges {
                 if edge.invalidated {
                     continue;
                 }
@@ -775,11 +847,15 @@ pub(crate) fn personalized_pagerank(
                 if weight <= 0.0 {
                     continue;
                 }
-                let (to, new) = ppr_intern(edge.target, &mut nodes, &mut index, &mut adjacency);
+                let to = match index.get(&edge.target) {
+                    Some(&to) => to,
+                    None if nodes.len() >= limits.max_nodes => continue,
+                    None => {
+                        next.push(edge.target);
+                        ppr_intern(edge.target, &mut nodes, &mut index, &mut adjacency).0
+                    }
+                };
                 adjacency[from].push((to, weight, edge.uuid));
-                if new {
-                    next.push(edge.target);
-                }
             }
         }
         if next.is_empty() {
@@ -787,12 +863,14 @@ pub(crate) fn personalized_pagerank(
         }
         frontier = next;
     }
+    let edge_reads = edges.decoded;
 
     let n = nodes.len();
     let restart_total: f32 = seeds.iter().map(|(_, w)| w.max(0.0)).sum();
     if n == 0 || restart_total <= 0.0 {
         return Ok(PprActivation {
             expanded,
+            edge_reads,
             ..Default::default()
         });
     }
@@ -853,6 +931,7 @@ pub(crate) fn personalized_pagerank(
         mass,
         carrying_edges,
         expanded,
+        edge_reads,
     })
 }
 
@@ -2505,6 +2584,58 @@ mod ppr_tests {
         let bound = ((1.0 - RECALL_PPR_RESTART) / RECALL_PPR_POTENTIATION_MIN_FLOW) as usize;
         let ppr = walk(&graph, &[(hub, 1.0), (pair_seed, 1.0)], None);
         assert!(ppr.carrying_edges.len() <= bound);
+    }
+
+    #[test]
+    fn the_walk_stays_inside_its_edge_and_node_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let seed = entity(&graph, "seed", 1);
+        let hub = entity(&graph, "hub", 1);
+        link(&graph, seed, hub, RelationType::CoOccurs);
+        let mut spokes = Vec::new();
+        for i in 0..40 {
+            let spoke = entity(&graph, &format!("spoke {i}"), 1);
+            link(&graph, hub, spoke, RelationType::CoOccurs);
+            spokes.push(spoke);
+        }
+        let near: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let near = entity(&graph, &format!("near {i}"), 1);
+                link(&graph, seed, near, RelationType::CoOccurs);
+                near
+            })
+            .collect();
+        let limits = |max_edge_reads, max_nodes| PprLimits {
+            max_expansions: 500,
+            max_edge_reads,
+            max_nodes,
+        };
+        let run =
+            |l| personalized_pagerank_within(&graph, &[(seed, 1.0)], None, Utc::now(), l).unwrap();
+
+        let open = run(limits(10_000, 10_000));
+        assert!(
+            spokes.iter().all(|s| mass(&open, s) > 0.0),
+            "unbounded, the hub spreads"
+        );
+        assert_eq!(
+            open.edge_reads,
+            4 + 41 + 3 + 40,
+            "seed, then hub and near, then spokes"
+        );
+
+        // The hub's 41 edges do not fit after the seed's 4: it is skipped, undecoded, and
+        // the near entities still expand.
+        let tight = run(limits(10, 10_000));
+        assert!(tight.edge_reads <= 10, "{}", tight.edge_reads);
+        assert_eq!(tight.edge_reads, 4 + 3);
+        assert!(mass(&tight, &hub) > 0.0, "the hub is reached, not expanded");
+        assert!(spokes.iter().all(|s| mass(&tight, s) == 0.0));
+        assert!(near.iter().all(|n| mass(&tight, n) > 0.0));
+
+        let capped = run(limits(10_000, 10));
+        assert!(capped.mass.len() <= 10, "{} nodes", capped.mass.len());
     }
 
     #[test]
