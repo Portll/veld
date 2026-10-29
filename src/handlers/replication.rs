@@ -165,7 +165,7 @@ pub async fn records(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FollowRequest {
     pub source: String,
@@ -173,6 +173,19 @@ pub struct FollowRequest {
     /// The leader's API key; this server's own when absent.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for FollowRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FollowRequest")
+            .field("source", &self.source)
+            .field("admin_key", &replication::REDACTED)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| replication::REDACTED),
+            )
+            .finish()
+    }
 }
 
 /// Start tailing `source`. Refused when the source is this instance, by its address

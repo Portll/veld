@@ -110,8 +110,9 @@ pub struct FeedPage {
     pub log_created: u64,
 }
 
-/// What a follower follows. The keys never leave the process.
-#[derive(Debug, Clone, Serialize)]
+/// What a follower follows. The keys never leave the process: serialization skips
+/// them and `Debug` prints them redacted.
+#[derive(Clone, Serialize)]
 pub struct FollowTarget {
     pub source: String,
     #[serde(skip)]
@@ -122,6 +123,22 @@ pub struct FollowTarget {
     #[serde(skip)]
     pub http: reqwest::Client,
     pub since: DateTime<Utc>,
+}
+
+/// Stands in for a secret in `Debug` output.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for FollowTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The client is left out: its Debug lists any proxy, whose URL can carry
+        // credentials.
+        f.debug_struct("FollowTarget")
+            .field("source", &self.source)
+            .field("admin_key", &REDACTED)
+            .field("api_key", &REDACTED)
+            .field("since", &self.since)
+            .finish_non_exhaustive()
+    }
 }
 
 /// This server's own first API key, from the same variables the auth
@@ -3094,6 +3111,60 @@ mod tests {
     fn tls_refusal(vars: &[(&str, &str)]) -> String {
         let err = tls_from(vars).expect_err("the TLS variables are refused");
         format!("{err:#}")
+    }
+
+    #[test]
+    fn debug_output_carries_no_key_material() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["follower.example".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (cert_pem, key_pem) = (cert.pem(), key.serialize_pem());
+        let cert_path = dir.path().join("client.pem");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let tls = tls_from(&[
+            (ENV_CLIENT_CERT, cert_path.to_str().unwrap()),
+            (ENV_CLIENT_KEY, key_path.to_str().unwrap()),
+        ])
+        .unwrap();
+        assert!(tls.identity.is_some());
+
+        let (admin_key, api_key) = ("admin-SECRET-4f1c", "api-SECRET-9b2e");
+        let replication = Replication::default();
+        replication
+            .follow(dir.path(), "http://127.0.0.1:9", admin_key, Some(api_key))
+            .unwrap();
+        let request = crate::handlers::replication::FollowRequest {
+            source: "http://127.0.0.1:9".into(),
+            admin_key: admin_key.into(),
+            api_key: Some(api_key.into()),
+        };
+        let pem_bodies: Vec<&str> = cert_pem
+            .lines()
+            .chain(key_pem.lines())
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        for text in [
+            format!("{replication:?}"),
+            format!("{replication:#?}"),
+            format!("{:?}", replication.status()),
+            format!("{request:?}"),
+            format!("{tls:?}"),
+        ] {
+            assert!(!text.contains("SECRET"), "a key in {text}");
+            assert!(
+                !text.contains("BEGIN") && !pem_bodies.iter().any(|body| text.contains(body)),
+                "PEM content in {text}"
+            );
+        }
+        assert!(
+            format!("{replication:?}").contains("http://127.0.0.1:9"),
+            "the source is still shown"
+        );
     }
 
     #[test]
