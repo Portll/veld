@@ -321,8 +321,9 @@ class Mem0System:
                 self.sleep(ADD_BACKOFF_S * 2 ** attempt)
         raise AssertionError("unreachable")
 
-    def ingest(self, user_id: str, sessions: list, content) -> dict:
-        """sessions: [(number, turns, start)] as locomo_qa_eval.conversation_sessions returns."""
+    def ingest(self, user_id: str, sessions: list, content, progress=lambda line: None) -> dict:
+        """sessions: [(number, turns, start)] as locomo_qa_eval.conversation_sessions returns;
+        progress gets one line per session, since a session's extraction can take minutes."""
         before = self.log.snapshot()
         started = time.perf_counter()
         stats = {"user_id": user_id, "sessions": 0, "turns": 0, "adds": 0, "events": {}}
@@ -335,6 +336,9 @@ class Mem0System:
                 stats["adds"] += 1
             stats["sessions"] += 1
             stats["turns"] += len(turns)
+            progress(f"  {user_id}: session {number} ({stats['sessions']} of {len(sessions)}) "
+                     f"added, {sum(stats['events'].values())} memory events so far, "
+                     f"{round(time.perf_counter() - started)}s")
         stats["ingest_s"] = round(time.perf_counter() - started, 2)
         stats["stored_memories"] = self.count(user_id)
         after = self.log.snapshot()

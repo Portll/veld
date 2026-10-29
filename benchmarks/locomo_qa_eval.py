@@ -1458,7 +1458,7 @@ def mem0_retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict]
             c = conv["conversation"]
             speakers = (c["speaker_a"], c["speaker_b"])
             user_id = user_for(cid)
-            stats = system.ingest(user_id, conversation_sessions(conv), turn_content)
+            stats = system.ingest(user_id, conversation_sessions(conv), turn_content, print)
             results["ingest"][cid] = stats
             calls = stats["calls"]["llm"]
             print(f"  {cid}: {stats['turns']} turns in {stats['sessions']} sessions, "

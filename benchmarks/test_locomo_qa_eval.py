@@ -309,8 +309,11 @@ class Mem0AdapterTests(unittest.TestCase):
     def test_v2_ingest_and_search(self):
         memory = StubMemory("2.2.1")
         system = stub_system("2.2.1", memory)
-        stats = system.ingest("locomo_conv-x", SESSIONS, qa.turn_content)
+        lines = []
+        stats = system.ingest("locomo_conv-x", SESSIONS, qa.turn_content, lines.append)
         self.assertEqual((stats["sessions"], stats["turns"], stats["adds"]), (2, 3, 2))
+        self.assertEqual(len(lines), 2)
+        self.assertIn("session 2 (2 of 2) added, 2 memory events so far", lines[1])
         self.assertEqual(stats["events"], {"ADD": 2})
         self.assertEqual(stats["stored_memories"], 2)
         messages, kwargs = memory.adds[0]
