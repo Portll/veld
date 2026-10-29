@@ -5052,6 +5052,11 @@ impl MultiUserMemoryManager {
         let mut hub_edges_skipped = 0u64;
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
+                // Two names `add_entity` resolved to one node (a case, stem or concept merge)
+                // are one entity, and an edge from it to itself relates nothing.
+                if entity_uuids[i].1 == entity_uuids[j].1 {
+                    continue;
+                }
                 if at_cap[i] || at_cap[j] {
                     hub_edges_skipped += 1;
                     continue;
@@ -6160,6 +6165,30 @@ mod graph_admission_tests {
         assert!(caroline.contains(&EntityLabel::Technology), "{caroline:?}");
     }
 
+    /// The NER span and its tag twin resolve to one node; the pair loop used to join it to
+    /// itself.
+    #[test]
+    fn two_names_for_one_node_make_no_self_loop() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let experience = Experience {
+            content: "Caroline painted a lake.".into(),
+            tags: vec!["Caroline".into()],
+            entities: vec!["Caroline".into()],
+            ner_entities: vec![person("Caroline")],
+            ..Default::default()
+        };
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(USER, &experience, &id, &[], None, legacy())
+            .unwrap();
+
+        let graph = mgr.get_user_graph(USER).unwrap();
+        let edges = graph.read().get_all_relationships().unwrap();
+        assert!(
+            edges.iter().all(|e| e.from_entity != e.to_entity),
+            "{edges:?}"
+        );
+    }
 }
 
 /// Annotate a query with NER-extracted entity names.
