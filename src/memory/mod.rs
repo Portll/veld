@@ -384,10 +384,12 @@ pub struct MemorySystem {
     /// and suppress frequently-ignored memories (up to 20% penalty for negative momentum)
     feedback_store: Option<Arc<parking_lot::RwLock<FeedbackStore>>>,
 
-    /// The tenant this system belongs to. The manager opens one MemorySystem per
-    /// user, but the id otherwise lives only in its cache key, so an in-process
-    /// recall without a user_id (recall harness, Python bindings) skipped every
-    /// per-user fact layer the HTTP path runs.
+    /// The tenant this system belongs to, set by the manager, which opens one
+    /// MemorySystem per user and otherwise keeps the id only in its cache key.
+    /// Without it an in-process recall that names no user (the recall harness)
+    /// skipped every per-user fact layer the HTTP path runs. The Python bindings
+    /// build their system directly and hold no user id, so their recall still
+    /// runs unscoped unless the query names one.
     owner_user_id: Option<String>,
 
     /// External dimension scores (Spine): topological health of the knowledge graph.
