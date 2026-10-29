@@ -132,8 +132,9 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     let result = runtime.block_on(async_main(file_limit));
     // The gap between "Server shutdown complete" and exit was 10.2 s on 2026-10-20 and
     // 4.5 s on 2026-10-21 with nothing in flight. These two lines split it: up to the
-    // first is async_main dropping its state (tenant stores close here), between them
-    // is blocking work outliving the drain, after the second is process teardown.
+    // first is async_main dropping its state, between them is blocking work outliving
+    // the drain, after the second is process teardown. Tenant stores closed between
+    // them, one at a time, until the shutdown sequence closed them (close_tenants).
     let stopping = std::time::Instant::now();
     info!("Shutdown sequence returned; stopping the runtime");
     // Dropping a runtime waits without limit for blocking work still running. On
@@ -1044,6 +1045,34 @@ async fn shutdown_signal_with_drain() {
     info!("Shutdown signal received, starting graceful shutdown");
 }
 
+/// How long shutdown waits for the tenants to close before it goes on; the runtime's
+/// own bound then covers what is still closing. With the 10 s task drain and the
+/// flush's 30 s + 60 s, the cleanup stays inside `GRACEFUL_SHUTDOWN_TIMEOUT_SECS`.
+const TENANT_CLOSE_TIMEOUT_SECS: u64 = 10;
+
+async fn close_tenants(manager: &AppState) {
+    let started = std::time::Instant::now();
+    let manager = Arc::clone(manager);
+    let closing = tokio::task::spawn_blocking(move || manager.close_all_tenants());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(TENANT_CLOSE_TIMEOUT_SECS),
+        closing,
+    )
+    .await
+    {
+        Ok(Ok(closed)) => info!(
+            tenants = closed.tenants,
+            held_elsewhere = closed.held_elsewhere,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Tenants closed"
+        ),
+        Ok(Err(e)) => error!("Tenant close task panicked: {e}"),
+        Err(_) => warn!(
+            "Tenants still closing after {TENANT_CLOSE_TIMEOUT_SECS}s; the runtime stop waits for the rest"
+        ),
+    }
+}
+
 async fn run_shutdown_cleanup(manager: AppState) {
     info!("Proceeding with database flush...");
 
@@ -1087,43 +1116,43 @@ async fn run_shutdown_cleanup(manager: AppState) {
         // retriever). Saving again wrote the same 413 MB file a second time on every
         // stop; it is now only the fallback when the flush ended without finishing.
         match flush {
-            FlushOutcome::Flushed => {
-                info!("Databases flushed successfully");
-                #[cfg(feature = "telemetry")]
-                tracing_setup::shutdown_tracing();
-                return;
-            }
+            FlushOutcome::Flushed => info!("Databases flushed successfully"),
             FlushOutcome::StillRunning => {
                 error!(
                     "Database flush timed out after {}s; tenants it had not reached repair \
                      their vector index on the next start",
                     DATABASE_FLUSH_TIMEOUT_SECS + VECTOR_INDEX_SAVE_TIMEOUT_SECS
                 );
+                // The flush still holds the tenants it has not reached, so they are not
+                // closed here: they close when it lets go, inside the runtime bound.
                 #[cfg(feature = "telemetry")]
                 tracing_setup::shutdown_tracing();
                 return;
             }
-            FlushOutcome::Failed => {}
-        }
-        info!("Persisting vector indices (the flush did not complete)...");
-        let manager_for_save = Arc::clone(&manager);
-        let save_handle =
-            tokio::task::spawn_blocking(move || manager_for_save.save_all_vector_indices());
+            FlushOutcome::Failed => {
+                info!("Persisting vector indices (the flush did not complete)...");
+                let manager_for_save = Arc::clone(&manager);
+                let save_handle =
+                    tokio::task::spawn_blocking(move || manager_for_save.save_all_vector_indices());
 
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(VECTOR_INDEX_SAVE_TIMEOUT_SECS),
-            save_handle,
-        )
-        .await
-        {
-            Ok(Ok(Ok(()))) => info!("Vector indices saved successfully"),
-            Ok(Ok(Err(e))) => error!("Failed to save vector indices: {}", e),
-            Ok(Err(e)) => error!("Save task panicked: {}", e),
-            Err(_) => error!(
-                "Vector index save timed out after {}s",
-                VECTOR_INDEX_SAVE_TIMEOUT_SECS
-            ),
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(VECTOR_INDEX_SAVE_TIMEOUT_SECS),
+                    save_handle,
+                )
+                .await
+                {
+                    Ok(Ok(Ok(()))) => info!("Vector indices saved successfully"),
+                    Ok(Ok(Err(e))) => error!("Failed to save vector indices: {}", e),
+                    Ok(Err(e)) => error!("Save task panicked: {}", e),
+                    Err(_) => error!(
+                        "Vector index save timed out after {}s",
+                        VECTOR_INDEX_SAVE_TIMEOUT_SECS
+                    ),
+                }
+            }
         }
+
+        close_tenants(&manager).await;
 
         #[cfg(feature = "telemetry")]
         tracing_setup::shutdown_tracing();

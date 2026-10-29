@@ -401,6 +401,46 @@ pub struct MultiUserMemoryManager {
     feed_floors: parking_lot::Mutex<crate::replication::FeedFloors>,
 }
 
+/// How many tenants [`MultiUserMemoryManager::close_all_tenants`] closes at once.
+const TENANT_CLOSE_WORKERS: usize = 8;
+
+/// One tenant's cached handles, taken out of the manager's maps to be closed together.
+/// Fields drop in declaration order: the journal writer (its deferred lanes, frame
+/// index and projection checkpoints) before the stores its projections read.
+struct TenantHandles {
+    writer: Option<Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>>,
+    memory: Option<SharedUserMemory>,
+    graph: Option<Arc<parking_lot::RwLock<GraphMemory>>>,
+    slow_store: Option<Arc<crate::memory::slow_store::SlowStore>>,
+}
+
+impl TenantHandles {
+    /// Drop every handle and report whether a store stayed open because something
+    /// outside the tenant still holds it. The handles reference one another (the
+    /// memory system holds its graph, a projection its slow store), so the count is
+    /// read after the drop, not before.
+    fn close(self) -> bool {
+        let writer = self.writer.as_ref().map(Arc::downgrade);
+        let memory = self.memory.as_ref().map(Arc::downgrade);
+        let graph = self.graph.as_ref().map(Arc::downgrade);
+        let slow_store = self.slow_store.as_ref().map(Arc::downgrade);
+        drop(self);
+        still_open(&writer) || still_open(&memory) || still_open(&graph) || still_open(&slow_store)
+    }
+}
+
+fn still_open<T: ?Sized>(handle: &Option<std::sync::Weak<T>>) -> bool {
+    handle.as_ref().is_some_and(|h| h.strong_count() > 0)
+}
+
+/// What [`MultiUserMemoryManager::close_all_tenants`] closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantsClosed {
+    pub tenants: usize,
+    /// Tenants with a handle someone else still held; those stores close when it lets go.
+    pub held_elsewhere: usize,
+}
+
 /// Written into a tenant's directory by a backup restore and removed by the C2
 /// reconcile that follows. A backup stages the journal before checkpointing the
 /// primary store, so a memory deleted between the two is live in the restored log
@@ -606,10 +646,13 @@ impl MultiUserMemoryManager {
             .max_capacity(server_config.max_users_in_memory as u64)
             .time_to_idle(std::time::Duration::from_secs(3600))
             .eviction_listener(move |key: Arc<String>, _value, cause| {
-                let cause_label = if cause == moka::notification::RemovalCause::Expired {
-                    "idle-timeout"
-                } else {
-                    "LRU"
+                let cause_label = match cause {
+                    moka::notification::RemovalCause::Expired => "idle-timeout",
+                    moka::notification::RemovalCause::Size => "LRU",
+                    // Restore, forget and the shutdown close remove graphs on purpose
+                    // and say so themselves.
+                    moka::notification::RemovalCause::Explicit
+                    | moka::notification::RemovalCause::Replaced => return,
                 };
                 info!(
                     "Evicted graph for user '{}' from memory cache ({})",
@@ -1874,6 +1917,68 @@ impl MultiUserMemoryManager {
             memory.read().close_writes();
         }
         tenants.len()
+    }
+
+    /// Close every cached tenant now, [`TENANT_CLOSE_WORKERS`] at a time: its journal
+    /// writer, memory system, graph and slow store. Left to the last reference, each
+    /// tenant closed in turn as the runtime stopped, after "Server shutdown complete":
+    /// on 2026-10-29 the live server's 62 tenants held the process 9 s there, against
+    /// a 10 s bound past which the closes are cut off and the next open replays the
+    /// journal tail. Call after `flush_all_databases`. Blocking. A tenant something
+    /// reopens afterwards closes at process exit, as before.
+    pub fn close_all_tenants(&self) -> TenantsClosed {
+        let mut users: std::collections::BTreeSet<String> = self
+            .journaled_writers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        users.extend(self.user_memories.iter().map(|(key, _)| key.to_string()));
+        users.extend(self.graph_memories.iter().map(|(key, _)| key.to_string()));
+        users.extend(self.slow_stores.iter().map(|entry| entry.key().clone()));
+
+        let tenants: Vec<TenantHandles> = users
+            .iter()
+            .map(|user_id| TenantHandles {
+                writer: self.journaled_writers.remove(user_id).map(|(_, w)| w),
+                memory: self.user_memories.remove(user_id),
+                graph: self.graph_memories.remove(user_id),
+                slow_store: self.slow_stores.remove(user_id).map(|(_, s)| s),
+            })
+            .collect();
+        // A removed entry stays referenced from the cache's pending write log until
+        // maintenance runs, which would keep its store open past the drop below.
+        self.user_memories.run_pending_tasks();
+        self.graph_memories.run_pending_tasks();
+        let count = tenants.len();
+        let held_elsewhere = std::sync::atomic::AtomicUsize::new(0);
+
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(TENANT_CLOSE_WORKERS)
+            .min(count);
+        // The stores were dropped on runtime threads until now; keep that context.
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let queue = parking_lot::Mutex::new(tenants);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let _entered = runtime.as_ref().map(|handle| handle.enter());
+                    loop {
+                        // Popped in its own statement: a guard taken in the loop
+                        // condition would stay held through the close.
+                        let next = queue.lock().pop();
+                        let Some(tenant) = next else { break };
+                        if tenant.close() {
+                            held_elsewhere.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        TenantsClosed {
+            tenants: count,
+            held_elsewhere: held_elsewhere.into_inner(),
+        }
     }
 
     pub fn flush_all_databases(&self) -> Result<()> {
@@ -6107,6 +6212,50 @@ mod background_task_tests {
             "the drain returns once the tracked task finishes"
         );
         assert!(state.task_tracker.is_empty());
+    }
+
+    #[test]
+    fn closing_the_tenants_releases_their_stores_for_a_reopen() {
+        let home = tempfile::tempdir().expect("temp home");
+        let state = manager(home.path(), 100);
+        for user in ["closed-a", "closed-b"] {
+            state.get_user_memory(user).expect("open memory");
+            state.get_user_graph(user).expect("open graph");
+            state.get_user_journaled_writer(user).expect("open journal");
+        }
+        let held = state.get_user_memory("closed-b").expect("cached memory");
+
+        assert_eq!(
+            state.close_all_tenants(),
+            TenantsClosed {
+                tenants: 2,
+                held_elsewhere: 1
+            }
+        );
+        assert!(state.user_memories.get("closed-a").is_none());
+        assert!(state.graph_memories.get("closed-a").is_none());
+        assert!(state.journaled_writers.is_empty());
+
+        // A store left open would refuse this open on its file lock.
+        let reopened = std::time::Instant::now();
+        state.get_user_memory("closed-a").expect("reopen memory");
+        state.get_user_graph("closed-a").expect("reopen graph");
+        state
+            .get_user_journaled_writer("closed-a")
+            .expect("reopen journal");
+        assert!(
+            reopened.elapsed() < Duration::from_secs(5),
+            "a closed tenant reopens without waiting out a lock retry"
+        );
+
+        drop(held);
+        assert_eq!(
+            state.close_all_tenants(),
+            TenantsClosed {
+                tenants: 1,
+                held_elsewhere: 0
+            }
+        );
     }
 
     /// The blocking pool is pinned to one thread and that thread is held, so the audit writes are
