@@ -1038,7 +1038,7 @@ impl MemorySystem {
         let mut system =
             Self::with_primary_store_and_bm25_index(config, Arc::new(primary), None, bm25_index)?;
         system.attach_redb_backup_db(database);
-        system.backfill_in_memory_bm25()?;
+        system.backfill_standalone_bm25()?;
         Ok(system)
     }
 
@@ -1050,14 +1050,19 @@ impl MemorySystem {
             storage.encrypts_records(),
         )?);
         let system = Self::with_storage_and_bm25_index(config, storage, bm25_index)?;
-        system.backfill_in_memory_bm25()?;
+        system.backfill_standalone_bm25()?;
         Ok(system)
     }
 
-    /// Standalone mode has no journal to replay, so an in-memory index (a sealed
-    /// store) is filled from the store itself when the system opens.
-    fn backfill_in_memory_bm25(&self) -> Result<()> {
-        if !self.hybrid_search.bm25_in_memory() {
+    /// Standalone mode has no journal to replay, so an index that starts empty is filled from
+    /// the store itself when the system opens: an in-memory index (a sealed store) on every
+    /// open, and an on-disk index `BM25Index::new` discarded for a schema change, until a fill
+    /// has committed and cleared its rebuild marker. Without the second, a standalone or Python
+    /// user lost keyword recall of every memory written before the schema changed.
+    fn backfill_standalone_bm25(&self) -> Result<()> {
+        let in_memory = self.hybrid_search.bm25_in_memory();
+        let rebuilding = self.hybrid_search.bm25_index().rebuild_pending();
+        if !in_memory && !rebuilding {
             return Ok(());
         }
         let mut indexed = 0usize;
@@ -1071,7 +1076,12 @@ impl MemorySystem {
             indexed += 1;
         }
         self.hybrid_search.commit_and_reload()?;
-        tracing::info!(indexed, "in-memory BM25 index filled from the sealed store");
+        if rebuilding {
+            self.hybrid_search.bm25_index().finish_rebuild()?;
+            tracing::info!(indexed, "BM25 index refilled from the store after a schema change");
+        } else {
+            tracing::info!(indexed, "in-memory BM25 index filled from the sealed store");
+        }
         Ok(())
     }
 
@@ -9835,6 +9845,61 @@ fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
     }
 
     chains
+}
+
+#[cfg(test)]
+mod standalone_bm25_rebuild_tests {
+    use super::*;
+    use tantivy::schema::{Schema, STORED, STRING, TEXT};
+    use tempfile::TempDir;
+
+    /// Replace the index at `path` with an empty one on BM25's previous schema, where `tags`
+    /// used the default analyzer: what a store written before the stemmed-tags change holds.
+    fn old_schema_index(path: &std::path::Path) {
+        std::fs::remove_dir_all(path).expect("remove index");
+        std::fs::create_dir_all(path).expect("mkdir");
+        let mut schema = Schema::builder();
+        schema.add_text_field("id", STRING | STORED);
+        schema.add_text_field("content", TEXT | STORED);
+        schema.add_text_field("tags", TEXT);
+        schema.add_text_field("entities", TEXT);
+        schema.add_text_field("stemmed_content", TEXT);
+        tantivy::Index::create_in_dir(path, schema.build()).expect("old index");
+    }
+
+    /// A standalone system has no intent log, so the replay that refills a server's discarded
+    /// index never runs; its own open has to refill from the store.
+    #[test]
+    fn a_standalone_open_refills_an_index_discarded_for_its_schema() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = || MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let id = {
+            let system = MemorySystem::new(config(), None).expect("system");
+            system
+                .remember(
+                    Experience {
+                        content: "the kestrel drifted off its mooring".to_string(),
+                        tags: vec!["harbour".to_string()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("remember")
+        };
+        old_schema_index(&tmp.path().join(BM25_INDEX_DIR));
+
+        let system = MemorySystem::new(config(), None).expect("reopen");
+        let bm25 = system.hybrid_search.bm25_index();
+        assert!(!bm25.rebuild_pending(), "the refill clears the marker");
+        let hits = bm25.search("kestrel", 10).expect("search");
+        assert!(
+            hits.iter().any(|(hit, _)| *hit == id),
+            "the memory written before the schema change is reachable by keyword: {hits:?}"
+        );
+    }
 }
 
 #[cfg(test)]
