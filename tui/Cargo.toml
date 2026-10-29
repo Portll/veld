@@ -37,7 +37,7 @@ dirs = "6.0"
 # Git read-only operations for the in-TUI git viewer tab
 # vendored-libgit2 keeps the build self-contained on Windows/macOS/Linux
 # without requiring a system libgit2 install.
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # Cross-platform browser launcher — used by the `?` / F1 keybinding to open
 # the embedded docs site (served by `veld server` at `/docs/`) in the user's
