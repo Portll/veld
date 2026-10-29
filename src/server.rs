@@ -1068,43 +1068,42 @@ async fn run_shutdown_cleanup(manager: AppState) {
 
         // Flush databases (blocking operation, must use spawn_blocking)
         let manager_for_flush = Arc::clone(&manager);
-        let flush_handle =
+        let mut flush_handle =
             tokio::task::spawn_blocking(move || manager_for_flush.flush_all_databases());
 
-        let flushed = match tokio::time::timeout(
-            std::time::Duration::from_secs(DATABASE_FLUSH_TIMEOUT_SECS),
-            flush_handle,
-        )
-        .await
-        {
-            Ok(Ok(Ok(()))) => {
-                info!("Databases flushed successfully");
-                true
-            }
-            Ok(Ok(Err(e))) => {
-                error!("Failed to flush databases: {}", e);
-                false
-            }
-            Ok(Err(e)) => {
-                error!("Flush task panicked: {}", e);
-                false
-            }
-            Err(_) => {
-                error!(
-                    "Database flush timed out after {}s",
-                    DATABASE_FLUSH_TIMEOUT_SECS
-                );
-                false
-            }
-        };
+        let mut flush = await_flush(&mut flush_handle, DATABASE_FLUSH_TIMEOUT_SECS).await;
+        if flush == FlushOutcome::StillRunning {
+            // A timeout does not stop a blocking task: the flush goes on saving each
+            // tenant's vector index. A fallback save beside it doubled every write and
+            // raced it on the same files, so the flush gets the fallback's budget.
+            warn!(
+                "Database flush still running after {}s; waiting up to {}s more",
+                DATABASE_FLUSH_TIMEOUT_SECS, VECTOR_INDEX_SAVE_TIMEOUT_SECS
+            );
+            flush = await_flush(&mut flush_handle, VECTOR_INDEX_SAVE_TIMEOUT_SECS).await;
+        }
 
         // A successful flush already saved every vector index (flush_storage saves the
         // retriever). Saving again wrote the same 413 MB file a second time on every
-        // stop; it is now only the fallback when the flush did not finish.
-        if flushed {
-            #[cfg(feature = "telemetry")]
-            tracing_setup::shutdown_tracing();
-            return;
+        // stop; it is now only the fallback when the flush ended without finishing.
+        match flush {
+            FlushOutcome::Flushed => {
+                info!("Databases flushed successfully");
+                #[cfg(feature = "telemetry")]
+                tracing_setup::shutdown_tracing();
+                return;
+            }
+            FlushOutcome::StillRunning => {
+                error!(
+                    "Database flush timed out after {}s; tenants it had not reached repair \
+                     their vector index on the next start",
+                    DATABASE_FLUSH_TIMEOUT_SECS + VECTOR_INDEX_SAVE_TIMEOUT_SECS
+                );
+                #[cfg(feature = "telemetry")]
+                tracing_setup::shutdown_tracing();
+                return;
+            }
+            FlushOutcome::Failed => {}
         }
         info!("Persisting vector indices (the flush did not complete)...");
         let manager_for_save = Arc::clone(&manager);
@@ -1146,6 +1145,63 @@ async fn run_shutdown_cleanup(manager: AppState) {
             );
             std::process::abort();
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FlushOutcome {
+    Flushed,
+    Failed,
+    StillRunning,
+}
+
+/// Wait up to `secs` for the shutdown flush. The handle stays valid after a timeout,
+/// so a second call keeps waiting on the same flush rather than starting another.
+async fn await_flush(handle: &mut tokio::task::JoinHandle<Result<()>>, secs: u64) -> FlushOutcome {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), handle).await {
+        Ok(Ok(Ok(()))) => FlushOutcome::Flushed,
+        Ok(Ok(Err(e))) => {
+            error!("Failed to flush databases: {}", e);
+            FlushOutcome::Failed
+        }
+        Ok(Err(e)) => {
+            error!("Flush task panicked: {}", e);
+            FlushOutcome::Failed
+        }
+        Err(_) => FlushOutcome::StillRunning,
+    }
+}
+
+#[cfg(test)]
+mod flush_wait_tests {
+    use super::{await_flush, FlushOutcome};
+
+    #[tokio::test]
+    async fn a_flush_that_outlives_its_wait_is_waited_on_again_not_restarted() {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&runs);
+        let mut handle = tokio::task::spawn_blocking(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+            Ok(())
+        });
+
+        assert_eq!(
+            await_flush(&mut handle, 1).await,
+            FlushOutcome::StillRunning
+        );
+        assert_eq!(await_flush(&mut handle, 5).await, FlushOutcome::Flushed);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_errors_or_panics_is_failed_so_the_fallback_runs() {
+        let mut errors = tokio::task::spawn_blocking(|| Err(anyhow::anyhow!("shared db")));
+        assert_eq!(await_flush(&mut errors, 5).await, FlushOutcome::Failed);
+
+        let mut panics =
+            tokio::task::spawn_blocking(|| -> anyhow::Result<()> { panic!("flush panicked") });
+        assert_eq!(await_flush(&mut panics, 5).await, FlushOutcome::Failed);
     }
 }
 
