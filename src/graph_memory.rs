@@ -2246,6 +2246,61 @@ pub fn extract_directed_predicate(
     ))
 }
 
+/// The relation the ontology implies between two co-mentioned entities by their labels alone,
+/// as `(relation, a_is_source)`, or `None` when no rule types the pair.
+///
+/// Ported from upstream shodh-memory #259/#260 (`infer_relation_type_for_pair`), with two
+/// adaptations. Upstream matches only the pair in the order the memory listed it, so
+/// `(Organization, Person)` went untyped and `(Location, Person)` became a `LocatedIn` edge
+/// from the place; here the table is consulted in both orders and the edge points from the
+/// rule's first label. And where upstream falls back to `CoOccurs`, this returns `None`, so
+/// the caller keeps veld's generic `RelatedTo`: edges dedup by relation type, and a second
+/// generic type would fork every existing pair.
+///
+/// `(Person, Person)` is `Knows` only with `person_person_knows`, which upstream keeps off by
+/// default (`SHODH_PERSON_PERSON_KNOWS`): a typed edge is eligible for ontological penalties
+/// a generic one is not. Two technologies stay untyped: co-mention says nothing about
+/// substitutability.
+pub fn infer_relation_type_for_pair(
+    a: &EntityLabel,
+    b: &EntityLabel,
+    person_person_knows: bool,
+) -> Option<(RelationType, bool)> {
+    fn rule(from: &EntityLabel, to: &EntityLabel, knows: bool) -> Option<RelationType> {
+        use EntityLabel::*;
+        use RelationType::*;
+        Some(match (from, to) {
+            (Person, Person) if knows => Knows,
+            (Person, Organization) | (Person, Team) => WorksAt,
+            (Person, Technology) | (Person, Service) | (Person, Database) => Uses,
+            (Person, Skill) => Learned,
+            (Task, Person) | (Task, Team) => AssignedTo,
+            (Task, Technology) | (Task, Service) => Requires,
+            (Service, Database) => Uses,
+            (Module, Module) | (Service, Service) | (Module, Service) | (Service, Module) => {
+                DependsOn
+            }
+            (Pipeline, Service) | (Pipeline, Environment) => DeploysTo,
+            (Metric, Service) | (Metric, Pipeline) => Monitors,
+            (Configuration, Service) | (Configuration, Environment) => Configures,
+            (Document, Service)
+            | (Document, Module)
+            | (Document, Pipeline)
+            | (Document, Project) => Documents,
+            (Task, Project)
+            | (Document, Repository)
+            | (Repository, Project)
+            | (Module, Project)
+            | (Service, Project) => PartOf,
+            (_, Location) => LocatedIn,
+            _ => return None,
+        })
+    }
+    rule(a, b, person_person_knows)
+        .map(|rt| (rt, true))
+        .or_else(|| rule(b, a, person_person_knows).map(|rt| (rt, false)))
+}
+
 /// Episodic node representing a discrete experience/memory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodicNode {
@@ -11448,6 +11503,45 @@ mod tests {
         let capped = graph.get_entity(&id).unwrap().unwrap().salience;
         let ceiling = 0.5 * crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST;
         assert!((capped - ceiling).abs() < 1e-4, "{capped} != {ceiling}");
+    }
+
+    #[test]
+    fn label_pairs_are_typed_in_either_order_from_the_rules_first_label() {
+        use EntityLabel::*;
+        assert_eq!(
+            infer_relation_type_for_pair(&Person, &Organization, false),
+            Some((RelationType::WorksAt, true))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Organization, &Person, false),
+            Some((RelationType::WorksAt, false))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Location, &Person, false),
+            Some((RelationType::LocatedIn, false))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Service, &Database, false),
+            Some((RelationType::Uses, true))
+        );
+    }
+
+    #[test]
+    fn label_pairs_with_no_rule_stay_untyped() {
+        use EntityLabel::*;
+        assert_eq!(infer_relation_type_for_pair(&Person, &Person, false), None);
+        assert_eq!(
+            infer_relation_type_for_pair(&Person, &Person, true),
+            Some((RelationType::Knows, true))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Technology, &Technology, false),
+            None
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Concept, &Other("MISC".into()), false),
+            None
+        );
     }
 
     #[test]
