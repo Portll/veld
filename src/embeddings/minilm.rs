@@ -26,6 +26,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+use super::idle_unload::ModelSlot;
 use super::Embedder;
 
 /// Threading for every ONNX session veld builds: both embedders, the cross-encoder and NER.
@@ -358,8 +359,8 @@ pub struct MiniLMEmbedder {
     config: EmbeddingConfig,
     threading: OrtThreading,
     pool_size: usize,
-    /// Lazily initialized model (OnceLock for thread-safe init)
-    lazy_model: OnceLock<Result<Arc<LazyModel>, String>>,
+    /// Loaded on first use; dropped while idle when `VELD_MODEL_IDLE_UNLOAD_SECS` is set.
+    lazy_model: Arc<ModelSlot<LazyModel>>,
     /// Flag for simplified mode (no ONNX)
     simplified_mode: bool,
     dimension: usize,
@@ -600,7 +601,7 @@ impl MiniLMEmbedder {
             config: config.clone(),
             threading,
             pool_size,
-            lazy_model: OnceLock::new(),
+            lazy_model: ModelSlot::new("minilm"),
             simplified_mode: false,
             dimension: 384,
         };
@@ -617,28 +618,24 @@ impl MiniLMEmbedder {
     }
 
     /// Ensure the model is loaded (thread-safe, idempotent)
-    fn ensure_model_loaded(&self) -> Result<&Arc<LazyModel>> {
-        let result = self.lazy_model.get_or_init(|| {
-            LazyModel::new(&self.config, self.threading, self.pool_size)
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        });
-
-        match result {
-            Ok(model) => Ok(model),
-            Err(e) => Err(anyhow::anyhow!("Failed to load model: {e}")),
-        }
+    fn ensure_model_loaded(&self) -> Result<Arc<LazyModel>> {
+        self.lazy_model
+            .get_or_load(|| {
+                LazyModel::new(&self.config, self.threading, self.pool_size)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))
     }
 
     /// Check if model is currently loaded (for diagnostics)
     pub fn is_model_loaded(&self) -> bool {
-        self.lazy_model.get().is_some()
+        self.lazy_model.is_loaded()
     }
 
     /// True once a load was attempted and failed. The failure is kept for this instance's
     /// lifetime, so a shared registry replaces such an instance rather than handing it out.
     pub fn model_load_failed(&self) -> bool {
-        matches!(self.lazy_model.get(), Some(Err(_)))
+        self.lazy_model.load_failed()
     }
 
     /// Whether this embedder produces non-semantic hash vectors instead of running the model.
@@ -698,7 +695,7 @@ impl MiniLMEmbedder {
             config,
             threading: OrtThreading::resolve(),
             pool_size: 1,
-            lazy_model: OnceLock::new(),
+            lazy_model: ModelSlot::new("minilm"),
             simplified_mode: true,
             dimension: 384,
         })

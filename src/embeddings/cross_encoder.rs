@@ -63,6 +63,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
 use tokenizers::Tokenizer;
 
+use super::idle_unload::ModelSlot;
 use super::minilm::OrtThreading;
 
 /// Maximum input sequence length (query + document tokens combined).
@@ -670,7 +671,8 @@ fn pair_key(query: &str, document: &str) -> String {
 pub struct OnnxCrossEncoder {
     config: CrossEncoderConfig,
     threading: OrtThreading,
-    model: OnceLock<Result<LazyOnnx, String>>,
+    /// Loaded on first use; dropped while idle when `VELD_MODEL_IDLE_UNLOAD_SECS` is set.
+    model: Arc<ModelSlot<LazyOnnx>>,
     available: AtomicBool,
     /// Scores this reranker has already computed. The instance is shared process-wide (see
     /// [`cross_encoder_for`]), so every tenant on the model reads one cache; the recall harness
@@ -689,7 +691,7 @@ impl OnnxCrossEncoder {
         Self {
             config,
             threading,
-            model: OnceLock::new(),
+            model: ModelSlot::new("cross-encoder"),
             available: AtomicBool::new(true),
             pair_cache: std::num::NonZeroUsize::new(capacity)
                 .map(|n| Mutex::new(lru::LruCache::new(n))),
@@ -699,7 +701,7 @@ impl OnnxCrossEncoder {
     /// True once a download or load was attempted and failed. The failure is kept for this
     /// instance's lifetime, so the shared registry replaces such an instance.
     fn load_failed(&self) -> bool {
-        matches!(self.model.get(), Some(Err(_)))
+        self.model.load_failed()
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -840,8 +842,8 @@ impl OnnxCrossEncoder {
         dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists()
     }
 
-    fn ensure_loaded(&self) -> Result<&LazyOnnx> {
-        let result = self.model.get_or_init(|| {
+    fn ensure_loaded(&self) -> Result<Arc<LazyOnnx>> {
+        let result = self.model.get_or_load(|| {
             let (model_path, tokenizer_path) = match self.ensure_downloaded() {
                 Ok(p) => p,
                 Err(e) => {
@@ -977,11 +979,11 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         // recorded from. Each pair is keyed on its own.
         let model = self.ensure_loaded()?;
         if let Some(taped) = super::model_tape::cross_encode(query, documents, || {
-            self.score_pairs_live(model, query, documents)
+            self.score_pairs_live(&model, query, documents)
         }) {
             return taped;
         }
-        self.score_pairs_live(model, query, documents)
+        self.score_pairs_live(&model, query, documents)
     }
 }
 

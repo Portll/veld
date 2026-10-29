@@ -36,6 +36,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 
+use super::idle_unload::ModelSlot;
+
 /// BIO tag labels from TinyBERT-finetuned-NER-ONNX
 /// Index mapping: O=0, B-MISC=1, I-MISC=2, B-ORG=3, I-ORG=4, B-LOC=5, I-LOC=6, B-PER=7, I-PER=8
 /// Note: This ordering differs from bert-base-NER (dslim) which uses MISC, PER, ORG, LOC
@@ -234,7 +236,8 @@ const NER_CACHE_SIZE: u64 = 1000;
 /// Neural NER model using BERT + ONNX Runtime
 pub struct NeuralNer {
     config: NerConfig,
-    lazy_model: OnceLock<Result<Arc<LazyNerModel>, String>>,
+    /// Loaded on first use; dropped while idle when `VELD_MODEL_IDLE_UNLOAD_SECS` is set.
+    lazy_model: Arc<ModelSlot<LazyNerModel>>,
     /// Fallback: rule-based extraction when model unavailable
     use_fallback: bool,
     /// Lazy-loaded EntityExtractor for comprehensive rule-based fallback
@@ -261,7 +264,7 @@ impl NeuralNer {
             );
             return Ok(Self {
                 config,
-                lazy_model: OnceLock::new(),
+                lazy_model: ModelSlot::new("bert-ner"),
                 use_fallback: true,
                 entity_extractor: OnceLock::new(),
                 entity_cache: cache,
@@ -274,7 +277,7 @@ impl NeuralNer {
         );
         Ok(Self {
             config,
-            lazy_model: OnceLock::new(),
+            lazy_model: ModelSlot::new("bert-ner"),
             use_fallback: false,
             entity_extractor: OnceLock::new(),
             entity_cache: cache,
@@ -285,7 +288,7 @@ impl NeuralNer {
     pub fn new_fallback(config: NerConfig) -> Self {
         Self {
             config,
-            lazy_model: OnceLock::new(),
+            lazy_model: ModelSlot::new("bert-ner"),
             use_fallback: true,
             entity_extractor: OnceLock::new(),
             entity_cache: moka::sync::Cache::builder()
@@ -296,21 +299,14 @@ impl NeuralNer {
     }
 
     /// Ensure model is loaded
-    fn ensure_model_loaded(&self) -> Result<&Arc<LazyNerModel>> {
+    fn ensure_model_loaded(&self) -> Result<Arc<LazyNerModel>> {
         if self.use_fallback {
             anyhow::bail!("NER model in fallback mode");
         }
 
-        let result = self.lazy_model.get_or_init(|| {
-            LazyNerModel::new(&self.config)
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        });
-
-        match result {
-            Ok(model) => Ok(model),
-            Err(e) => Err(anyhow::anyhow!("Failed to load NER model: {e}")),
-        }
+        self.lazy_model
+            .get_or_load(|| LazyNerModel::new(&self.config).map_err(|e| e.to_string()))
+            .map_err(|e| anyhow::anyhow!("Failed to load NER model: {e}"))
     }
 
     /// Check if using fallback mode
