@@ -1278,7 +1278,7 @@ impl super::MemorySystem {
                                 // Retrieval-driven strengthening of the edges that carried the
                                 // walk: a usage write, skipped under read-only recall.
                                 if !ppr.carrying_edges.is_empty()
-                                    && !crate::memory::recall_readonly()
+                                    && !self.recall_readonly()
                                     && super::ablation::is_enabled("graph_potentiation")
                                 {
                                     if let Err(e) = g.batch_strengthen_synapses(

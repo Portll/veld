@@ -935,6 +935,9 @@ mod tests {
         records: Vec<(String, u32, i64, u32)>,
         /// Entities and relationships, co-retrieval edges among them.
         graph: (usize, usize),
+        /// Id, strength bits and activation count of every relationship: traversal
+        /// strengthens edges it walks without adding any.
+        edges: Vec<(String, u32, u32)>,
         journal_head: u64,
     }
 
@@ -957,6 +960,16 @@ mod tests {
             .collect();
         records.sort();
         let graph = state.get_user_graph_stats(USER).unwrap();
+        let mut edges: Vec<_> = state
+            .get_user_graph(USER)
+            .unwrap()
+            .read()
+            .get_all_relationships()
+            .unwrap()
+            .iter()
+            .map(|e| (e.uuid.to_string(), e.strength.to_bits(), e.activation_count))
+            .collect();
+        edges.sort();
         let journal = state
             .get_user_journaled_writer(USER)
             .unwrap()
@@ -968,6 +981,7 @@ mod tests {
             retrievals: guard.stats().total_retrievals,
             records,
             graph: (graph.entity_count, graph.relationship_count),
+            edges,
             journal_head: journal,
         }
     }
@@ -1037,6 +1051,66 @@ mod tests {
         assert!(
             usage(&harness).retrievals > before.retrievals,
             "the same recall on a standalone instance counts itself, so the check above can see a write"
+        );
+    }
+
+    /// The graph leg strengthens the edges its walk carried; on a follower the leader owns
+    /// them, so the walk must read the instance's replica flag and not only the env gate.
+    #[tokio::test]
+    async fn the_graph_leg_on_a_follower_strengthens_no_edge() {
+        let harness = TestHarness::new();
+        for (content, entities) in [
+            (
+                "Caroline took Melanie to the harbour museum",
+                ["Caroline", "Melanie", "museum"],
+            ),
+            (
+                "Melanie showed Caroline the museum archive",
+                ["Melanie", "Caroline", "archive"],
+            ),
+            (
+                "Caroline returned to the museum archive with Melanie",
+                ["Caroline", "archive", "Melanie"],
+            ),
+        ] {
+            let experience = Experience {
+                content: content.to_string(),
+                entities: entities.map(String::from).to_vec(),
+                ..Default::default()
+            };
+            let memory = harness.state().get_user_memory(USER).unwrap();
+            let id = memory.read().remember(experience.clone(), None).unwrap();
+            harness
+                .state()
+                .process_experience_into_graph(USER, &experience, &id)
+                .unwrap();
+        }
+        let recall = || {
+            post_json(
+                "/api/recall",
+                &json!({"user_id": USER, "query": "What did Caroline and Melanie see at the museum?"}),
+            )
+        };
+        follow(&harness);
+        let before = usage(&harness);
+        assert!(
+            !before.edges.is_empty(),
+            "the memories must link their entities"
+        );
+        let (status, _, body) = call(&harness, recall()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Long enough for any fire-and-forget write a handler spawned to land.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(usage(&harness), before, "recall on a follower wrote");
+
+        // A repeat from the same evidence source earns no step, so the control runs last.
+        harness.state().replication.unfollow();
+        let (status, _, body) = call(&harness, recall()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(
+            usage(&harness).edges,
+            before.edges,
+            "control: a standalone recall strengthens the edges its walk carried"
         );
     }
 
