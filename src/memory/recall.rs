@@ -3882,48 +3882,6 @@ impl super::MemorySystem {
         memories.truncate(query.max_results);
 
         // =====================================================================
-        // LAYER 5.7: CONFIDENCE GATING + SCORE-GAP PRUNING
-        // =====================================================================
-        // Category error detection: when retrieval confidence is low, return
-        // fewer results rather than padding with noise. This handles queries
-        // that are inherently unanswerable by recognizing the absence of a
-        // confident match. Score-gap pruning drops trailing noise results.
-        if memories.len() >= 2 {
-            let scores: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
-            let top_score = scores[0];
-
-            if top_score > 0.0 {
-                let mut keep = memories.len();
-                for i in 1..scores.len() {
-                    let ratio = scores[i] / top_score;
-                    // If result scores less than 25% of top score, it's noise
-                    if ratio < 0.25 {
-                        keep = i;
-                        break;
-                    }
-                    // If there's a >60% relative drop from previous, cut here
-                    if i >= 2 && scores[i - 1] > 0.0 {
-                        let step_ratio = scores[i] / scores[i - 1];
-                        if step_ratio < 0.40 {
-                            keep = i;
-                            break;
-                        }
-                    }
-                }
-                if keep < memories.len() {
-                    tracing::debug!(
-                        "Layer 5.7: Confidence pruning {} -> {} results (top={:.3}, cut={:.3})",
-                        memories.len(),
-                        keep,
-                        top_score,
-                        scores.get(keep).copied().unwrap_or(0.0)
-                    );
-                    memories.truncate(keep);
-                }
-            }
-        }
-
-        // =====================================================================
         // LAYER 5.8: ANSWER-TYPE SOFT FILTER
         // =====================================================================
         // Penalize memories whose ExperienceType doesn't match query intent.
