@@ -7,7 +7,7 @@ use axum::{
     extract::{Extension, Path, State},
     response::Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::state::MultiUserMemoryManager;
@@ -15,7 +15,7 @@ use super::types::MemoryEvent;
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::entity_frequency::{frequency, Bucket, Frequency, Window};
-use crate::entity_hygiene::{classify, Shelf};
+use crate::entity_hygiene::{classify, Classification, Shelf};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse};
 use crate::memory::{Experience, MemoryId};
@@ -173,8 +173,8 @@ fn default_true() -> bool {
 
 /// Per-tag provenance folded over every memory that stored the tag. Absent when no row names
 /// the tag: records written before the store existed are undetermined, not caller-authored.
-#[derive(Debug, Default, serde::Serialize)]
-struct EntityProvenance {
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct EntityProvenance {
     memories: usize,
     redacted: usize,
     sources: std::collections::BTreeMap<&'static str, usize>,
@@ -198,11 +198,37 @@ fn fold_provenance(
     out
 }
 
+/// Reply of `POST /api/graph/entities/all`.
+#[derive(Debug, Serialize)]
+pub struct GraphEntitiesResponse {
+    /// At most `limit` entities on the requested shelf.
+    pub entities: Vec<GraphEntityRow>,
+    /// Entities returned.
+    pub count: usize,
+    /// Entities in the graph, every shelf.
+    pub total: usize,
+    /// Entities per shelf (`cast`, `vocabulary`, `noise`), every shelf.
+    pub shelves: std::collections::BTreeMap<&'static str, usize>,
+    pub witness: &'static str,
+}
+
+/// One entity of a `POST /api/graph/entities/all` reply: the node's own fields, its hygiene
+/// classification, and its tag provenance when `with_sources` was set.
+#[derive(Debug, Serialize)]
+pub struct GraphEntityRow {
+    #[serde(flatten)]
+    pub entity: EntityNode,
+    pub hygiene: Classification,
+    /// Absent unless `with_sources`; then `null` for an entity no tag row names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Option<EntityProvenance>>,
+}
+
 /// POST /api/graph/entities/all - Get all entities
 pub async fn get_all_entities(
     State(state): State<AppState>,
     Json(req): Json<GetAllEntitiesRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<GraphEntitiesResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let graph = state
@@ -240,25 +266,24 @@ pub async fn get_all_entities(
         if !req.include_embeddings {
             entity.name_embedding = None;
         }
-        let mut row = serde_json::to_value(&entity).map_err(|e| AppError::Internal(e.into()))?;
-        row["hygiene"] = serde_json::to_value(hygiene).map_err(|e| AppError::Internal(e.into()))?;
-        if let Some(provenance) = &provenance {
-            row["provenance"] = match provenance.get(&entity.name) {
-                Some(p) => serde_json::to_value(p).map_err(|e| AppError::Internal(e.into()))?,
-                None => serde_json::Value::Null,
-            };
-        }
-        rows.push(row);
+        let provenance = provenance
+            .as_ref()
+            .map(|by_name| by_name.get(&entity.name).cloned());
+        rows.push(GraphEntityRow {
+            entity,
+            hygiene,
+            provenance,
+        });
     }
     let count = rows.len();
 
-    Ok(Json(serde_json::json!({
-        "entities": rows,
-        "count": count,
-        "total": total,
-        "shelves": shelf_counts,
-        "witness": "graph.entities",
-    })))
+    Ok(Json(GraphEntitiesResponse {
+        entities: rows,
+        count,
+        total,
+        shelves: shelf_counts,
+        witness: "graph.entities",
+    }))
 }
 
 fn shelf_name(shelf: Shelf) -> &'static str {
@@ -366,6 +391,16 @@ pub struct DeleteEntityRequest {
     pub entity_id: String,
 }
 
+/// Reply of `DELETE /api/graph/entity/delete`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteEntityResponse {
+    pub success: bool,
+    /// False when no entity had that id.
+    pub deleted: bool,
+    pub entity_id: String,
+    pub user_id: String,
+}
+
 /// Delete one entity from a tenant's graph.
 ///
 /// WHY THIS ROUTE EXISTS. `graph_memory::delete_entity` has been implemented since the graph was
@@ -388,7 +423,7 @@ pub async fn delete_entity(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Json(req): Json<DeleteEntityRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<DeleteEntityResponse>, AppError> {
     let user_id = resolve_request_user_id(
         Some(&req.user_id),
         authenticated_user.as_ref().map(|extension| &extension.0),
@@ -434,12 +469,26 @@ pub async fn delete_entity(
         });
     }
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "deleted": deleted,
-        "entity_id": uuid.to_string(),
-        "user_id": user_id,
-    })))
+    Ok(Json(DeleteEntityResponse {
+        success: true,
+        deleted,
+        entity_id: uuid.to_string(),
+        user_id,
+    }))
+}
+
+/// Reply of `DELETE /api/graph/{user_id}/clear`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClearGraphResponse {
+    pub cleared: ClearedGraphCounts,
+}
+
+/// What `DELETE /api/graph/{user_id}/clear` removed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClearedGraphCounts {
+    pub entities: usize,
+    pub relationships: usize,
+    pub episodes: usize,
 }
 
 /// DELETE /api/graph/{user_id}/clear - Clear all graph data for a user
@@ -447,7 +496,7 @@ pub async fn clear_user_graph(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ClearGraphResponse>, AppError> {
     let user_id = resolve_request_user_id(
         Some(&user_id),
         authenticated_user.as_ref().map(|extension| &extension.0),
@@ -481,13 +530,26 @@ pub async fn clear_user_graph(
         results: None,
     });
 
-    Ok(Json(serde_json::json!({
-        "cleared": {
-            "entities": entities,
-            "relationships": relationships,
-            "episodes": episodes
-        }
-    })))
+    Ok(Json(ClearGraphResponse {
+        cleared: ClearedGraphCounts {
+            entities,
+            relationships,
+            episodes,
+        },
+    }))
+}
+
+/// Reply of `POST /api/graph/{user_id}/rebuild`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RebuildGraphResponse {
+    pub success: bool,
+    /// Memories whose entities were extracted again.
+    pub processed_memories: usize,
+    pub total_memories: usize,
+    /// Entities in the graph after the rebuild.
+    pub entities_created: usize,
+    /// Relationships in the graph after the rebuild.
+    pub relationships_created: usize,
 }
 
 /// POST /api/graph/{user_id}/rebuild - Rebuild graph from all existing memories
@@ -495,7 +557,7 @@ pub async fn rebuild_user_graph(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<RebuildGraphResponse>, AppError> {
     let user_id = resolve_request_user_id(
         Some(&user_id),
         authenticated_user.as_ref().map(|extension| &extension.0),
@@ -571,13 +633,13 @@ pub async fn rebuild_user_graph(
         results: None,
     });
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "processed_memories": processed,
-        "total_memories": total_memories,
-        "entities_created": entities_created,
-        "relationships_created": relationships_created
-    })))
+    Ok(Json(RebuildGraphResponse {
+        success: true,
+        processed_memories: processed,
+        total_memories,
+        entities_created,
+        relationships_created,
+    }))
 }
 
 /// Request to invalidate a relationship
@@ -587,11 +649,18 @@ pub struct InvalidateRelationshipRequest {
     pub relationship_uuid: String,
 }
 
+/// Reply of `POST /api/graph/relationship/invalidate`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvalidateRelationshipResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 /// POST /api/graph/relationship/invalidate - Invalidate a relationship edge
 pub async fn invalidate_relationship(
     State(state): State<AppState>,
     Json(req): Json<InvalidateRelationshipRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<InvalidateRelationshipResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let rel_uuid =
@@ -620,10 +689,10 @@ pub async fn invalidate_relationship(
         results: None,
     });
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Relationship invalidated"
-    })))
+    Ok(Json(InvalidateRelationshipResponse {
+        success: true,
+        message: "Relationship invalidated".to_string(),
+    }))
 }
 
 #[cfg(test)]

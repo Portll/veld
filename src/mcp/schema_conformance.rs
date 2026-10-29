@@ -115,11 +115,7 @@ const CHECKS: &[(&str, &str, Check)] = &[
 /// `Response`, so the schema has no fields to sample. Each is a Phase 1 item of the schema
 /// remediation plan; when its handler gains a typed reply this test refuses the entry so the
 /// row above starts to count.
-const UNTYPED_TODAY: &[&str] = &[
-    "POST /api/lineage/confirm",
-    "POST /api/lineage/reject",
-    "POST /api/datasets/{name}/query",
-];
+const UNTYPED_TODAY: &[&str] = &["POST /api/datasets/{name}/query"];
 
 const UNTYPED_RESPONSES: &[&str] = &["serde_json::Value", "opaque", "no body", "unknown"];
 

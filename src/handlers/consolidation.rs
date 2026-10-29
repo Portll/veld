@@ -1044,6 +1044,16 @@ pub async fn rebuild_index(
     }))
 }
 
+/// Reply of `POST /api/index/reembed`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReembedResponse {
+    pub success: bool,
+    /// Memories embedded again.
+    pub reembedded: usize,
+    /// Memories whose embedding failed; they keep their previous vector.
+    pub failed: usize,
+}
+
 /// Re-embed all memories with context-prefixed embeddings (v0.7.2 migration)
 ///
 /// Clears pre-computed embeddings and re-indexes every memory through the new
@@ -1051,7 +1061,7 @@ pub async fn rebuild_index(
 pub async fn reembed_all(
     State(state): State<AppState>,
     Json(req): Json<RebuildIndexRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ReembedResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
@@ -1062,11 +1072,11 @@ pub async fn reembed_all(
     let memory_guard = memory_sys.read();
     let (reembedded, failed) = memory_guard.reembed_all().map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "reembedded": reembedded,
-        "failed": failed,
-    })))
+    Ok(Json(ReembedResponse {
+        success: true,
+        reembedded,
+        failed,
+    }))
 }
 
 // =============================================================================
@@ -1391,11 +1401,19 @@ pub struct DrainEmbeddingBacklogRequest {
     pub reconcile: bool,
 }
 
+/// Reply of `POST /api/embeddings/backlog/drain`. `reconciled` is `null` unless the request
+/// set `reconcile`.
+#[derive(Debug, serde::Serialize)]
+pub struct DrainBacklogResponse {
+    pub reconciled: Option<crate::memory::embedding_backlog::ReconcileReport>,
+    pub drained: crate::memory::embedding_backlog::DrainReport,
+}
+
 /// POST /api/embeddings/backlog/drain - Reconcile (optionally) and drain now.
 pub async fn drain_embedding_backlog(
     State(state): State<AppState>,
     Json(req): Json<DrainEmbeddingBacklogRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<DrainBacklogResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     let limit = req.limit.unwrap_or(50);
     if limit == 0 {
@@ -1433,10 +1451,10 @@ pub async fn drain_embedding_backlog(
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("backlog drain task failed: {e}")))?
     .map_err(AppError::Internal)?;
-    Ok(Json(serde_json::json!({
-        "reconciled": reconciled,
-        "drained": drained,
-    })))
+    Ok(Json(DrainBacklogResponse {
+        reconciled,
+        drained,
+    }))
 }
 
 #[cfg(test)]

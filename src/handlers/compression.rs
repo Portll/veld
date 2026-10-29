@@ -6,7 +6,7 @@ use axum::{
     extract::{Extension, Query, State},
     response::Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use super::utils::resolve_request_user_id;
@@ -26,11 +26,18 @@ pub struct CompressMemoryRequest {
     pub id: String,
 }
 
+/// Reply of `POST /api/memory/compress`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompressMemoryResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 /// POST /api/memory/compress - Manually compress a specific memory
 pub async fn compress_memory(
     State(state): State<AppState>,
     Json(req): Json<CompressMemoryRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<CompressMemoryResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let _memory_sys = state
@@ -44,10 +51,10 @@ pub async fn compress_memory(
     );
 
     // Compression happens automatically in the memory system based on age and importance
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Memory compression initiated"
-    })))
+    Ok(Json(CompressMemoryResponse {
+        success: true,
+        message: "Memory compression initiated".to_string(),
+    }))
 }
 
 /// Request for decompressing a memory
@@ -58,11 +65,30 @@ pub struct DecompressMemoryRequest {
     pub id: String,
 }
 
+/// Reply of `POST /api/memory/decompress`. `memory` is present only when a compressed
+/// record was decompressed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DecompressMemoryResponse {
+    pub success: bool,
+    pub message: String,
+    pub was_compressed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<DecompressedMemory>,
+}
+
+/// The decompressed record of a `POST /api/memory/decompress` reply.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DecompressedMemory {
+    pub id: String,
+    pub content: String,
+    pub importance: f32,
+}
+
 /// POST /api/memory/decompress - Decompress a compressed memory
 pub async fn decompress_memory(
     State(state): State<AppState>,
     Json(req): Json<DecompressMemoryRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<DecompressMemoryResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
@@ -81,11 +107,12 @@ pub async fn decompress_memory(
         .map_err(AppError::Internal)?;
 
     if !memory.compressed {
-        return Ok(Json(serde_json::json!({
-            "success": true,
-            "message": "Memory is not compressed",
-            "was_compressed": false
-        })));
+        return Ok(Json(DecompressMemoryResponse {
+            success: true,
+            message: "Memory is not compressed".to_string(),
+            was_compressed: false,
+            memory: None,
+        }));
     }
 
     // Decompress using compression pipeline
@@ -93,16 +120,17 @@ pub async fn decompress_memory(
         .decompress_memory(&memory)
         .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Memory decompressed successfully",
-        "was_compressed": true,
-        "memory": {
-            "id": decompressed.id.0.to_string(),
-            "content": decompressed.experience.content,
-            "importance": decompressed.importance()
-        }
-    })))
+    let importance = decompressed.importance();
+    Ok(Json(DecompressMemoryResponse {
+        success: true,
+        message: "Memory decompressed successfully".to_string(),
+        was_compressed: true,
+        memory: Some(DecompressedMemory {
+            id: decompressed.id.0.to_string(),
+            content: decompressed.experience.content,
+            importance,
+        }),
+    }))
 }
 
 /// Request for storage statistics

@@ -602,6 +602,17 @@ pub struct EntityResolveResponse {
     pub unresolved: Vec<String>,
 }
 
+/// Reply of `POST /api/entity/attribute`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetAttributeResponse {
+    /// The canonical entity name.
+    pub entity: String,
+    pub attribute: String,
+    pub value: String,
+    /// Always `set`.
+    pub status: String,
+}
+
 /// POST /api/entity/set-attribute — Set a structured attribute on an entity.
 /// This is how you make entities "exact" — store DOB, email, coordinates, etc.
 ///
@@ -611,7 +622,7 @@ pub struct EntityResolveResponse {
 pub async fn set_entity_attribute(
     State(state): State<AppState>,
     Json(req): Json<SetAttributeRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<SetAttributeResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_entity(&req.entity_name).map_validation_err("entity_name")?;
     validation::validate_content(&req.key, false).map_validation_err("key")?;
@@ -647,12 +658,12 @@ pub async fn set_entity_attribute(
             .add_entity(updated)
             .map_err(AppError::Internal)?;
 
-        Ok::<_, AppError>(serde_json::json!({
-            "entity": node.name,
-            "attribute": key,
-            "value": value,
-            "status": "set"
-        }))
+        Ok::<_, AppError>(SetAttributeResponse {
+            entity: node.name,
+            attribute: key,
+            value,
+            status: "set".to_string(),
+        })
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Set attribute task panicked: {e}")))?
@@ -667,12 +678,24 @@ pub struct SetAttributeRequest {
     pub value: String,
 }
 
+/// Reply of `POST /api/entity/merge`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MergeEntitiesResponse {
+    /// The entity deleted.
+    pub source: String,
+    /// The entity its edges now point at.
+    pub target: String,
+    pub edges_moved: usize,
+    /// Always `merged`.
+    pub status: String,
+}
+
 /// POST /api/entity/merge — Merge two entities into one canonical entity.
 /// All edges from the source are redirected to the target, then the source is deleted.
 pub async fn merge_entities(
     State(state): State<AppState>,
     Json(req): Json<MergeEntitiesRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<MergeEntitiesResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_entity(&req.source_name).map_validation_err("source_name")?;
     validation::validate_entity(&req.target_name).map_validation_err("target_name")?;
@@ -786,12 +809,12 @@ pub async fn merge_entities(
             .delete_entity(&source.uuid)
             .map_err(AppError::Internal)?;
 
-        Ok::<_, AppError>(serde_json::json!({
-            "source": source_name,
-            "target": target_name,
-            "edges_moved": edges_moved,
-            "status": "merged"
-        }))
+        Ok::<_, AppError>(MergeEntitiesResponse {
+            source: source_name,
+            target: target_name,
+            edges_moved,
+            status: "merged".to_string(),
+        })
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Merge task panicked: {e}")))?;
@@ -806,6 +829,16 @@ pub struct MergeEntitiesRequest {
     pub target_name: String,
 }
 
+/// Reply of `POST /api/entity/alias`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddAliasResponse {
+    /// The canonical entity name the alias now resolves to.
+    pub entity: String,
+    pub alias: String,
+    /// Always `added`.
+    pub status: String,
+}
+
 /// POST /api/entity/alias — Add an alias for an entity.
 /// The alias is stored in the entity's `aliases` attribute and is used by
 /// `find_entity_by_name`'s fuzzy/substring matching to surface the canonical entity.
@@ -814,7 +847,7 @@ pub struct MergeEntitiesRequest {
 pub async fn add_entity_alias(
     State(state): State<AppState>,
     Json(req): Json<AddAliasRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<AddAliasResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_entity(&req.entity_name).map_validation_err("entity_name")?;
     validation::validate_entity(&req.alias).map_validation_err("alias")?;
@@ -854,11 +887,11 @@ pub async fn add_entity_alias(
             .add_entity(updated)
             .map_err(AppError::Internal)?;
 
-        Ok::<_, AppError>(serde_json::json!({
-            "entity": entity_name,
-            "alias": alias,
-            "status": "added"
-        }))
+        Ok::<_, AppError>(AddAliasResponse {
+            entity: entity_name,
+            alias,
+            status: "added".to_string(),
+        })
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Add alias task panicked: {e}")))?;

@@ -11,7 +11,7 @@ use super::types::RetrieveResponse;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::graph_memory;
 use crate::mif::adapters::AdapterRegistry;
-use crate::mif::{export, import};
+use crate::mif::{export, import, MifDocument};
 use crate::validation;
 
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
@@ -39,11 +39,44 @@ fn default_format() -> String {
     "veld".to_string()
 }
 
+/// Reply of `POST /api/export/mif`: the MIF document itself for `format` `veld` or `json`,
+/// else the adapter's text output wrapped with its counts.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExportMifResponse {
+    Document(Box<ExportedDocument>),
+    Encoded(EncodedExport),
+}
+
+/// A `veld` or `json` export of `POST /api/export/mif`: the MIF document's own fields.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportedDocument {
+    #[serde(flatten)]
+    pub document: MifDocument,
+    /// On a follower, the exported stores replication does not carry: they hold this
+    /// instance's own data, not its leader's. An import ignores the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_replicated: Vec<String>,
+}
+
+/// A non-JSON export of `POST /api/export/mif`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EncodedExport {
+    pub format: String,
+    /// The adapter's output, as text.
+    pub data: String,
+    pub memory_count: usize,
+    pub todo_count: usize,
+    /// As in [`ExportedDocument::not_replicated`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_replicated: Vec<String>,
+}
+
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn export_mif(
     State(state): State<AppState>,
     Json(req): Json<MifExportRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ExportMifResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let user_id = req.user_id.clone();
@@ -119,32 +152,33 @@ pub async fn export_mif(
     )
     .map_err(AppError::Internal)?;
 
+    let not_replicated: Vec<String> = if state.replication.client_writes_allowed() {
+        Vec::new()
+    } else {
+        ["todos", "projects", "reminders"]
+            .into_iter()
+            .chain(req.include_graph.then_some("knowledge_graph"))
+            .map(String::from)
+            .collect()
+    };
+
     // Convert to requested output format
-    let mut output = if req.format == "veld" || req.format == "json" {
-        serde_json::to_value(&doc).map_err(|e| AppError::Internal(e.into()))?
+    let output = if req.format == "veld" || req.format == "json" {
+        None
     } else {
         let registry = AdapterRegistry::new();
         let bytes = registry
             .export_with(&req.format, &doc)
             .map_err(AppError::Internal)?;
-        let output_str = String::from_utf8(bytes).map_err(|e| AppError::Internal(e.into()))?;
-        // For non-JSON formats, wrap in an object
-        serde_json::json!({
-            "format": req.format,
-            "data": output_str,
-            "memory_count": doc.memories.len(),
-            "todo_count": doc.todos.len(),
+        let data = String::from_utf8(bytes).map_err(|e| AppError::Internal(e.into()))?;
+        Some(EncodedExport {
+            format: req.format.clone(),
+            data,
+            memory_count: doc.memories.len(),
+            todo_count: doc.todos.len(),
+            not_replicated: not_replicated.clone(),
         })
     };
-    // On a follower these hold this instance's own data, not its leader's. An import
-    // ignores the field.
-    if !state.replication.client_writes_allowed() {
-        let mut stores = vec!["todos", "projects", "reminders"];
-        if req.include_graph {
-            stores.push("knowledge_graph");
-        }
-        output["not_replicated"] = serde_json::json!(stores);
-    }
 
     state.log_event(
         &user_id,
@@ -158,7 +192,13 @@ pub async fn export_mif(
         ),
     );
 
-    Ok(Json(output))
+    Ok(Json(match output {
+        Some(encoded) => ExportMifResponse::Encoded(encoded),
+        None => ExportMifResponse::Document(Box::new(ExportedDocument {
+            document: doc,
+            not_replicated,
+        })),
+    }))
 }
 
 // =============================================================================
@@ -349,24 +389,39 @@ pub async fn import_mif(
 // ADAPTER LISTING
 // =============================================================================
 
-pub async fn list_adapters() -> Json<serde_json::Value> {
+pub async fn list_adapters() -> Json<MifAdaptersResponse> {
     let registry = AdapterRegistry::new();
-    let adapters: Vec<serde_json::Value> = registry
+    let adapters = registry
         .list_adapters()
         .into_iter()
-        .map(|(name, format_id)| {
-            serde_json::json!({
-                "name": name,
-                "format": format_id,
-            })
+        .map(|(name, format_id)| MifAdapter {
+            name: name.to_string(),
+            format: format_id.to_string(),
         })
         .collect();
 
-    Json(serde_json::json!({
-        "adapters": adapters,
-        "default_export": "veld",
-        "default_import": "auto-detect",
-    }))
+    Json(MifAdaptersResponse {
+        adapters,
+        default_export: "veld".to_string(),
+        default_import: "auto-detect".to_string(),
+    })
+}
+
+/// Reply of `GET /api/mif/adapters`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MifAdaptersResponse {
+    pub adapters: Vec<MifAdapter>,
+    /// The `format` `POST /api/export/mif` uses when none is sent.
+    pub default_export: String,
+    pub default_import: String,
+}
+
+/// One import/export adapter.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MifAdapter {
+    pub name: String,
+    /// The value to send as `format`.
+    pub format: String,
 }
 
 // =============================================================================
@@ -381,10 +436,20 @@ pub struct AddEntityRequest {
     pub attributes: Option<HashMap<String, String>>,
 }
 
+/// Reply of `POST /api/graph/entity/add`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddEntityResponse {
+    pub success: bool,
+    /// The entity name, as sent.
+    pub entity: String,
+    /// The label applied, as its variant name.
+    pub label: String,
+}
+
 pub async fn add_entity(
     State(state): State<AppState>,
     Json(req): Json<AddEntityRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<AddEntityResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_entity(&req.name).map_validation_err("name")?;
     validation::validate_entity(&req.label).map_validation_err("label")?;
@@ -442,11 +507,11 @@ pub async fn add_entity(
         &format!("Added entity '{}' with label {:?}", req.name, entity_label),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "entity": req.name,
-        "label": format!("{:?}", entity_label)
-    })))
+    Ok(Json(AddEntityResponse {
+        success: true,
+        entity: req.name,
+        label: format!("{:?}", entity_label),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,10 +523,22 @@ pub struct AddRelationshipRequest {
     pub strength: Option<f32>,
 }
 
+/// Reply of `POST /api/graph/relationship/add`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddRelationshipResponse {
+    pub success: bool,
+    pub from: String,
+    pub to: String,
+    /// The relation type applied, as its variant name.
+    #[serde(rename = "type")]
+    pub relation_type: String,
+    pub strength: f32,
+}
+
 pub async fn add_relationship(
     State(state): State<AppState>,
     Json(req): Json<AddRelationshipRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<AddRelationshipResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_entity(&req.from_entity).map_validation_err("from_entity")?;
     validation::validate_entity(&req.to_entity).map_validation_err("to_entity")?;
@@ -553,13 +630,13 @@ pub async fn add_relationship(
         ),
     );
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "from": req.from_entity,
-        "to": req.to_entity,
-        "type": format!("{:?}", relation_type),
-        "strength": strength
-    })))
+    Ok(Json(AddRelationshipResponse {
+        success: true,
+        from: req.from_entity,
+        to: req.to_entity,
+        relation_type: format!("{:?}", relation_type),
+        strength,
+    }))
 }
 
 // =============================================================================
