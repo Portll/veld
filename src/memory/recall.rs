@@ -6304,14 +6304,14 @@ fn flat_hybrid(vector: f32, bm25: f32) -> f32 {
 /// the best of theirs and `vector_best` (the vector list's best, read as a cosine), times the
 /// hybrid weight; under reciprocal rank, ranked after the `hybrid_len` hybrid candidates in
 /// cosine order. Nothing of the graph's own weighting enters.
-fn admitted_graph_hit_terms<'a>(
+fn admitted_graph_hit_terms(
     mode: FusionMode,
     hybrid_w: f32,
     k: f32,
     hybrid_len: usize,
-    mut cosines: Vec<(&'a MemoryId, f32)>,
+    mut cosines: Vec<(&MemoryId, f32)>,
     vector_best: Option<f32>,
-) -> Vec<(&'a MemoryId, f32)> {
+) -> Vec<(&MemoryId, f32)> {
     cosines.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     let best = best_leg_score(cosines.iter().map(|(_, c)| *c).chain(vector_best));
     cosines
