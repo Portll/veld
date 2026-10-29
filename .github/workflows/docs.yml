@@ -81,8 +81,8 @@ jobs:
         with:
           name: generated-reference
           path: |
-            docs/src/reference/schemas.md
-            docs/src/reference/schemas.json
+            docs/src/
+            CLAUDE.md
           retention-days: 7
           if-no-files-found: error
 
