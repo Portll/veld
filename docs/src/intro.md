@@ -42,7 +42,7 @@ Veld is a derivative work of [shodh-memory](https://github.com/varun29ankuS/shod
 | Rust crate | `veld` on crates.io |
 | Node / MCP | `@veld/memory-mcp` on npm |
 | Python | `veld` on PyPI |
-| Docker | `varunveld/veld` |
+| Docker | `ghcr.io/portll/veld` |
 | MCP Registry | `veld` |
 
 ## Project status

@@ -13,7 +13,7 @@
   <a href="https://crates.io/crates/veld"><img src="https://img.shields.io/crates/v/veld.svg" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@veld/memory-mcp"><img src="https://img.shields.io/npm/v/@veld/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/veld/"><img src="https://img.shields.io/pypi/v/veld.svg" alt="PyPI"></a>
-  <a href="https://hub.docker.com/r/varunveld/veld"><img src="https://img.shields.io/docker/pulls/varunveld/veld.svg?logo=docker" alt="Docker"></a>
+  <a href="https://github.com/Portll/veld/pkgs/container/veld"><img src="https://img.shields.io/badge/ghcr.io-portll%2Fveld-2496ED?logo=docker" alt="Container image"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Evaluation-blue.svg" alt="License"></a>
   <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
@@ -122,7 +122,7 @@ That's it. The MCP server auto-downloads the backend binary and starts it. No Do
 
 ```bash
 # 1. Start the server
-docker run -d -p 3030:3030 -v veld-data:/data varunveld/veld
+docker run -d -p 3030:3030 -v veld-data:/data ghcr.io/portll/veld
 
 # 2. Add to Claude Code
 claude mcp add veld -- npx -y @veld/memory-mcp
@@ -180,7 +180,7 @@ let results = memory.recall("user-1", "user preferences", 5)?;
 ### Docker
 
 ```bash
-docker run -d -p 3030:3030 -v veld-data:/data varunveld/veld
+docker run -d -p 3030:3030 -v veld-data:/data ghcr.io/portll/veld
 ```
 
 ## What It Does
@@ -423,7 +423,7 @@ The bundled pre-commit hook scans staged files for obvious API keys, private key
 ```yaml
 services:
   veld:
-    image: varunveld/veld:latest
+    image: ghcr.io/portll/veld:latest
     environment:
       - VELD_ENV=production
       - VELD_HOST=0.0.0.0
@@ -486,5 +486,5 @@ A derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory
 ---
 
 <p align="center">
-  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=veld">MCP Registry</a> · <a href="https://hub.docker.com/r/varunveld/veld">Docker Hub</a> · <a href="https://pypi.org/project/veld/">PyPI</a> · <a href="https://www.npmjs.com/package/@veld/memory-mcp">npm</a> · <a href="https://crates.io/crates/veld">crates.io</a> · <a href="https://github.com/Portll/veld">Docs</a>
+  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=veld">MCP Registry</a> · <a href="https://github.com/Portll/veld/pkgs/container/veld">Container image</a> · <a href="https://pypi.org/project/veld/">PyPI</a> · <a href="https://www.npmjs.com/package/@veld/memory-mcp">npm</a> · <a href="https://crates.io/crates/veld">crates.io</a> · <a href="https://github.com/Portll/veld">Docs</a>
 </p>
