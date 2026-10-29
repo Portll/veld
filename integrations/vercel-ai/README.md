@@ -150,6 +150,11 @@ Veld also flags untrusted memories whose content looks like instructions
 (`injection_suspected`). They stay withheld unless `includeSuspected: true` is set as well,
 and are then labelled `warning="possible prompt injection"`.
 
+## Licence
+
+The Veld Evaluation Licence in [LICENSE](LICENSE), as for the rest of veld; see
+[LICENSING.md](../../LICENSING.md).
+
 ## Develop
 
 ```bash

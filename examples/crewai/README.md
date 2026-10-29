@@ -1,7 +1,7 @@
 # Veld - Agentic Memory + CrewAI Integration
 
 Use Veld - Agentic Memory as the memory of a CrewAI crew or agent. `VeldCrewMemory` is a
-CrewAI `Memory` (CrewAI 1.15 and later), so it plugs in wherever CrewAI takes one.
+CrewAI `Memory` (CrewAI 1.15), so it plugs in wherever CrewAI takes one.
 
 ## Installation
 
@@ -9,7 +9,9 @@ CrewAI `Memory` (CrewAI 1.15 and later), so it plugs in wherever CrewAI takes on
 pip install "veld[crewai]"
 ```
 
-CrewAI needs Python 3.10 or later.
+CrewAI needs Python 3.10 or later. The `crewai` extra installs CrewAI 1.15.x and no later:
+the adapter uses two private parts of CrewAI's `Memory` (`_submit_save` and `_storage`),
+which a new minor release may change.
 
 ## Quick Start
 

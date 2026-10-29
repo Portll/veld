@@ -107,6 +107,8 @@ node_modules/
 bun.lock
 package-lock.json
 yarn.lock
+# The Vercel AI SDK package pins its dev and test toolchain.
+!integrations/vercel-ai/package-lock.json
 
 # Coverage
 coverage/
