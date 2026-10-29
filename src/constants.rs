@@ -355,6 +355,16 @@ pub const GRAPH_TAG_ADMISSION_ENV: &str = "VELD_GRAPH_TAG_ADMISSION";
 /// them off, the query verbs `memory::recall` resolves against entity names match nothing.
 pub const GRAPH_VERB_ENTITIES_ENV: &str = "VELD_GRAPH_VERB_ENTITIES";
 
+/// Degree above which a derived entity takes no new co-occurrence edge (upstream's
+/// `SHODH_HUB_DEGREE_MAX`, default 300). A speaker named in every turn of a conversation
+/// reaches it first; past it, an edge to the speaker says only that the speaker spoke.
+/// Declared entities are exempt. The value is held below [`MAX_ENTITY_DEGREE`], the prune
+/// cap, where an edge only buys a prune of an older one.
+pub const GRAPH_HUB_DEGREE_MAX: usize = 300;
+
+/// Env var overriding [`GRAPH_HUB_DEGREE_MAX`].
+pub const GRAPH_HUB_DEGREE_MAX_ENV: &str = "SHODH_HUB_DEGREE_MAX";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay
