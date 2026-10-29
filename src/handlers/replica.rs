@@ -11,7 +11,8 @@
 //!   a follower is empty or stale: refused with 503 `NOT_REPLICATED`.
 //! - [`Access::Read`] reads memory records or this process's own runtime state.
 //! - [`Access::Local`] writes only this instance's own operational state (its
-//!   logins, keyring, backups and the replication controls), which no leader owns.
+//!   logins, keyring, backups, vector index and the replication controls), which no
+//!   leader owns.
 //!
 //! Every protected route is listed in [`ROUTES`]; a test holds the list to the
 //! routes `build_protected_routes` mounts, so a new route cannot go unclassified.
@@ -173,8 +174,10 @@ pub const ROUTES: &[(&str, &str, Access)] = &[
     ("POST", "/api/search/advanced", Read),
     ("POST", "/api/storage/uncompressed", Read),
     ("POST", "/api/index/verify", Read),
-    ("POST", "/api/index/repair", Write),
-    ("POST", "/api/index/rebuild", Write),
+    // Both write the vector index and its id mappings from the stored records, never a
+    // record: the index is this instance's own projection. Reembed rewrites records.
+    ("POST", "/api/index/repair", Local),
+    ("POST", "/api/index/rebuild", Local),
     ("POST", "/api/index/reembed", Write),
     ("GET", "/api/embeddings/backlog", Read),
     ("POST", "/api/embeddings/backlog/drain", Write),
@@ -435,7 +438,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::handlers::test_helpers::{get, get_unauthenticated, post_json, TestHarness};
+    use crate::handlers::test_helpers::{
+        get, get_unauthenticated, post_json, TestHarness, TEST_API_KEY,
+    };
     use crate::intent_log::{payload, IntentPayload};
     use crate::memory::types::{Experience, Memory, MemoryId};
 
@@ -802,6 +807,47 @@ mod tests {
         );
     }
 
+    /// Forgets the leader sends leave deleted vectors in the follower's index, and the
+    /// maintenance pass that compacts a leader's does not run on a follower.
+    #[tokio::test]
+    async fn a_followers_heavy_cycle_compacts_its_vector_index() {
+        let harness = TestHarness::new();
+        let ids: Vec<MemoryId> = [
+            "the breakwater lamp is red",
+            "the breakwater lamp was replaced",
+            "the breakwater is closed in storms",
+        ]
+        .into_iter()
+        .map(|content| remember_directly(&harness, content))
+        .collect();
+        follow(&harness);
+        let forgets: Vec<(u64, IntentPayload)> = ids[..2]
+            .iter()
+            .enumerate()
+            .map(|(lsn, id)| {
+                let frame = IntentPayload::Forget {
+                    user_id: USER.into(),
+                    memory_id: id.0.to_string(),
+                    schema_version: Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+                };
+                (lsn as u64, frame)
+            })
+            .collect();
+        let state = harness.state();
+        tokio::task::spawn_blocking(move || {
+            crate::replication::apply_replicated_page(&state, USER, forgets).unwrap();
+            state.run_maintenance_all_users()
+        })
+        .await
+        .unwrap();
+
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        let health = memory.read().index_health();
+        assert_eq!(health.deleted_count, 0, "{health:?}");
+        assert_eq!(health.total_vectors, 1, "{health:?}");
+        assert_eq!(memory.read().stored_count(), 1);
+    }
+
     #[tokio::test]
     async fn unreplicated_stores_answer_not_replicated_on_a_follower() {
         let harness = TestHarness::new();
@@ -937,6 +983,161 @@ mod tests {
             !text.contains("127.0.0.1:9") && !text.contains("follow"),
             "{text}"
         );
+    }
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// The router on a loopback socket: `oneshot` cannot upgrade a WebSocket.
+    async fn serve(harness: &TestHarness) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/stream", listener.local_addr().unwrap());
+        let app = harness.router();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server)
+    }
+
+    fn stream_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("x-api-key", TEST_API_KEY.parse().unwrap());
+        request
+    }
+
+    async fn next_frame(socket: &mut Socket) -> tokio_tungstenite::tungstenite::Message {
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(30), socket.next())
+                .await
+                .expect("a frame within 30 s")
+                .expect("the socket is open")
+                .expect("a frame");
+            if !matches!(frame, Message::Ping(_) | Message::Pong(_)) {
+                return frame;
+            }
+        }
+    }
+
+    async fn exchange(socket: &mut Socket, message: serde_json::Value) -> serde_json::Value {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .unwrap();
+        match next_frame(socket).await {
+            Message::Text(text) => serde_json::from_str(text.as_str()).unwrap(),
+            other => panic!("expected a JSON frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_follower_refuses_the_stream_upgrade() {
+        let harness = TestHarness::new();
+        follow(&harness);
+        let (url, server) = serve(&harness).await;
+        match tokio_tungstenite::connect_async(stream_request(&url)).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(response.headers().get(RETRY_AFTER).is_some());
+            }
+            other => panic!("the upgrade was not refused: {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_open_stream_stops_ingesting_once_its_instance_follows() {
+        use tokio_tungstenite::tungstenite::Message;
+        let harness = TestHarness::new();
+        let (url, server) = serve(&harness).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(stream_request(&url))
+            .await
+            .unwrap();
+        let content = |text: &str| json!({"type": "content", "content": text, "importance": 0.9});
+
+        let ack = exchange(&mut socket, json!({"user_id": USER})).await;
+        assert_eq!(ack["type"], "ack", "{ack}");
+        exchange(&mut socket, content("the pier lights come on at dusk")).await;
+        let stored = exchange(&mut socket, json!({"type": "flush"})).await;
+        assert_eq!(stored["memories_created"], 1, "{stored}");
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        assert_eq!(memory.read().stored_count(), 1);
+
+        follow(&harness);
+        let refused = exchange(&mut socket, content("the pier lights failed")).await;
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert_eq!(refused["code"], READ_ONLY_REPLICA, "{refused}");
+        assert_eq!(refused["fatal"], true, "{refused}");
+        match next_frame(&mut socket).await {
+            Message::Close(Some(frame)) => {
+                assert_eq!(u16::from(frame.code), 1013, "try again later");
+                assert_eq!(frame.reason.as_str(), READ_ONLY_REPLICA);
+            }
+            other => panic!("expected the socket to close, got {other:?}"),
+        }
+        assert_eq!(
+            memory.read().stored_count(),
+            1,
+            "nothing ingested after the follow"
+        );
+        server.abort();
+    }
+
+    /// The zenoh auto-topics hold one session for the life of the process, so a
+    /// follow refuses its messages and keeps it: an unfollow lets it ingest again.
+    #[tokio::test]
+    async fn a_stream_session_outlives_a_follow() {
+        use crate::streaming::{ExtractionResult, StreamMessage};
+        let harness = TestHarness::new();
+        let memory = harness.state().get_user_memory(USER).unwrap();
+        let extractor = harness.manager.streaming_extractor();
+        let session = extractor
+            .create_session(serde_json::from_value(json!({"user_id": USER})).unwrap())
+            .await
+            .unwrap();
+        let content = || -> StreamMessage {
+            serde_json::from_value(
+                json!({"type": "content", "content": "the ferry ramp was resurfaced", "importance": 0.9}),
+            )
+            .unwrap()
+        };
+
+        follow(&harness);
+        for message in [content(), StreamMessage::Flush] {
+            match extractor
+                .process_message(&session, message, memory.clone(), harness.state())
+                .await
+            {
+                ExtractionResult::Error { code, fatal, .. } => {
+                    assert_eq!(code, READ_ONLY_REPLICA);
+                    assert!(fatal);
+                }
+                other => panic!("a follower took a stream message: {other:?}"),
+            }
+        }
+        assert_eq!(memory.read().stored_count(), 0);
+
+        harness.state().replication.unfollow();
+        let mut created = 0;
+        for message in [content(), StreamMessage::Flush] {
+            if let ExtractionResult::Extraction {
+                memories_created, ..
+            } = extractor
+                .process_message(&session, message, memory.clone(), harness.state())
+                .await
+            {
+                created += memories_created;
+            }
+        }
+        assert_eq!(created, 1, "the same session ingests again");
+        assert_eq!(memory.read().stored_count(), 1);
     }
 
     /// A feed request and a status poll from one follower, as the leader's admin

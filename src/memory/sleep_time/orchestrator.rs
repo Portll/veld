@@ -240,6 +240,15 @@ impl SleepTimeOrchestrator {
         manager.get_user_graph_async(user_id).await
     }
 
+    /// Whether a pass may write: false while this instance follows a leader, whose
+    /// frames bring every record a pass would write. A manager already dropped is
+    /// shutting down, and its tenants fail to resolve on their own.
+    pub(super) fn writes_allowed(&self) -> bool {
+        self.manager
+            .upgrade()
+            .is_none_or(|manager| manager.replication.client_writes_allowed())
+    }
+
     pub(super) fn block_store(&self) -> &Arc<ContextBlockStore> {
         &self.block_store
     }

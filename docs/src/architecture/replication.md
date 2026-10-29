@@ -110,13 +110,28 @@ While an instance follows a leader, only the frames it applies write to it:
 - **Recall makes no usage writes**, as under `VELD_RECALL_READONLY=1`: no access counts,
   coactivation edges, interference, retrieval counter, reconsolidation boost or feedback.
   `proactive_context` does not auto-ingest, and its `ingested_memory_id` is empty.
+- **Writers outside the router are refused too.** `/api/stream` refuses the upgrade, and
+  a socket opened before a runtime follow answers its next message with an error frame,
+  `{type: "error", code: "READ_ONLY_REPLICA", fatal: true}`, then closes with code 1013
+  (try again later). The zenoh remember, forget, stream and mission start and end
+  handlers drop the sample and log the refusal under the same code; a zenoh auto-topic
+  keeps its session and ingests again after an unfollow. Zenoh recall stores no pending
+  feedback. `src/replication.rs` `Replication::client_writes_allowed` is the one check
+  they share.
 - **Maintenance changes no record.** Decay write-back, tier promotion, compression,
   consolidation, fact extraction, graph strengthening and decay, the sleep-time passes and
-  reminder cleanup are skipped; the heavy cycle's flush and cache pruning still run.
-  Reminders do not fire and the embedding backlog does not drain.
+  reminder cleanup are skipped; the heavy cycle's flush, cache pruning and vector-index
+  compaction (a rebuild of an index past its rebuild or deleted-vector threshold) still
+  run. Reminders do not fire and the embedding backlog does not drain. The sleep-time
+  workers claim nothing. Work that began before a runtime follow stops writing: a
+  maintenance cycle before its next tenant or write phase, a detached `/api/consolidate`
+  or `/api/consolidation/sleep` pass before its next phase, and a sleep-time pass before
+  it applies its rewrite (its queue item is released for after an unfollow).
 - **Writable on a follower, because no leader owns them:** the user-auth surface (this
   instance's logins, sessions and keyring), `follow` and `unfollow` (unfollowing is how
-  an operator promotes a follower), and backup create and purge.
+  an operator promotes a follower), backup create and purge, and vector-index rebuild
+  and repair (`/api/index/rebuild`, `/api/index/repair`), which write the index and its
+  id mappings from the stored records and no record.
 
 `GET /api/replication/role` takes any API key, and neither the admin key nor a tenant. It
 reports `{role: leader|follower|standalone, instance_id, leader_instance_id?,

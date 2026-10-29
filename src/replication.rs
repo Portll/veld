@@ -536,6 +536,15 @@ impl Replication {
         self.following.load(Ordering::Acquire)
     }
 
+    /// Whether anything but the replication applier may write to this instance: a
+    /// client request on any transport, a stream, maintenance, consolidation or the
+    /// sleep-time workers. False while it follows a leader, whose frames bring every
+    /// change. A writer that runs for a while asks again before each write phase, so a
+    /// follow that lands mid-pass stops it.
+    pub fn client_writes_allowed(&self) -> bool {
+        !self.is_following()
+    }
+
     /// The flag behind [`Self::is_following`], for the per-tenant stores to share.
     pub fn following_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.following)

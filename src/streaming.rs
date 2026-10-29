@@ -754,6 +754,17 @@ impl StreamingMemoryExtractor {
         self.sessions.get(session_id).map(|entry| entry.clone())
     }
 
+    /// What every message gets while this instance follows a leader. The session is
+    /// kept, so a zenoh auto-topic resumes after an unfollow; a WebSocket closes.
+    fn read_only_replica() -> ExtractionResult {
+        ExtractionResult::Error {
+            code: crate::handlers::replica::READ_ONLY_REPLICA.to_string(),
+            message: "this instance is a read-only replica; stream to its leader".to_string(),
+            fatal: true,
+            timestamp: Utc::now(),
+        }
+    }
+
     fn session_not_found(session_id: &str) -> ExtractionResult {
         ExtractionResult::Error {
             code: "SESSION_NOT_FOUND".to_string(),
@@ -822,6 +833,10 @@ impl StreamingMemoryExtractor {
 
         // Update activity timestamp to prevent stale session cleanup
         handle.lock().touch();
+
+        if !manager.replication.client_writes_allowed() {
+            return Self::read_only_replica();
+        }
 
         match message {
             StreamMessage::Content {

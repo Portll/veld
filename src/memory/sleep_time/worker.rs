@@ -67,8 +67,9 @@ pub async fn run_worker(
             return;
         }
 
-        // Disabled config: stay idle but still observe cancellation.
-        if !orch.config().enabled {
+        // Disabled config, or a follower: stay idle but still observe cancellation. A
+        // follower claims nothing, so its queue waits for an unfollow untouched.
+        if !orch.config().enabled || !orch.writes_allowed() {
             tokio::select! {
                 _ = cancel_rx.changed() => continue,
                 _ = tokio::time::sleep(StdDuration::from_secs(IDLE_POLL_INTERVAL_SECS)) => continue,
@@ -381,6 +382,16 @@ async fn process_item(
         let (worker_id, user_id, trigger) = (worker_id.to_string(), user_id.clone(), item.trigger);
         move || -> ProcessOutcome {
             let (worker_id, user_id) = (worker_id.as_str(), user_id.as_str());
+            if !orch.writes_allowed() {
+                let spent = rewriter_result.as_ref().map_or(0, |out| out.total_tokens);
+                let _ = orch.budget().record_actual_spend(user_id, spent);
+                tracing::info!(
+                    worker = %worker_id,
+                    user_id = %user_id,
+                    "this instance began following a leader mid-pass; nothing applied, item released"
+                );
+                return ProcessOutcome::Retryable;
+            }
             let user_mem_guard = user_mem.read();
             let mem_sys = user_mem_guard.as_memory_system();
 
@@ -992,6 +1003,75 @@ mod tests {
             .get_user_memory_async(TENANT)
             .await
             .expect("the open the pass started finishes");
+    }
+
+    fn follow_a_leader(harness: &TestHarness) {
+        let manager = &harness.manager;
+        manager
+            .replication
+            .follow(
+                &manager.base_path,
+                "http://127.0.0.1:9",
+                "admin",
+                Some("key"),
+            )
+            .expect("follow");
+    }
+
+    #[tokio::test]
+    async fn a_follower_worker_claims_nothing() {
+        const TENANT: &str = "sleep-follower-idle";
+        let harness = TestHarness::new();
+        let orch = orchestrator_over(&harness.manager);
+        assert!(orch
+            .enqueue(TENANT, SleepMode::Nrem, SleepTimeTrigger::Manual)
+            .expect("enqueue"));
+        follow_a_leader(&harness);
+
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_worker(Arc::clone(&orch), shutdown_rx, 0));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            orch.queue()
+                .next_unclaimed_for_user(TENANT)
+                .expect("queue")
+                .is_some(),
+            "the worker claimed while its instance follows a leader"
+        );
+        shutdown
+            .send(true)
+            .expect("the worker watches for shutdown");
+        worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn a_pass_claimed_before_a_follow_applies_nothing() {
+        const TENANT: &str = "sleep-follow-mid-pass";
+        let harness = TestHarness::new();
+        let (orch, item, graph) = a_pass_that_applies_an_edge(&harness, TENANT);
+        let edges_before = graph.read().get_stats().expect("stats").relationship_count;
+        follow_a_leader(&harness);
+
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let outcome = run_pass(Arc::clone(&orch), item, shutdown_rx, NO_DEADLINE).await;
+        assert_eq!(
+            outcome,
+            Ok(ProcessOutcome::Retryable),
+            "released, so it runs after an unfollow"
+        );
+        assert_eq!(
+            graph.read().get_stats().expect("stats").relationship_count,
+            edges_before,
+            "the edge proposal was applied on a follower"
+        );
+        assert_eq!(
+            orch.user_status(TENANT)
+                .expect("budget")
+                .budget
+                .tokens_this_hour,
+            SETTLED_TOKENS,
+            "the rewrite's spend is still settled"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

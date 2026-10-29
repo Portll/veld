@@ -1386,7 +1386,7 @@ pub async fn proactive_context(
     // follower nothing a client sends is stored either: its ingest would never reach
     // the leader, so `ingested_memory_id` comes back empty.
     let usage_writes = !state.recall_readonly();
-    if state.replication.is_following() {
+    if !state.replication.client_writes_allowed() {
         req.auto_ingest = false;
     }
 

@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Extension, Query, State,
     },
     response::{
@@ -388,6 +388,25 @@ async fn handle_streaming_socket(
 
         // Check if session was closed
         if matches!(result, streaming::ExtractionResult::Closed { .. }) {
+            break;
+        }
+        // A fatal error ends the stream. The error frame above says why; the close
+        // frame repeats its code, and asks a refused replica's client to come back later.
+        if let streaming::ExtractionResult::Error {
+            fatal: true, code, ..
+        } = &result
+        {
+            let close = if code == super::replica::READ_ONLY_REPLICA {
+                close_code::AGAIN
+            } else {
+                close_code::ERROR
+            };
+            let _ = sender
+                .send(Message::Close(Some(CloseFrame {
+                    code: close,
+                    reason: code.as_str().into(),
+                })))
+                .await;
             break;
         }
     }
