@@ -7,10 +7,10 @@
 //! types the edge when its cosine clears the floor. No model is added and nothing is trained:
 //! a relation type is a list of exemplar lines.
 //!
-//! Two adaptations. Exemplar embeddings are cached per embedder id rather than once per
-//! process, because a veld process can hold embedders of different dimensions. And the cosine
-//! is read on the MiniLM reference scale ([`crate::similarity::scale`]) before it meets the
-//! floor, which upstream set on MiniLM.
+//! Three adaptations. Exemplar embeddings are cached per embedder id rather than once per
+//! process, because a veld process can hold embedders of different dimensions. The cosine is
+//! read on the MiniLM reference scale ([`crate::similarity::scale`]) before it meets the floor,
+//! which upstream set on MiniLM. And a negated sentence is never typed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -134,6 +134,14 @@ impl RelationTyper {
         let a_first = pa < pb;
         let (x_name, y_name) = if a_first { (&a, &b) } else { (&b, &a) };
         let sentence = &lc[sent_start..sent_end];
+        // A negated sentence says the relation does not hold, and its embedding still sits
+        // next to the exemplar it negates: "x did not cause y" is nearest "x caused y".
+        if sentence
+            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+            .any(|word| crate::memory::query_parser::is_negation(word) || word.ends_with("n't"))
+        {
+            return None;
+        }
         // The longer name first, so a name nested in the other is not mangled.
         let normalized = if x_name.len() >= y_name.len() {
             sentence
@@ -216,5 +224,27 @@ mod tests {
         assert!(typer
             .type_relation(&embedder, "Alpha met Beta.", "Alpha", "Beta", 1.01)
             .is_none());
+    }
+
+    /// Upstream's typer reads "x did not cause y" as Causes: it is the nearest exemplar.
+    #[test]
+    fn a_negated_sentence_is_untyped_at_any_floor() {
+        let embedder = embedder();
+        let typer = RelationTyper::default();
+        for sentence in [
+            "Redis did not cause Outage.",
+            "Redis never caused Outage.",
+            "Redis isn't part of Outage.",
+        ] {
+            assert!(
+                typer
+                    .type_relation(&embedder, sentence, "Redis", "Outage", -1.0)
+                    .is_none(),
+                "{sentence}"
+            );
+        }
+        assert!(typer
+            .type_relation(&embedder, "Redis caused Outage.", "Redis", "Outage", -1.0)
+            .is_some());
     }
 }

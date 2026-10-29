@@ -4052,7 +4052,7 @@ fn calculate_term_weight(word: &str, base_weight: f32) -> f32 {
 }
 
 /// Check if word is negation
-fn is_negation(word: &str) -> bool {
+pub(crate) fn is_negation(word: &str) -> bool {
     const NEGATIONS: &[&str] = &[
         "not",
         "no",
