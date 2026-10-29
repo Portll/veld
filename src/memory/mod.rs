@@ -2842,6 +2842,9 @@ impl MemorySystem {
                     if let Some((vector, from)) =
                         fresh.experience.embeddings.take().zip(fresh_space)
                     {
+                        // The slot is emptied with its stamp: keep_vector skips a vector in a
+                        // slot's own space, and a stamped slot still names the displaced one's.
+                        fresh.experience.embedding_space = None;
                         if fresh.experience.embeddings_secondary.is_none()
                             && self.retriever.secondary_index_space() == Some(&from)
                         {
@@ -11042,6 +11045,53 @@ mod foreign_vector_tests {
             assert_eq!(
                 fits.experience.embeddings, stored.experience.embeddings,
                 "{backend}"
+            );
+        }
+    }
+
+    /// An embedder switch on a corpus whose vectors name their space: the drain embeds the
+    /// memory in the index's space and keeps the vector it replaces in its own.
+    #[test]
+    fn a_replaced_vector_that_names_its_space_is_kept() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let old_space = SpaceId::new("retired-model", foreign_dimension(&system));
+            let old_vector = vec![0.05; old_space.dimension()];
+            let mut memory =
+                stored_with_foreign_vector(&system, "the slipway closes for repairs in May");
+            memory
+                .experience
+                .set_primary_vector(old_vector.clone(), old_space.clone());
+            system
+                .long_term_memory
+                .update_many(std::slice::from_ref(&memory))
+                .expect("store");
+            system
+                .embedding_backlog
+                .record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    None,
+                )
+                .expect("backlog row");
+
+            let (report, _) = system.drain_embedding_backlog_journaled(10).expect("drain");
+            assert_eq!(
+                (report.drained, report.failed),
+                (1, 0),
+                "{backend}: {report:?}"
+            );
+
+            let stored = system.long_term_memory.get(&memory.id).expect("stored");
+            let index_space = system.retriever.index_space().clone();
+            assert_eq!(
+                stored.experience.embedding_space.as_ref(),
+                Some(&index_space),
+                "{backend}"
+            );
+            assert_eq!(
+                stored.experience.vector_in(&old_space, None, None),
+                Some(&old_vector),
+                "{backend}: the replaced vector is kept in its space"
             );
         }
     }
