@@ -17,9 +17,10 @@
 //!   names one reports the ablation as unavailable instead of measuring baseline.
 //!
 //! [`DEFAULT_DISABLED`] holds `hebbian`, as upstream's does (shodh-memory #321). The
-//! term adds a graph hop decay of up to 1.0, scaled by 0.1, to fused scores whose top
+//! term added a graph hop decay of up to 1.0, scaled by 0.1, to fused scores whose top
 //! ten spread over about 0.007, and only for memories the graph leg reached. On the
-//! LoCoMo gate, switching it off lifted nDCG@10 from 0.383 to about 0.44.
+//! LoCoMo gate, switching it off lifted nDCG@10 from 0.383 to about 0.44. It is now a
+//! share of the fused score, at most 10%, and stays off until that form is measured.
 
 use std::collections::HashSet;
 
@@ -28,7 +29,7 @@ pub const DISABLE_BOOSTS_VAR: &str = "SHODH_DISABLE_BOOSTS";
 
 /// Every family veld gates, each with an [`is_enabled`] call at its site.
 ///
-/// * `hebbian` — the Layer-5 hebbian term `score + hebbian_boost * 0.1` in
+/// * `hebbian` — the Layer-5 hebbian term `score * (1 + 0.1 * hebbian_boost)` in
 ///   `recall.rs`. Off by default ([`DEFAULT_DISABLED`]); `SHODH_DISABLE_BOOSTS` set
 ///   without it, even to the empty string, switches it on. Also switchable through
 ///   the `hebbian` cognitive-dial signal; the term runs only when both allow it.
@@ -146,6 +147,28 @@ pub fn graph_fusion_weight_override() -> Option<f32> {
         .and_then(|v| v.trim().parse::<f32>().ok())
         .filter(|w| w.is_finite())
         .map(|w| w.clamp(0.0, 1.0))
+}
+
+/// `SHODH_FUSION_FLAT=1|true` — fuse recall Layer 4 by FLAT calibrated max instead of
+/// reciprocal rank, under upstream's name for forcing it (shodh-memory #320). The `fusion`
+/// cognitive dial, when set, wins over this variable.
+pub fn flat_fusion_requested() -> bool {
+    std::env::var("SHODH_FUSION_FLAT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The Layer 4 fusion a query runs under: the `fusion` dial, else
+/// [`flat_fusion_requested`], else reciprocal rank.
+pub fn fusion_mode(
+    dial: Option<crate::memory::dials::FusionMode>,
+) -> crate::memory::dials::FusionMode {
+    use crate::memory::dials::FusionMode;
+    dial.unwrap_or(if flat_fusion_requested() {
+        FusionMode::Flat
+    } else {
+        FusionMode::Rrf
+    })
 }
 
 /// Serialises every test in the crate that mutates an ablation env var.
@@ -270,6 +293,21 @@ mod tests {
         assert_eq!(graph_fusion_weight_override(), None);
         std::env::remove_var("SHODH_DISABLE_FACT_LAYERS");
         std::env::remove_var("SHODH_GRAPH_FUSION_WEIGHT");
+    }
+
+    #[test]
+    fn fusion_is_rrf_unless_the_dial_or_the_upstream_flag_asks_for_flat() {
+        use crate::memory::dials::FusionMode;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SHODH_FUSION_FLAT");
+        assert_eq!(fusion_mode(None), FusionMode::Rrf);
+        assert_eq!(fusion_mode(Some(FusionMode::Flat)), FusionMode::Flat);
+        std::env::set_var("SHODH_FUSION_FLAT", "true");
+        assert_eq!(fusion_mode(None), FusionMode::Flat);
+        assert_eq!(fusion_mode(Some(FusionMode::Rrf)), FusionMode::Rrf);
+        std::env::set_var("SHODH_FUSION_FLAT", "0");
+        assert_eq!(fusion_mode(None), FusionMode::Rrf);
+        std::env::remove_var("SHODH_FUSION_FLAT");
     }
 
     #[test]

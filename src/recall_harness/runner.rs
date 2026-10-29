@@ -1331,6 +1331,20 @@ pub fn ingest_corpus(
             )
             .with_context(|| format!("graph-processing corpus item {}", item.id))?;
 
+        // Pass 3: the remember handler stores each memory's temporal facts after the
+        // write, and core remember() does not, so without this Layer 0.6 searched an
+        // empty store on every gate run.
+        user_mem
+            .read()
+            .store_temporal_facts_for_memory(
+                EVAL_USER,
+                &memory_id,
+                &experience.content,
+                &experience.entities,
+                item.created_at,
+            )
+            .with_context(|| format!("storing temporal facts for corpus item {}", item.id))?;
+
         map.insert(item.id.clone(), memory_id.0);
     }
 
@@ -1818,6 +1832,8 @@ pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
         arm("-bm25", &[("SHODH_ABLATE_BM25", "1")]),
         arm("-spreading", &[("SHODH_ABLATE_SPREADING", "1")]),
         arm("-boost-stack", &[("SHODH_DISABLE_BOOSTS", "all")]),
+        // FLAT calibrated-max Layer 4 fusion in place of reciprocal rank (upstream #320).
+        arm("fusion=flat", &[("SHODH_FUSION_FLAT", "1")]),
         // Single-leg isolation: one leg's candidates only.
         arm("leg=vector", &[("SHODH_LEG", "vector")]),
         arm("leg=bm25", &[("SHODH_LEG", "bm25")]),

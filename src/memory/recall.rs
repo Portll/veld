@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::constants::{HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING};
 use crate::embeddings::Embedder;
+use crate::memory::dials::FusionMode;
 use crate::memory::graph_retrieval::calculate_density_weights;
 use crate::memory::introspection::{self, StrengtheningReason};
 use crate::memory::learning_history;
@@ -63,6 +64,91 @@ impl super::MemorySystem {
         Ok(embedding)
     }
 
+    /// Working- and Session-tier memories the vector index does not hold, each with its best
+    /// similarity to the query where that exceeds 0.1: the cosine of its vector in the primary
+    /// index's space, or of its vector in any other space a query vector exists for, moved
+    /// onto the primary's scale first so a sharper model's near-misses do not outrank the
+    /// primary's hits on scale alone.
+    fn unindexed_tier_hits(
+        &self,
+        query_embedding: &[f32],
+        index_space: &SpaceId,
+        space_queries: &[(SpaceId, Vec<f32>)],
+        exclude: &HashSet<MemoryId>,
+    ) -> Vec<(MemoryId, f32)> {
+        let best_similarity = |mem: &Memory| -> Option<f32> {
+            let primary = self
+                .retriever
+                .stored_vector(mem, index_space)
+                .filter(|emb| !emb.is_empty())
+                .map(|emb| {
+                    crate::memory::hybrid_search::cosine_similarity_pub(query_embedding, emb)
+                });
+            let others = space_queries.iter().filter_map(|(space, q)| {
+                self.retriever
+                    .stored_vector(mem, space)
+                    .filter(|emb| !emb.is_empty())
+                    .map(|emb| {
+                        self.retriever.calibrated_similarity(
+                            space,
+                            crate::memory::hybrid_search::cosine_similarity_pub(q, emb),
+                        )
+                    })
+            });
+            primary
+                .into_iter()
+                .chain(others)
+                .reduce(f32::max)
+                .filter(|&s| s > 0.1)
+        };
+
+        let mut tier_memories = self.working_memory.read().all_memories();
+        tier_memories.extend(self.session_memory.read().all_memories());
+        tier_memories
+            .iter()
+            .filter(|mem| !exclude.contains(&mem.id) && !self.retriever.has_mapping(&mem.id))
+            .filter_map(|mem| best_similarity(mem).map(|sim| (mem.id.clone(), sim)))
+            .collect()
+    }
+
+    /// The `vamana_only` rung's answer: the vector leg in its own order, each memory scored
+    /// by its cosine, after the query's filters. No fusion, boost or rescoring stage runs,
+    /// and nothing is written back: access counts and coactivation feed the stages this
+    /// rung leaves out, so a vector-only recall must not move what the next rung measures.
+    fn vector_rung_results<S: CandidateSource + ?Sized>(
+        &self,
+        vector_results: &[(MemoryId, f32)],
+        filter: &Query,
+        candidates: &RecallCandidates<'_, S>,
+    ) -> (Vec<SharedMemory>, Vec<&'static str>) {
+        candidates.prefetch(vector_results.iter().map(|(id, _)| id));
+        let mut memories = Vec::with_capacity(filter.max_results);
+        let mut sources = Vec::new();
+        for (id, similarity) in vector_results {
+            if memories.len() >= filter.max_results {
+                break;
+            }
+            let Some(view) = candidates.get(id) else {
+                continue;
+            };
+            let valid = match filter.as_of {
+                Some(t) => view.memory.is_valid_at(t),
+                None => !view.memory.is_expired(),
+            };
+            if !valid || !self.retriever.matches_filters(&view.memory, filter) {
+                continue;
+            }
+            let source = view.tier.source_label();
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+            let mut memory = view.memory.as_ref().clone();
+            memory.set_score(*similarity);
+            memories.push(Arc::new(memory));
+        }
+        (memories, sources)
+    }
+
     /// Search and retrieve relevant memories (zero-copy with Arc<Memory>)
     ///
     /// PRODUCTION IMPLEMENTATION:
@@ -70,6 +156,17 @@ impl super::MemorySystem {
     /// - Non-semantic search: Uses importance * temporal decay
     /// - Zero shortcuts, no TODOs, enterprise-grade
     pub fn recall(&self, query: &Query) -> Result<Vec<SharedMemory>> {
+        let owner_scoped;
+        let query = match (&query.user_id, &self.owner_user_id) {
+            (None, Some(owner)) => {
+                owner_scoped = Query {
+                    user_id: Some(owner.clone()),
+                    ..query.clone()
+                };
+                &owner_scoped
+            }
+            _ => query,
+        };
         let _evidence = crate::graph_memory::EvidenceScope::enter(query.evidence_source.as_deref());
         // Semantic search requires special handling
         if let Some(query_text) = &query.query_text {
@@ -646,7 +743,11 @@ impl super::MemorySystem {
         }
 
         let attribute_boost_ids: HashSet<MemoryId> = match &query_type {
-            query_parser::QueryType::Attribute(attr_query) => {
+            query_parser::QueryType::Attribute(attr_query)
+                if query
+                    .layer_mode()
+                    .allows(crate::memory::types::LayerMode::PlusBm25) =>
+            {
                 tracing::debug!(
                     "Layer 0.5: Attribute query detected - entity='{}', attribute='{}', synonyms={:?}",
                     attr_query.entity,
@@ -745,7 +846,12 @@ impl super::MemorySystem {
 
         let temporal_gate = has_any_temporal_intent || has_temporal_keywords;
 
-        let temporal_fact_boost_ids: HashSet<MemoryId> = if temporal_gate {
+        // A PlusFacts stage, like Layer 0.7: below that rung it contributes nothing.
+        let temporal_fact_boost_ids: HashSet<MemoryId> = if temporal_gate
+            && query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::PlusFacts)
+        {
             if let Some(user_id) = query
                 .user_id
                 .as_ref()
@@ -833,6 +939,13 @@ impl super::MemorySystem {
                 // ---------------------------------------------------------------
                 // Fires when entity is known but event keywords are empty or
                 // Strategy 1 returned nothing.
+                // [signal: temporal_fact_untimed_fallback] With no time window to filter by, it
+                // takes every fact about the entity, up to 50 sources for one person; disabled,
+                // only time-window-filtered facts count. Default = on.
+                let untimed_entity_fallback = self
+                    .cognitive_dials
+                    .read()
+                    .signal_enabled("temporal_fact_untimed_fallback");
                 if boosted.is_empty() && !entity.is_empty() {
                     match self
                         .temporal_fact_store
@@ -851,7 +964,7 @@ impl super::MemorySystem {
                                 boosted.extend(
                                     filtered.into_iter().map(|f| f.source_memory_id.clone()),
                                 );
-                            } else {
+                            } else if untimed_entity_fallback {
                                 // No time window or no overlap — take all entity facts
                                 tracing::debug!(
                                     "Layer 0.6: Fallback entity-only found {} facts for '{}'",
@@ -1340,7 +1453,16 @@ impl super::MemorySystem {
         // Decompose compound/multi-entity queries into sub-queries for independent
         // vector search. BM25 and graph traversal still use the original query —
         // they handle compound queries better naturally.
-        let sub_queries = query_parser::decompose_query(query_text, &query_analysis);
+        // The vamana_only rung is the vector index's own answer to the query embedding:
+        // sub-query lists would come back RRF-fused, not ranked by cosine.
+        let vector_only = !query
+            .layer_mode()
+            .allows(crate::memory::types::LayerMode::PlusSpreading);
+        let sub_queries = if vector_only {
+            vec![query_text.to_string()]
+        } else {
+            query_parser::decompose_query(query_text, &query_analysis)
+        };
         let decomposed = sub_queries.len() > 1;
         // Detect abstract/thematic decomposition (Rule 4): decomposition fired AND
         // query contains abstract vocabulary. Used to invert RRF weights (sub-queries
@@ -1583,70 +1705,22 @@ impl super::MemorySystem {
         // ===========================================================================
         // LAYER 3.5: WORKING + SESSION TIER BRUTE-FORCE COSINE SCAN
         // ===========================================================================
-        // Vamana indexes only long-term storage. Working-tier and Session-tier
-        // memories (current session, last few hours) are NOT in the vector index.
-        // This is the root cause of temporal MRR 0.767: the most recent memories
-        // are invisible to vector search.
-        //
-        // Fix: brute-force cosine similarity over the small in-memory tiers
-        // (typically <100 memories combined), merge results with Vamana output.
-        // Cost: O(n) where n = working + session count. At <100 memories and
-        // 384-dim vectors, this is <0.1ms — negligible vs Vamana's ~2-5ms.
+        // A Working- or Session-tier memory the vector index does not hold yet (its
+        // embedding is still being written back, or its insert failed) is invisible to
+        // Layer 3, so the in-memory tiers are scanned by brute-force cosine for those.
+        // A memory the index does hold was already ranked there: the ones below its cut
+        // are its rejects, and on the decomposed path they re-entered at the top reciprocal
+        // ranks (LoCoMo conv-26: every turn is tier-resident, vector hit@10 0.72 -> 0.68).
         {
             let mut tier_hits = 0usize;
             let vamana_ids: std::collections::HashSet<MemoryId> =
                 vector_results.iter().map(|(id, _)| id.clone()).collect();
-
-            // Helper: compute max similarity across primary + secondary embeddings
-            let dual_cosine = |mem: &crate::memory::types::Memory| -> Option<f32> {
-                let mut best: Option<f32> = None;
-
-                // Primary embedding, only when it is in the primary index's space
-                if let Some(emb) = self.retriever.stored_vector(mem, &index_space) {
-                    if !emb.is_empty() {
-                        let sim = crate::memory::hybrid_search::cosine_similarity_pub(
-                            &query_embedding,
-                            emb,
-                        );
-                        best = Some(sim);
-                    }
-                }
-
-                // Every other space a query vector exists for — take the max, each similarity
-                // moved onto the primary's scale first, so a sharper model's near-misses do
-                // not outrank the primary's hits on scale alone
-                for (space, q_sec) in &space_queries {
-                    if let Some(m_sec) = self.retriever.stored_vector(mem, space) {
-                        if !m_sec.is_empty() {
-                            let sim_sec = self.retriever.calibrated_similarity(
-                                space,
-                                crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec),
-                            );
-                            best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
-                        }
-                    }
-                }
-
-                best.filter(|&s| s > 0.1)
-            };
-
-            let mut tier_candidates: Vec<(MemoryId, f32)> = Vec::new();
-            for mem in self.working_memory.read().all_memories() {
-                if vamana_ids.contains(&mem.id) {
-                    continue;
-                }
-                if let Some(sim) = dual_cosine(&mem) {
-                    tier_candidates.push((mem.id.clone(), sim));
-                }
-            }
-            for mem in self.session_memory.read().all_memories() {
-                if vamana_ids.contains(&mem.id) {
-                    continue;
-                }
-                if let Some(sim) = dual_cosine(&mem) {
-                    tier_candidates.push((mem.id.clone(), sim));
-                }
-            }
+            let mut tier_candidates = self.unindexed_tier_hits(
+                &query_embedding,
+                &index_space,
+                &space_queries,
+                &vamana_ids,
+            );
 
             if decomposed {
                 // The decomposed vector list carries reciprocal-rank scores (at most
@@ -1676,6 +1750,16 @@ impl super::MemorySystem {
                     "recall [layer:3.5] Working+Session brute-force cosine scan"
                 );
             }
+        }
+
+        if vector_only {
+            let (memories, sources) =
+                self.vector_rung_results(&vector_results, &vector_query, &candidates);
+            crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
+            self.logger
+                .read()
+                .log_retrieved(query_text, memories.len(), &sources);
+            return Ok(memories);
         }
 
         // ===========================================================================
@@ -1759,41 +1843,77 @@ impl super::MemorySystem {
             let bm25_query_text = query_parser::expand_abstract_terms_for_bm25(query_text);
             let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
 
-            let hybrid_ids = self
-                .hybrid_search
-                .search_with_dynamic_weights(
-                    bm25_query_ref,
-                    vector_results.clone(),
-                    get_content,
-                    term_weights,
-                    phrases,
-                    disc_opt,
-                    query.rerank_count, // FIX-11: per-query rerank count override
-                )
-                .map(|r| {
-                    r.into_iter()
-                        .map(|x| {
-                            attr.insert(
-                                x.memory_id.clone(),
-                                SignalAttribution {
-                                    bm25_contribution: x.bm25_score.unwrap_or(0.0),
-                                    vector_contribution: x.vector_score.unwrap_or(0.0),
-                                    graph_contribution: x.graph_score.unwrap_or(0.0),
-                                    cross_encoder_contribution: x.rerank_score.unwrap_or(0.0),
-                                    ..Default::default()
+            let bm25_allowed = query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::PlusBm25);
+            let hybrid_search_results = if bm25_allowed {
+                self.hybrid_search
+                    .search_with_dynamic_weights(
+                        bm25_query_ref,
+                        vector_results.clone(),
+                        get_content,
+                        term_weights,
+                        phrases,
+                        disc_opt,
+                        query.rerank_count, // FIX-11: per-query rerank count override
+                    )
+                    .ok()
+            } else {
+                None
+            };
+            // What FLAT fuses: each hybrid candidate's raw scores in the two lists, and the
+            // factor the optional LLM refiner multiplied its hybrid score by (1 without one).
+            let mut hybrid_components: std::collections::HashMap<MemoryId, HybridComponents> =
+                std::collections::HashMap::new();
+            let hybrid_ids = match hybrid_search_results {
+                Some(r) => r
+                    .into_iter()
+                    .map(|x| {
+                        attr.insert(
+                            x.memory_id.clone(),
+                            SignalAttribution {
+                                bm25_contribution: x.bm25_score.unwrap_or(0.0),
+                                vector_contribution: x.vector_score.unwrap_or(0.0),
+                                graph_contribution: x.graph_score.unwrap_or(0.0),
+                                cross_encoder_contribution: x.rerank_score.unwrap_or(0.0),
+                                ..Default::default()
+                            },
+                        );
+                        hybrid_components.insert(
+                            x.memory_id.clone(),
+                            HybridComponents {
+                                bm25: x.bm25_score.unwrap_or(0.0),
+                                vector: x.vector_score.unwrap_or(0.0),
+                                refined: if x.rrf_score > 0.0 {
+                                    x.score / x.rrf_score
+                                } else {
+                                    1.0
                                 },
-                            );
-                            (x.memory_id, x.score)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or(vector_results);
+                            },
+                        );
+                        (x.memory_id, x.score)
+                    })
+                    .collect::<Vec<_>>(),
+                None => {
+                    for (id, score) in &vector_results {
+                        hybrid_components.insert(
+                            id.clone(),
+                            HybridComponents {
+                                bm25: 0.0,
+                                vector: *score,
+                                refined: 1.0,
+                            },
+                        );
+                    }
+                    vector_results
+                }
+            };
             for id in &primary_vector_hits {
                 mark_space(&mut attr, id, &index_space);
             }
 
             // ===========================================================================
-            // LAYER 4: RRF FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
+            // LAYER 4: FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
             // ===========================================================================
             // Biological model: Memory graphs start dense (noisy L1 edges) and become
             // sparse over time through pruning (Hebbian "use it or lose it").
@@ -1801,11 +1921,15 @@ impl super::MemorySystem {
             // Sparse graphs = mature, curated connections = trust graph more
             // Dense graphs = fresh, noisy connections = trust semantic/BM25 more
             //
-            // The density weights directly control the balance - no extra multipliers.
-            // This follows ACT-R's additive activation model.
-            // K controls top-rank discrimination: K=20 → rank-1 vs rank-5 gap is 19%
-            // (vs 12% at K=30). Higher K = more equal weighting, lower K = sharper.
-            // Precedence: per-query rrf_k → live dial `rrf_k_outer` → const 20.0.
+            // Reciprocal rank (the default) adds weight / (k + rank) per list; K sets top-rank
+            // discrimination, precedence per-query rrf_k → live dial `rrf_k_outer` → 20.0.
+            // FLAT, behind the `fusion` dial or SHODH_FUSION_FLAT, scores a candidate in each
+            // list by its score over the list's best, vector and BM25 joined as the stronger
+            // plus FLAT_CONSENSUS of the weaker. On the LoCoMo hold-out (1,166 cases) against
+            // main, FLAT traded the top hit for depth (p@1 -0.050, recall@10 +0.032), and
+            // reciprocal rank under the same bounded boosts did better on both (+0.023,
+            // +0.043). Upstream's own gate arm leaned the same way on p@1 (0.48 FLAT, 0.50 RRF).
+            let fusion_mode = super::ablation::fusion_mode(early_dials_snapshot.fusion);
             let k: f32 = query
                 .rrf_k
                 .or_else(|| self.cognitive_dials.read().rrf_k_outer)
@@ -1836,30 +1960,110 @@ impl super::MemorySystem {
             let hybrid_w = semantic_w + linguistic_w;
 
             tracing::debug!(
-                "Layer 4 RRF: density={:?}, graph_w={:.2}, hybrid_w={:.2}, query_entities={}",
+                "Layer 4 {} fusion: density={:?}, graph_w={:.2}, hybrid_w={:.2}, query_entities={}",
+                fusion_mode.as_str(),
                 graph_density,
                 graph_w,
                 hybrid_w,
                 query_entity_count
             );
 
-            // Graph results: pure RRF with density weight
+            // Graph results: the leg's term, times the activation bonus. Under FLAT the term
+            // is the activation over the leg's highest. Under `graph_candidates_only` the leg
+            // adds no term and no hop weight; its hits that no hybrid list found are scored
+            // after the hybrid leg below.
+            let graph_candidates_only = early_dials_snapshot.graph_candidates_only.unwrap_or(false);
+            let best_activation = best_leg_score(graph_results.iter().map(|(_, a, _)| *a));
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
-                // Standard RRF: weight / (k + rank), rank is 1-indexed
-                let rrf_score = graph_w / (k + (r + 1) as f32);
-                // RRF score + additive activation bonus (ACT-R spreading activation)
-                let activation_bonus = graph_w * 0.2 * activation.clamp(0.0, 1.0);
-                *fused.entry(id.clone()).or_insert(0.0) += rrf_score + activation_bonus;
-                heb.insert(id.clone(), *h);
+                if !graph_candidates_only {
+                    let term =
+                        leg_term(fusion_mode, graph_w, k, r + 1, *activation, best_activation)
+                            * graph_activation_factor(graph_w, *activation);
+                    *fused.entry(id.clone()).or_insert(0.0) += term;
+                    heb.insert(id.clone(), *h);
+                }
 
                 // Signal attribution: record graph contribution for memories
                 // that came from graph traversal (may not have hybrid search data)
                 attr.entry(id.clone()).or_default().graph_contribution = *activation;
             }
 
-            // Hybrid (BM25+vector) results: pure RRF with density weight
-            for (r, (id, _)) in hybrid_ids.iter().enumerate() {
-                *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+            // Hybrid (BM25+vector) results.
+            match fusion_mode {
+                FusionMode::Rrf => {
+                    for (r, (id, _)) in hybrid_ids.iter().enumerate() {
+                        *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+                    }
+                }
+                FusionMode::Flat => {
+                    let best_vector = best_leg_score(hybrid_components.values().map(|c| c.vector));
+                    let best_bm25 = best_leg_score(hybrid_components.values().map(|c| c.bm25));
+                    for (id, _) in &hybrid_ids {
+                        let Some(c) = hybrid_components.get(id) else {
+                            continue;
+                        };
+                        *fused.entry(id.clone()).or_insert(0.0) += hybrid_w
+                            * flat_hybrid(
+                                calibrated(c.vector, best_vector),
+                                calibrated(c.bm25, best_bm25),
+                            )
+                            * c.refined;
+                    }
+                }
+            }
+
+            if graph_candidates_only {
+                let admitted: Vec<&MemoryId> = graph_results
+                    .iter()
+                    .map(|(id, _, _)| id)
+                    .filter(|id| !hybrid_components.contains_key(*id))
+                    .collect();
+                if !admitted.is_empty() {
+                    // The vector list's best by its own score, to put the admitted hits'
+                    // cosines on that list's scale: its scores are reciprocal ranks on a
+                    // decomposed query, so its best is re-read as a cosine like theirs.
+                    let mut vector_best: Option<(&MemoryId, f32)> = None;
+                    for (id, _) in &hybrid_ids {
+                        if let Some(c) = hybrid_components.get(id) {
+                            if vector_best.is_none_or(|(_, best)| c.vector > best) {
+                                vector_best = Some((id, c.vector));
+                            }
+                        }
+                    }
+                    candidates.prefetch(
+                        admitted
+                            .iter()
+                            .copied()
+                            .chain(vector_best.map(|(id, _)| id)),
+                    );
+                    let cosine = |id: &MemoryId| -> f32 {
+                        candidates
+                            .get(id)
+                            .and_then(|view| {
+                                self.retriever
+                                    .stored_vector(&view.memory, &index_space)
+                                    .filter(|e| !e.is_empty())
+                                    .map(|e| {
+                                        crate::memory::hybrid_search::cosine_similarity_pub(
+                                            &query_embedding,
+                                            e,
+                                        )
+                                    })
+                            })
+                            .unwrap_or(0.0)
+                    };
+                    let scored = admitted_graph_hit_terms(
+                        fusion_mode,
+                        hybrid_w,
+                        k,
+                        hybrid_ids.len(),
+                        admitted.into_iter().map(|id| (id, cosine(id))).collect(),
+                        vector_best.map(|(id, _)| cosine(id)),
+                    );
+                    for (id, term) in scored {
+                        *fused.entry(id.clone()).or_insert(0.0) += term;
+                    }
+                }
             }
 
             // PSEUDO-RELEVANCE FEEDBACK: a second lexical pass whose query adds the terms the
@@ -1869,7 +2073,7 @@ impl super::MemorySystem {
                 .use_prf
                 .unwrap_or(crate::constants::PRF_ENABLED_DEFAULT)
                 && early_dials_snapshot.signal_enabled("prf");
-            if prf_wanted && hybrid_ids.len() >= 2 {
+            if bm25_allowed && prf_wanted && hybrid_ids.len() >= 2 {
                 let prf_docs = early_dials_snapshot
                     .prf_docs
                     .unwrap_or(crate::constants::PRF_DOCS);
@@ -1894,8 +2098,10 @@ impl super::MemorySystem {
                         .search(&expanded, query.max_results * 5)
                         .unwrap_or_default();
                     let prf_w = hybrid_w * prf_weight;
-                    for (r, (id, _)) in prf_hits.iter().enumerate() {
-                        *fused.entry(id.clone()).or_insert(0.0) += prf_w / (k + (r + 1) as f32);
+                    let best_prf = best_leg_score(prf_hits.iter().map(|(_, s)| *s));
+                    for (r, (id, score)) in prf_hits.iter().enumerate() {
+                        *fused.entry(id.clone()).or_insert(0.0) +=
+                            leg_term(fusion_mode, prf_w, k, r + 1, *score, best_prf);
                     }
                     tracing::debug!(
                         terms = terms.join(" "),
@@ -1905,23 +2111,26 @@ impl super::MemorySystem {
                 }
             }
 
-            // Date window results (Layer 3.7): pure RRF at the hybrid weight. A memory
-            // the hybrid list also holds gains from both, which is the point: the date
-            // confirms the match. One the hybrid list could not reach enters here.
+            // Date window results (Layer 3.7), at the hybrid weight. A memory the hybrid
+            // list also holds gains from both, which is the point: the date confirms the
+            // match. One the hybrid list could not reach enters here.
             if !date_window_results.is_empty() {
-                for (r, (id, _)) in date_window_results.iter().enumerate() {
-                    *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+                let best_dated = best_leg_score(date_window_results.iter().map(|(_, s)| *s));
+                for (r, (id, score)) in date_window_results.iter().enumerate() {
+                    *fused.entry(id.clone()).or_insert(0.0) +=
+                        leg_term(fusion_mode, hybrid_w, k, r + 1, *score, best_dated);
                     attr.entry(id.clone()).or_default().temporal_match = true;
                 }
                 tracing::debug!(
-                    "Layer 4 RRF: date window leg added {} results (w={:.2})",
+                    "Layer 4 fusion: date window leg added {} results (w={:.2})",
                     date_window_results.len(),
                     hybrid_w
                 );
             }
 
-            // The legs beyond the primary index. RRF is rank-based, so the spaces' score scales
-            // do not matter; each leg weighs a share of semantic_w, so the total is not inflated:
+            // The legs beyond the primary index. Reciprocal rank reads ranks and FLAT calibrates
+            // against the leg's own best, so the spaces' score scales do not matter; each leg
+            // weighs a share of semantic_w, so the total is not inflated:
             // the secondary ratio, the space's dial weight, and for a leg through a fitted map,
             // the map's confidence. The leg through the secondary-to-primary map searches the
             // primary index, so its hits count for the primary space.
@@ -1943,12 +2152,15 @@ impl super::MemorySystem {
                         semantic_w * sec_ratio * confidence * space_weight(&leg.space)
                     }
                 };
-                for (r, (id, _)) in leg.hits.iter().enumerate() {
-                    *fused.entry(id.clone()).or_insert(0.0) += w / (k + (r + 1) as f32);
+                let best_hit = best_leg_score(leg.hits.iter().map(|(_, s)| *s));
+                for (r, (id, score)) in leg.hits.iter().enumerate() {
+                    *fused.entry(id.clone()).or_insert(0.0) +=
+                        leg_term(fusion_mode, w, k, r + 1, *score, best_hit);
                     mark_space(&mut attr, id, &leg.space);
                 }
                 tracing::debug!(
-                    "Layer 4 RRF: {:?} leg on {} added {} results (w={:.2})",
+                    "Layer 4 {} fusion: {:?} leg on {} added {} results (w={:.2})",
+                    fusion_mode.as_str(),
                     leg.kind,
                     leg.space,
                     leg.hits.len(),
@@ -1960,6 +2172,14 @@ impl super::MemorySystem {
                 (leg.space, ranked)
             }));
 
+            // Every boost from here to Layer 4.92 multiplies a candidate's fused score by
+            // `1 + share`, so what it adds is a bounded share of that candidate's own score
+            // (shodh-memory #174). An absolute boost outweighed every rank difference the
+            // fusion produced: at k = 20 reciprocal-rank scores sit near 0.02-0.04, and on
+            // LoCoMo the entity-overlap and temporal-fact boosts took gold hit@10 from 0.72 to
+            // 0.45. A boost reorders what the fusion found; it does not add a memory the
+            // fusion did not find, since such a memory has no score to take a share of.
+
             // ===========================================================================
             // LAYER 4.5: ATTRIBUTE QUERY BOOST
             // ===========================================================================
@@ -1967,15 +2187,10 @@ impl super::MemorySystem {
             // AND an attribute synonym value. This ensures "Caroline is single" ranks
             // high for "What is Caroline's relationship status?".
             if !attribute_boost_ids.is_empty() {
-                const ATTRIBUTE_BOOST: f32 = 0.5; // Strong boost for attribute matches
                 let mut boosted_count = 0;
                 for id in &attribute_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += ATTRIBUTE_BOOST;
-                        boosted_count += 1;
-                    } else {
-                        // Also add memories that weren't in the fusion but match attribute
-                        fused.insert(id.clone(), ATTRIBUTE_BOOST);
+                        *score *= 1.0 + crate::constants::ATTRIBUTE_QUERY_BOOST;
                         boosted_count += 1;
                     }
                 }
@@ -1990,12 +2205,16 @@ impl super::MemorySystem {
             // ===========================================================================
             // LAYER 4.55: TEMPORAL FACT BOOST
             // ===========================================================================
-            // Source memories of matching temporal facts get a precision-tuned boost.
-            // Fires for all temporal intents (including WhenQuestion) and broader
-            // temporal keywords to surface fact-sourced memories.
-            // Uses temporal_recall_boost (0.20) — calibrated to lift temporal-source
-            // memories by ~2 RRF positions without overriding strong semantic matches.
-            if !temporal_fact_boost_ids.is_empty() {
+            // Source memories of matching temporal facts gain `temporal_recall_boost` (0.20) of
+            // their fused score. Fires for all temporal intents (including WhenQuestion) and
+            // broader temporal keywords. The entity-only fallback in Layer 0.6 can name fifty
+            // sources for one person, so the boost has to stay a nudge: as an absolute +0.20
+            // those fifty outranked every semantic match and took LoCoMo temporal hit@10 from
+            // 0.89 to 0.35.
+            // [signal: temporal_fact_boost] Gated by disabled_signals dial; default = always on.
+            if !temporal_fact_boost_ids.is_empty()
+                && early_dials_snapshot.signal_enabled("temporal_fact_boost")
+            {
                 let temporal_recall_boost = self
                     .cognitive_dials
                     .read()
@@ -2004,14 +2223,11 @@ impl super::MemorySystem {
                 let mut boosted_count = 0;
                 for id in &temporal_fact_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += temporal_recall_boost;
+                        *score *= 1.0 + temporal_recall_boost;
                         boosted_count += 1;
-                    } else {
-                        fused.insert(id.clone(), temporal_recall_boost);
-                        boosted_count += 1;
+                        // Signal attribution: mark temporal match
+                        attr.entry(id.clone()).or_default().temporal_match = true;
                     }
-                    // Signal attribution: mark temporal match
-                    attr.entry(id.clone()).or_default().temporal_match = true;
                 }
                 if boosted_count > 0 {
                     tracing::info!(
@@ -2041,7 +2257,6 @@ impl super::MemorySystem {
                     || (query_lower.contains("what") && query_lower.contains("use"));
 
                 if is_decision_query {
-                    const DECISION_TYPE_BOOST: f32 = 0.15;
                     let mut boosted_count = 0usize;
                     for (id, score) in fused.iter_mut() {
                         let is_decision = candidates.get(id).is_some_and(|view| {
@@ -2051,7 +2266,7 @@ impl super::MemorySystem {
                             )
                         });
                         if is_decision {
-                            *score += DECISION_TYPE_BOOST;
+                            *score *= 1.0 + crate::constants::DECISION_TYPE_BOOST;
                             boosted_count += 1;
                         }
                     }
@@ -2071,7 +2286,10 @@ impl super::MemorySystem {
             // Porter stemming resolves morphological mismatches: "bugs"->"bug",
             // "risks"->"risk", "testing"->"test". Stop word filtering prevents
             // false positives from "the" matching inside "prometheus" etc.
-            // Linear 0.10 per match, capped at 0.40.
+            // A word match adds up to ENTITY_OVERLAP_SHARE of the memory's fused score, weighted
+            // by how few candidates it matches; four full matches are the cap.
+            // [signal: entity_overlap] Gated by disabled_signals dial; default = always on.
+            let entity_overlap_on = early_dials_snapshot.signal_enabled("entity_overlap");
             {
                 use rust_stemmers::{Algorithm, Stemmer};
                 let stemmer = Stemmer::create(Algorithm::English);
@@ -2096,65 +2314,96 @@ impl super::MemorySystem {
 
                 if !query_stems.is_empty() {
                     let ids: Vec<MemoryId> = fused.keys().cloned().collect();
-                    for id in &ids {
-                        let view = candidates.get(id);
-                        let entity_stems: Vec<String> = view
-                            .as_ref()
-                            .map(|v| {
-                                v.entities_lower
-                                    .iter()
-                                    .map(|e| stem_query_token(&stemmer, e))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let matched: Vec<&String> = query_stems
-                            .iter()
-                            .filter(|qs| {
-                                entity_stems
-                                    .iter()
-                                    .any(|es| query_token_matches_entity(qs, es))
-                            })
-                            .collect();
+                    let mut with_entities = 0usize;
+                    let matches: Vec<Vec<&String>> = ids
+                        .iter()
+                        .map(|id| {
+                            let entity_stems: Vec<String> = candidates
+                                .get(id)
+                                .map(|v| {
+                                    v.entities_lower
+                                        .iter()
+                                        .map(|e| stem_query_token(&stemmer, e))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !entity_stems.is_empty() {
+                                with_entities += 1;
+                            }
+                            query_stems
+                                .iter()
+                                .filter(|qs| {
+                                    entity_stems
+                                        .iter()
+                                        .any(|es| query_token_matches_entity(qs, es))
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let mut matching_candidates: std::collections::HashMap<&String, usize> =
+                        std::collections::HashMap::new();
+                    for matched in &matches {
+                        for qs in matched {
+                            *matching_candidates.entry(*qs).or_default() += 1;
+                        }
+                    }
+
+                    for (id, matched) in ids.iter().zip(&matches) {
                         let overlap = matched.len();
                         if overlap >= 1 {
-                            // Dampen entity overlap for abstract/decomposed queries:
-                            // generic stems like "perform" match many memories equally,
-                            // adding noise rather than signal. Reduce from 0.10 to 0.04.
-                            // An identifier match ("serve.mjs" against a declared
-                            // `repo:admin/serve.mjs`) is not a generic stem — it matches at a
-                            // name boundary or not at all — so it keeps the undampened rate
-                            // whether or not the query was decomposed.
+                            // A word match is weighted by how few candidates the word matches:
+                            // a speaker's name is an entity on half of a conversation and says
+                            // nothing about which turn is meant, while `thiserror` on one
+                            // memory says everything. An identifier match ("serve.mjs" against
+                            // a declared `repo:admin/serve.mjs`) matches at a name boundary or
+                            // not at all, so it counts in full.
                             let identifiers =
                                 matched.iter().filter(|qs| is_structured_token(qs)).count();
-                            let words = overlap - identifiers;
-                            let per_match = if decomposed { 0.04 } else { 0.10 };
-                            let cap = if decomposed { 0.16 } else { 0.40 };
-                            let boost = ((per_match * words as f32).min(cap)
-                                + 0.10 * identifiers as f32)
-                                .min(0.40);
-                            if let Some(score) = fused.get_mut(id) {
-                                *score += boost;
+                            // Summed in a fixed order: `matched` follows the stem set's hash
+                            // order, and an f32 sum in another order differs in its last bits.
+                            let mut word_weights: Vec<f32> = matched
+                                .iter()
+                                .filter(|qs| !is_structured_token(qs))
+                                .map(|qs| {
+                                    entity_match_specificity(
+                                        with_entities,
+                                        matching_candidates[*qs],
+                                    )
+                                })
+                                .collect();
+                            word_weights.sort_by(f32::total_cmp);
+                            let word_weight: f32 = word_weights.iter().sum();
+                            if entity_overlap_on {
+                                if let Some(score) = fused.get_mut(id) {
+                                    *score *= 1.0
+                                        + entity_overlap_share(
+                                            word_weight,
+                                            identifiers,
+                                            decomposed,
+                                        );
+                                }
                             }
                             // Signal attribution: mark entity overlap
                             attr.entry(id.clone()).or_default().entity_overlap = true;
-                        } else if overlap == 0 && !has_any_temporal_intent {
+                        } else if !has_any_temporal_intent {
                             // Content-fallback: when no entity/tag overlap, check
                             // if query stems appear in memory content. Smaller boost
-                            // (+0.05/match, cap 0.20) to keep below tag-match priority.
+                            // (0.05 of the memory's fused score per match, cap 0.20) to
+                            // keep below tag-match priority.
                             // Gated: skip for temporal queries where content overlap
                             // would boost wrong-session memories indiscriminately.
                             // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
                             if early_dials_snapshot.signal_enabled("content_fallback") {
-                                if let Some(view) = view.as_ref() {
+                                if let Some(view) = candidates.get(id) {
                                     let content_lower = &view.content_lower;
                                     let content_overlap = query_stems
                                         .iter()
                                         .filter(|qs| content_lower.contains(qs.as_str()))
                                         .count();
                                     if content_overlap >= 2 {
-                                        let boost = (0.05 * content_overlap as f32).min(0.20);
                                         if let Some(score) = fused.get_mut(id) {
-                                            *score += boost;
+                                            *score *=
+                                                1.0 + (0.05 * content_overlap as f32).min(0.20);
                                         }
                                     }
                                 }
@@ -2225,7 +2474,8 @@ impl super::MemorySystem {
             // This is the key signal that differentiates "we decided to use Rust"
             // (specific, focused) from "things that didn't go well: Rust, MongoDB..."
             // (broad retrospective).
-            {
+            // [signal: length_penalty] Gated by disabled_signals dial; default = always on.
+            if early_dials_snapshot.signal_enabled("length_penalty") {
                 let mut lengths: Vec<(MemoryId, usize)> = Vec::new();
                 for id in fused.keys() {
                     if let Some(view) = candidates.get(id) {
@@ -2325,7 +2575,13 @@ impl super::MemorySystem {
             // against light pollution from old-but-topical memories.
             // Only the top TEMPORAL_DEDUP_MAX_CANDIDATES by fused score are compared: the pass
             // is all-pairs over the fused set, which runs to hundreds of candidates.
-            if has_any_temporal_intent || has_temporal_keywords {
+            // Recency intent only: "when did X happen" asks for the memory where it happened,
+            // which is usually the oldest on its topic. Firing on every temporal query took
+            // LoCoMo temporal hit@10 to zero.
+            // [signal: temporal_topic_dedup] Gated by disabled_signals dial; default = always on.
+            if query_parser::has_recency_intent(query_text)
+                && early_dials_snapshot.signal_enabled("temporal_topic_dedup")
+            {
                 let demoted = temporal_topic_dedup(
                     &mut fused,
                     &candidates,
@@ -2404,8 +2660,7 @@ impl super::MemorySystem {
             // via keyword or semantic similarity (built in recall handler C5).
             if let Some(ref signals) = query.prospective_signals {
                 if !signals.is_empty() {
-                    const PROSPECTIVE_BOOST_PER_MATCH: f32 = 0.15;
-                    const MAX_PROSPECTIVE_BOOST: f32 = 0.5;
+                    use crate::constants::{PROSPECTIVE_BOOST_MAX, PROSPECTIVE_BOOST_PER_MATCH};
 
                     // Tokenize all signals into unique terms (skip noise words < 3 chars)
                     let signal_terms: std::collections::HashSet<String> = signals
@@ -2431,10 +2686,10 @@ impl super::MemorySystem {
 
                                 if match_count > 0 {
                                     // Sqrt scaling: diminishing returns for additional matches
-                                    let boost = (PROSPECTIVE_BOOST_PER_MATCH
-                                        * (match_count as f32).sqrt())
-                                    .min(MAX_PROSPECTIVE_BOOST);
-                                    *score += boost;
+                                    *score *= 1.0
+                                        + (PROSPECTIVE_BOOST_PER_MATCH
+                                            * (match_count as f32).sqrt())
+                                        .min(PROSPECTIVE_BOOST_MAX);
                                     boosted_count += 1;
                                 }
                             }
@@ -2464,7 +2719,7 @@ impl super::MemorySystem {
                 let mut boosted_count = 0;
                 for (id, boost) in &fact_source_boosts {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += boost;
+                        *score *= 1.0 + boost;
                         boosted_count += 1;
                     }
                 }
@@ -2479,9 +2734,8 @@ impl super::MemorySystem {
             // ===========================================================================
             // LAYER 4.9: ONTOLOGICAL RE-RANKING
             // ===========================================================================
-            // Boost memories connected to type-matching entities. Conservative additive
-            // boost on top of the fused score. Only active when ontological intent has
-            // sufficient confidence.
+            // Boost memories connected to type-matching entities, by a share of the fused
+            // score. Only active when ontological intent has sufficient confidence.
             //
             // Reference: Collins & Quillian (1969) — type-plausible paths retrieved faster
             // Pre-sort and limit candidates before expensive re-ranking.
@@ -2530,7 +2784,7 @@ impl super::MemorySystem {
                                         .onto_rerank_max
                                         .unwrap_or(crate::constants::ONTOLOGICAL_RERANK_MAX),
                                 );
-                                *fused_score += boost;
+                                *fused_score *= 1.0 + boost;
                                 boosted_count += 1;
                                 crate::metrics::ONTOLOGICAL_RERANK_BOOST_APPLIED
                                     .observe(boost as f64);
@@ -2541,11 +2795,12 @@ impl super::MemorySystem {
                                 // Memory has entities but NONE match expected types.
                                 // Apply penalty only at high confidence to avoid
                                 // punishing NER extraction gaps.
-                                *fused_score += self
-                                    .cognitive_dials
-                                    .read()
-                                    .onto_rerank_penalty
-                                    .unwrap_or(crate::constants::ONTOLOGICAL_RERANK_PENALTY);
+                                *fused_score *= 1.0
+                                    + self
+                                        .cognitive_dials
+                                        .read()
+                                        .onto_rerank_penalty
+                                        .unwrap_or(crate::constants::ONTOLOGICAL_RERANK_PENALTY);
                                 penalized_count += 1;
                             }
                         }
@@ -2619,7 +2874,7 @@ impl super::MemorySystem {
                 // Apply demotions
                 for (idx, penalty) in &demote_indices {
                     if let Some((_, score)) = res.get_mut(*idx) {
-                        *score -= penalty;
+                        *score *= 1.0 - penalty;
                         demoted += 1;
                     }
                 }
@@ -2804,11 +3059,11 @@ impl super::MemorySystem {
         > = std::cell::RefCell::new(std::collections::HashMap::new());
 
         for (memory_id, score) in memory_ids {
-            // Hebbian boost from learned graph weights (10% contribution)
-            // [signal: hebbian] Gated by disabled_signals dial; default = always on.
+            // Hebbian boost from learned graph weights: up to 10% of the fused score.
+            // [signal: hebbian] Gated by disabled_signals dial and the ablation family (off).
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
             let base_score = if hebbian_family_on && dials_snapshot.signal_enabled("hebbian") {
-                score + hebbian_boost * 0.1
+                score * (1.0 + hebbian_boost.clamp(0.0, 1.0) * 0.1)
             } else {
                 score
             };
@@ -3154,8 +3409,11 @@ impl super::MemorySystem {
                     1.0
                 };
 
-                let final_score = (base
-                    + recency_boost
+                // The signals are shares of the fused score, summed and then capped
+                // (shodh-memory #174): added to it, a recency or temporal term of 0.1-0.25 set the
+                // order outright over reciprocal-rank scores near 0.03, and a memory the fusion
+                // ranked last could pass every one above it.
+                let signal_share = recency_boost
                     + arousal_boost
                     + credibility_boost
                     + valence_boost
@@ -3170,7 +3428,9 @@ impl super::MemorySystem {
                     + temporal_density
                     + entity_density
                     + elaboration_boost
-                    + burstiness_boost)
+                    + burstiness_boost;
+                let final_score = base
+                    * (1.0 + signal_share).min(crate::constants::UNIFIED_SIGNAL_FACTOR_MAX)
                     * feedback_multiplier
                     * confidence_gate
                     * external_dim_multiplier;
@@ -3673,48 +3933,6 @@ impl super::MemorySystem {
         memories.truncate(query.max_results);
 
         // =====================================================================
-        // LAYER 5.7: CONFIDENCE GATING + SCORE-GAP PRUNING
-        // =====================================================================
-        // Category error detection: when retrieval confidence is low, return
-        // fewer results rather than padding with noise. This handles queries
-        // that are inherently unanswerable by recognizing the absence of a
-        // confident match. Score-gap pruning drops trailing noise results.
-        if memories.len() >= 2 {
-            let scores: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
-            let top_score = scores[0];
-
-            if top_score > 0.0 {
-                let mut keep = memories.len();
-                for i in 1..scores.len() {
-                    let ratio = scores[i] / top_score;
-                    // If result scores less than 25% of top score, it's noise
-                    if ratio < 0.25 {
-                        keep = i;
-                        break;
-                    }
-                    // If there's a >60% relative drop from previous, cut here
-                    if i >= 2 && scores[i - 1] > 0.0 {
-                        let step_ratio = scores[i] / scores[i - 1];
-                        if step_ratio < 0.40 {
-                            keep = i;
-                            break;
-                        }
-                    }
-                }
-                if keep < memories.len() {
-                    tracing::debug!(
-                        "Layer 5.7: Confidence pruning {} -> {} results (top={:.3}, cut={:.3})",
-                        memories.len(),
-                        keep,
-                        top_score,
-                        scores.get(keep).copied().unwrap_or(0.0)
-                    );
-                    memories.truncate(keep);
-                }
-            }
-        }
-
-        // =====================================================================
         // LAYER 5.8: ANSWER-TYPE SOFT FILTER
         // =====================================================================
         // Penalize memories whose ExperienceType doesn't match query intent.
@@ -3758,15 +3976,15 @@ impl super::MemorySystem {
         // =====================================================================
         // LAYER 5.85: LINGUISTIC BOOST (moved before 5.9 to avoid undoing pins)
         // =====================================================================
-        // Additive boost based on focal entity overlap. Must run BEFORE Layer 5.9
-        // ordinal resolution, because 5.9 pins memories to specific ranks and a
-        // post-pin re-sort would destroy those pins.
+        // Sort-key boost for focal entity overlap, 5% of the score per unit of matched IC
+        // weight. Must run BEFORE Layer 5.9 ordinal resolution, because 5.9 pins memories to
+        // specific ranks and a post-pin re-sort would destroy those pins.
         if !query_analysis.focal_entities.is_empty() {
             memories.sort_by(|a, b| {
                 let score_a = a.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05;
+                    * (1.0 + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05);
                 let score_b = b.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
+                    * (1.0 + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05);
                 score_b.total_cmp(&score_a)
             });
         }
@@ -6139,11 +6357,112 @@ impl<'s, S: CandidateSource + ?Sized> RecallCandidates<'s, S> {
     }
 }
 
+/// Layer 4.525's weight for a query word that matches the entities of `matching` of the `n`
+/// candidates carrying entities: `ln(n / matching) / ln(n)`, 1 for a word only one candidate
+/// carries and 0 for a word every candidate carries.
+fn entity_match_specificity(n: usize, matching: usize) -> f32 {
+    if n <= 1 || matching == 0 {
+        return 1.0;
+    }
+    ((n as f32 / matching as f32).ln() / (n as f32).ln()).clamp(0.0, 1.0)
+}
+
+/// Layer 4.525's share of a memory's own fused score for its entity matches: each word match
+/// is worth `ENTITY_OVERLAP_SHARE` times its specificity (`word_weight` is their sum), 0.4 of
+/// that on a decomposed query, whose generic stems ("perform") match many memories alike; each
+/// identifier match is worth the full share, decomposed or not. Four full matches are the cap.
+fn entity_overlap_share(word_weight: f32, identifiers: usize, decomposed: bool) -> f32 {
+    let share = crate::constants::ENTITY_OVERLAP_SHARE;
+    let per_word = if decomposed { 0.4 * share } else { share };
+    let words = (per_word * word_weight).min(4.0 * per_word);
+    (words + share * identifiers as f32).min(4.0 * share)
+}
+
+/// One hybrid-list candidate as Layer 4's FLAT fusion reads it.
+#[derive(Debug, Clone, Copy)]
+struct HybridComponents {
+    /// Raw BM25 score, 0 when only the vector list found it.
+    bm25: f32,
+    /// Raw vector-list score (cosine, or reciprocal rank on a decomposed query), 0 when
+    /// only BM25 found it.
+    vector: f32,
+    /// The factor the LLM refiner multiplied the hybrid score by; 1 when it did not run.
+    refined: f32,
+}
+
+/// The highest score in a fused list, the denominator FLAT calibrates the list against.
+fn best_leg_score(scores: impl Iterator<Item = f32>) -> f32 {
+    scores.filter(|s| s.is_finite()).fold(0.0, f32::max)
+}
+
+/// `score` over its list's best, in [0, 1]; 0 for a list with no positive score.
+fn calibrated(score: f32, best: f32) -> f32 {
+    if best > 0.0 && score.is_finite() {
+        (score / best).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// What one list adds to a candidate's fused score: `weight / (k + rank)` (rank from 1) under
+/// reciprocal rank, `weight × score / best` under FLAT.
+fn leg_term(mode: FusionMode, weight: f32, k: f32, rank: usize, score: f32, best: f32) -> f32 {
+    match mode {
+        FusionMode::Rrf => weight / (k + rank as f32),
+        FusionMode::Flat => weight * calibrated(score, best),
+    }
+}
+
+/// FLAT's join of a candidate's calibrated vector and BM25 scores: the stronger, plus
+/// `FLAT_CONSENSUS` of the weaker.
+fn flat_hybrid(vector: f32, bm25: f32) -> f32 {
+    let (strong, weak) = if vector >= bm25 {
+        (vector, bm25)
+    } else {
+        (bm25, vector)
+    };
+    strong + crate::constants::FLAT_CONSENSUS * weak
+}
+
+/// Under the `graph_candidates_only` dial, the fused terms of the graph hits no hybrid list
+/// returned, each scored as the vector list would have scored it: under FLAT its cosine over
+/// the best of theirs and `vector_best` (the vector list's best, read as a cosine), times the
+/// hybrid weight; under reciprocal rank, ranked after the `hybrid_len` hybrid candidates in
+/// cosine order. Nothing of the graph's own weighting enters.
+fn admitted_graph_hit_terms(
+    mode: FusionMode,
+    hybrid_w: f32,
+    k: f32,
+    hybrid_len: usize,
+    mut cosines: Vec<(&MemoryId, f32)>,
+    vector_best: Option<f32>,
+) -> Vec<(&MemoryId, f32)> {
+    cosines.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let best = best_leg_score(cosines.iter().map(|(_, c)| *c).chain(vector_best));
+    cosines
+        .into_iter()
+        .enumerate()
+        .map(|(r, (id, cos))| {
+            (
+                id,
+                leg_term(mode, hybrid_w, k, hybrid_len + r + 1, cos, best),
+            )
+        })
+        .collect()
+}
+
+/// The multiplier on a graph candidate's graph term for its activation.
+fn graph_activation_factor(graph_w: f32, activation: f32) -> f32 {
+    1.0 + graph_w * crate::constants::ACTIVATION_BONUS_SCALE * activation.clamp(0.0, 1.0)
+}
+
 /// Layer 4.54 (temporal topic dedup) over the `cap` highest fused scores: for each pair of
-/// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85.
+/// those whose lowercase entity sets have Jaccard > 0.40, the older is demoted ×0.85, once
+/// however many newer memories share its topic. Compounded per pair, the oldest memory on a
+/// busy topic fell by 0.85^n and left the top 50 entirely.
 /// Pairs are visited in content order: when two same-topic memories share a timestamp the
 /// second one visited is demoted, so the order must not come from the map's hash order.
-/// Returns the number of demotions.
+/// Returns the number of memories demoted.
 fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
     fused: &mut std::collections::HashMap<MemoryId, f32>,
     candidates: &RecallCandidates<'_, S>,
@@ -6171,7 +6490,7 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
         .map(|(_, _, view)| view.entities_lower.iter().map(String::as_str).collect())
         .collect();
 
-    let mut demoted = 0usize;
+    let mut older: HashSet<&MemoryId> = HashSet::new();
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
             let (set_a, set_b) = (&entity_sets[i], &entity_sets[j]);
@@ -6188,19 +6507,20 @@ fn temporal_topic_dedup<S: CandidateSource + ?Sized>(
                     entries[i].2.memory.created_at,
                     entries[j].2.memory.created_at,
                 );
-                let older_id = if ts_a < ts_b {
+                older.insert(if ts_a < ts_b {
                     &entries[i].0
                 } else {
                     &entries[j].0
-                };
-                if let Some(score) = fused.get_mut(older_id) {
-                    *score *= 0.85;
-                    demoted += 1;
-                }
+                });
             }
         }
     }
-    demoted
+    for id in &older {
+        if let Some(score) = fused.get_mut(*id) {
+            *score *= 0.85;
+        }
+    }
+    older.len()
 }
 
 /// Query words resolved to graph entities for recall.
@@ -6595,7 +6915,7 @@ mod signal_disable_gate_tests {
     }
 
     /// Simulates the hebbian gate on base_score.
-    /// When `hebbian` is disabled the 0.1× hebbian contribution is not added to base.
+    /// When `hebbian` is disabled the fused score does not take its 0.1× hebbian share.
     #[test]
     fn sd_c4_hebbian_gate_changes_base_score() {
         let rrf_score: f32 = 0.5;
@@ -6603,11 +6923,11 @@ mod signal_disable_gate_tests {
 
         let dials_enabled = CognitiveDials::default();
         let base_enabled = if dials_enabled.signal_enabled("hebbian") {
-            rrf_score + hebbian_score * 0.1
+            rrf_score * (1.0 + hebbian_score * 0.1)
         } else {
             rrf_score
         };
-        let expected = rrf_score + hebbian_score * 0.1;
+        let expected = rrf_score * (1.0 + hebbian_score * 0.1);
         assert!(
             (base_enabled - expected).abs() < 1e-6,
             "hebbian enabled: expected {expected}, got {base_enabled}"
@@ -6620,7 +6940,7 @@ mod signal_disable_gate_tests {
             ..Default::default()
         };
         let base_disabled = if dials_disabled.signal_enabled("hebbian") {
-            rrf_score + hebbian_score * 0.1
+            rrf_score * (1.0 + hebbian_score * 0.1)
         } else {
             rrf_score
         };
@@ -7007,8 +7327,159 @@ mod date_window_leg_tests {
 }
 
 #[cfg(test)]
+mod vector_rung_tests {
+    use super::*;
+    use crate::memory::{MemoryConfig, MemorySystem};
+    use rand::{Rng, SeedableRng};
+    use tempfile::TempDir;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn normalised(v: Vec<f32>) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.into_iter().map(|x| x / norm).collect()
+    }
+
+    /// A unit vector whose cosine with the unit vector `axis` is `cos`.
+    fn at_cosine(axis: &[f32], cos: f32, rng: &mut impl Rng) -> Vec<f32> {
+        let r: Vec<f32> = (0..axis.len()).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let along: f32 = r.iter().zip(axis).map(|(a, b)| a * b).sum();
+        let orthogonal = normalised(r.iter().zip(axis).map(|(a, b)| a - along * b).collect());
+        let sin = (1.0 - cos * cos).sqrt();
+        axis.iter()
+            .zip(&orthogonal)
+            .map(|(a, o)| cos * a + sin * o)
+            .collect()
+    }
+
+    fn remember_at(
+        sys: &MemorySystem,
+        content: &str,
+        entities: &[&str],
+        embedding: Vec<f32>,
+        day: u32,
+    ) -> MemoryId {
+        let created_at = chrono::NaiveDate::from_ymd_opt(2023, 5, day)
+            .expect("test date")
+            .and_hms_opt(12, 0, 0)
+            .expect("noon")
+            .and_utc();
+        sys.remember(
+            Experience {
+                experience_type: ExperienceType::Conversation,
+                content: content.to_string(),
+                entities: entities.iter().map(|e| e.to_string()).collect(),
+                embeddings: Some(embedding),
+                ..Default::default()
+            },
+            Some(created_at),
+        )
+        .expect("remember")
+    }
+
+    /// LoCoMo conv-26 shape: the turn the question asks about is the oldest and the longest,
+    /// and the turns nearer in time share the question's words and speaker. Every fusion
+    /// stage after the vector leg (temporal facts, entity overlap, the length penalty,
+    /// temporal topic dedup) prefers those; the vector rung must not run any of them.
+    #[test]
+    fn the_vector_rung_returns_the_stored_vectors_in_cosine_order() {
+        let (sys, _tmp) = fresh_system();
+        let dim = sys.get_embedder().dimension();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(26);
+        let query = normalised((0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect());
+
+        let mut by_cosine: Vec<(MemoryId, f32)> = Vec::new();
+        for i in 0..24u32 {
+            let cos = 0.9 - 0.03 * i as f32;
+            let embedding = at_cosine(&query, cos, &mut rng);
+            let id = if i < 12 {
+                remember_at(
+                    &sys,
+                    &format!(
+                        "Caroline: entry {i}, a long account of the evening at the community \
+                         centre, who spoke, what they said, how it felt, and what came after"
+                    ),
+                    &["Caroline", &format!("centre {i}")],
+                    embedding,
+                    1 + i,
+                )
+            } else {
+                remember_at(
+                    &sys,
+                    &format!("Caroline: support group {i}"),
+                    &["Caroline", "LGBTQ", "support group"],
+                    embedding,
+                    1 + i,
+                )
+            };
+            by_cosine.push((id, cos));
+        }
+
+        let recalled = sys
+            .recall(&Query {
+                user_id: Some("vector-rung-user".to_string()),
+                query_text: Some("When did Caroline go to the LGBTQ support group?".to_string()),
+                query_embedding: Some(query),
+                layers: Some(LayerMode::VamanaOnly),
+                max_results: 10,
+                ..Default::default()
+            })
+            .expect("recall");
+
+        let got: Vec<&MemoryId> = recalled.iter().map(|m| &m.id).collect();
+        let want: Vec<&MemoryId> = by_cosine.iter().take(10).map(|(id, _)| id).collect();
+        assert_eq!(got, want);
+        for (memory, (_, cos)) in recalled.iter().zip(&by_cosine) {
+            let score = memory.score.expect("scored");
+            assert!((score - cos).abs() < 1e-3, "score {score} for cosine {cos}");
+        }
+    }
+
+    #[test]
+    fn the_tier_scan_returns_only_memories_the_vector_index_does_not_hold() {
+        let (sys, _tmp) = fresh_system();
+        let dim = sys.get_embedder().dimension();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(35);
+        let query = normalised((0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect());
+        let indexed = remember_at(
+            &sys,
+            "Melanie: we went camping",
+            &["Melanie"],
+            at_cosine(&query, 0.8, &mut rng),
+            1,
+        );
+        let unindexed = remember_at(
+            &sys,
+            "Melanie: the kids loved the lake",
+            &["Melanie"],
+            at_cosine(&query, 0.7, &mut rng),
+            2,
+        );
+        assert!(sys.retriever.has_mapping(&indexed));
+        assert!(sys.retriever.remove_memory(&unindexed));
+
+        let index_space = sys.retriever.index_space().clone();
+        let hits = sys.unindexed_tier_hits(&query, &index_space, &[], &HashSet::new());
+        let ids: Vec<&MemoryId> = hits.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![&unindexed]);
+        assert!((hits[0].1 - 0.7).abs() < 1e-3);
+    }
+}
+
+#[cfg(test)]
 mod candidate_projection_tests {
-    use super::{temporal_topic_dedup, CandidateSource, CandidateTier, RecallCandidates};
+    use super::{
+        entity_match_specificity, temporal_topic_dedup, CandidateSource, CandidateTier,
+        RecallCandidates,
+    };
     use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, SharedMemory};
     use anyhow::Result;
     use std::cell::RefCell;
@@ -7138,6 +7609,22 @@ mod candidate_projection_tests {
     }
 
     #[test]
+    fn an_entity_word_weighs_by_how_few_candidates_carry_it() {
+        assert_eq!(entity_match_specificity(200, 1), 1.0);
+        assert_eq!(entity_match_specificity(200, 200), 0.0);
+        let speaker_name = entity_match_specificity(200, 100);
+        let topic = entity_match_specificity(200, 5);
+        assert!(speaker_name < 0.15, "{speaker_name}");
+        assert!(topic > 0.65, "{topic}");
+        assert_eq!(
+            entity_match_specificity(1, 1),
+            1.0,
+            "one candidate: nothing to compare"
+        );
+        assert_eq!(entity_match_specificity(0, 0), 1.0);
+    }
+
+    #[test]
     fn temporal_dedup_compares_only_the_top_candidates() {
         let mut source = CountingSource::default();
         let base = chrono::Utc::now() - chrono::Duration::days(100);
@@ -7155,19 +7642,18 @@ mod candidate_projection_tests {
 
         let demoted = temporal_topic_dedup(&mut fused, &candidates, 50);
         assert_eq!(
-            demoted,
-            50 * 49 / 2,
-            "every pair among the top 50 overlaps fully"
+            demoted, 49,
+            "every compared memory but the newest has a newer one on its topic"
         );
         for id in &by_rank[..10] {
             assert_eq!(fused[id], before[id], "below the cap, nothing is compared");
         }
-        // The newest of the compared set loses no pair; the oldest of it loses every one.
         let newest = &by_rank[59];
         assert_eq!(fused[newest], before[newest]);
-        let oldest_compared = &by_rank[10];
-        let expected = before[oldest_compared] * 0.85_f32.powi(49);
-        assert!((fused[oldest_compared] - expected).abs() < 1e-4);
+        // The oldest compared memory loses to 49 newer ones and is still demoted only once.
+        for id in &by_rank[10..59] {
+            assert!((fused[id] - before[id] * 0.85).abs() < 1e-4);
+        }
     }
 }
 
@@ -7261,6 +7747,222 @@ mod query_entity_resolution_tests {
         assert!(
             none.file_paths.is_empty(),
             "no path-shaped word, no declared file"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+
+    const EPS: f32 = 1e-6;
+
+    #[test]
+    fn flat_scores_a_list_by_how_close_a_candidate_is_to_its_best() {
+        // Rank does not enter: the same score over the same best is the same term at rank 1
+        // and rank 50, so a leg's length cannot change what fusion believes of a candidate.
+        let at_1 = leg_term(FusionMode::Flat, 0.7, 20.0, 1, 0.45, 0.6);
+        let at_50 = leg_term(FusionMode::Flat, 0.7, 20.0, 50, 0.45, 0.6);
+        assert!((at_1 - 0.7 * 0.75).abs() < EPS);
+        assert_eq!(at_1, at_50);
+        // A list's best enters at the list's weight, not weight / (k + 1).
+        assert!((leg_term(FusionMode::Flat, 0.3, 20.0, 1, 0.9, 0.9) - 0.3).abs() < EPS);
+        assert!((leg_term(FusionMode::Rrf, 0.3, 20.0, 1, 0.9, 0.9) - 0.3 / 21.0).abs() < EPS);
+        assert!((leg_term(FusionMode::Rrf, 0.3, 20.0, 10, 0.1, 0.9) - 0.3 / 30.0).abs() < EPS);
+    }
+
+    #[test]
+    fn calibration_is_bounded_and_safe_on_an_empty_list() {
+        assert_eq!(calibrated(0.5, 0.0), 0.0);
+        assert_eq!(calibrated(f32::NAN, 1.0), 0.0);
+        assert_eq!(calibrated(-0.2, 0.8), 0.0);
+        assert_eq!(calibrated(0.8, 0.8), 1.0);
+        assert_eq!(best_leg_score(std::iter::empty()), 0.0);
+        assert_eq!(best_leg_score([0.2, f32::NAN, 0.7].into_iter()), 0.7);
+    }
+
+    #[test]
+    fn a_candidate_one_list_is_sure_of_beats_a_crowd_both_lists_half_match() {
+        // The burial FLAT exists to undo: vector's best, absent from BM25, against a
+        // candidate both lists put at 0.6 of their best.
+        let single = flat_hybrid(1.0, 0.0);
+        let crowd = flat_hybrid(0.6, 0.6);
+        assert!((single - 1.0).abs() < EPS);
+        assert!((crowd - (0.6 + 0.3 * 0.6)).abs() < EPS);
+        assert!(single > crowd);
+        // Both lists finding a candidate is still worth something over one list.
+        assert!(flat_hybrid(0.8, 0.5) > flat_hybrid(0.8, 0.0));
+        // Symmetric in the two lists.
+        assert_eq!(flat_hybrid(0.3, 0.9), flat_hybrid(0.9, 0.3));
+    }
+
+    #[test]
+    fn an_entity_match_is_a_bounded_share_of_the_memorys_own_score() {
+        let share = crate::constants::ENTITY_OVERLAP_SHARE;
+        assert_eq!(entity_overlap_share(0.0, 0, false), 0.0);
+        assert!((entity_overlap_share(1.0, 0, false) - share).abs() < EPS);
+        assert!((entity_overlap_share(0.5, 0, false) - 0.5 * share).abs() < EPS);
+        // A decomposed query's word matches count for 0.4; an identifier counts in full.
+        assert!((entity_overlap_share(1.0, 0, true) - 0.4 * share).abs() < EPS);
+        assert!((entity_overlap_share(0.0, 1, true) - share).abs() < EPS);
+        // Four full matches of either kind are the cap, decomposed or not.
+        assert!((entity_overlap_share(10.0, 0, false) - 4.0 * share).abs() < EPS);
+        assert!((entity_overlap_share(3.0, 3, false) - 4.0 * share).abs() < EPS);
+        assert!((entity_overlap_share(0.0, 9, true) - 4.0 * share).abs() < EPS);
+        assert!((entity_overlap_share(10.0, 0, true) - 1.6 * share).abs() < EPS);
+    }
+
+    #[test]
+    fn an_admitted_graph_hit_scores_as_the_vector_list_would_have() {
+        let (a, b) = (
+            MemoryId(uuid::Uuid::new_v4()),
+            MemoryId(uuid::Uuid::new_v4()),
+        );
+        // FLAT: cosine over the vector list's best, at the hybrid weight, so an admitted hit
+        // never outscores the list's own best.
+        let flat = admitted_graph_hit_terms(
+            FusionMode::Flat,
+            0.7,
+            20.0,
+            40,
+            vec![(&a, 0.3), (&b, 0.45)],
+            Some(0.6),
+        );
+        assert_eq!(flat[0].0, &b, "cosine order");
+        assert!((flat[0].1 - 0.7 * 0.75).abs() < EPS);
+        assert!((flat[1].1 - 0.7 * 0.5).abs() < EPS);
+        // With no vector best to read, the hits calibrate among themselves.
+        let alone = admitted_graph_hit_terms(FusionMode::Flat, 0.7, 20.0, 0, vec![(&a, 0.3)], None);
+        assert!((alone[0].1 - 0.7).abs() < EPS);
+        // Reciprocal rank: after the 40 hybrid candidates, in cosine order.
+        let rrf = admitted_graph_hit_terms(
+            FusionMode::Rrf,
+            0.7,
+            20.0,
+            40,
+            vec![(&a, 0.3), (&b, 0.45)],
+            Some(0.6),
+        );
+        assert_eq!(rrf[0].0, &b);
+        assert!((rrf[0].1 - 0.7 / 61.0).abs() < EPS);
+        assert!((rrf[1].1 - 0.7 / 62.0).abs() < EPS);
+    }
+
+    #[test]
+    fn graph_activation_multiplies_the_graph_term_within_a_bound() {
+        assert!((graph_activation_factor(0.5, 1.0) - 1.15).abs() < EPS);
+        assert!((graph_activation_factor(0.1, 1.0) - 1.03).abs() < EPS);
+        assert_eq!(
+            graph_activation_factor(0.5, 7.0),
+            graph_activation_factor(0.5, 1.0)
+        );
+        assert_eq!(graph_activation_factor(0.0, 1.0), 1.0);
+        assert_eq!(graph_activation_factor(0.5, -1.0), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod owner_scope_tests {
+    use super::*;
+    use crate::memory::{MemoryConfig, MemorySystem};
+
+    /// Sets an env var for the scope of the guard and restores it on drop, so a failed
+    /// expectation cannot leave recall read-only for the rest of the test process.
+    struct EnvVar(&'static str, Option<String>);
+
+    impl EnvVar {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self(name, previous)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    fn score_of(sys: &MemorySystem, user_id: Option<&str>, id: &MemoryId) -> f32 {
+        let query = Query {
+            user_id: user_id.map(str::to_string),
+            query_text: Some("When did Melanie run a marathon?".to_string()),
+            max_results: 5,
+            ..Default::default()
+        };
+        sys.recall(&query)
+            .expect("recall")
+            .iter()
+            .find(|m| &m.id == id)
+            .and_then(|m| m.score)
+            .expect("the fact's source is recalled")
+    }
+
+    /// A recall that names no user, on a system that knows its owner, runs the owner's fact
+    /// layers: the temporal fact stored for the owner boosts its source memory exactly as a
+    /// recall naming the owner does, and an unowned system's recall does not. A regression
+    /// in the owner match at the top of `recall()` scores the source as the unowned recall.
+    #[test]
+    fn a_userless_recall_on_an_owned_system_runs_the_owners_fact_layers() {
+        let _env = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Read-only recall writes no access counts or activation, so the three recalls below
+        // differ only in which user they run as.
+        let _readonly = EnvVar::set("VELD_RECALL_READONLY", "1");
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut sys = MemorySystem::new(
+            MemoryConfig {
+                storage_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        let content = "Melanie ran a marathon yesterday";
+        let entities = vec!["Melanie".to_string()];
+        let source = sys
+            .remember(
+                Experience {
+                    content: content.to_string(),
+                    entities: entities.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember");
+        sys.remember(
+            Experience {
+                content: "Caroline went to a support group meeting".to_string(),
+                entities: vec!["Caroline".to_string()],
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("remember");
+        let created_at = sys.get_memory(&source).expect("stored").created_at;
+        let stored = sys
+            .store_temporal_facts_for_memory("alice", &source, content, &entities, created_at)
+            .expect("store temporal facts");
+        assert!(stored > 0, "the content must yield a temporal fact");
+
+        let unowned = score_of(&sys, None, &source);
+        sys.set_owner_user_id("alice");
+        let scoped = score_of(&sys, None, &source);
+        let named = score_of(&sys, Some("alice"), &source);
+
+        assert!(
+            (scoped - named).abs() < 1e-6,
+            "a user-less recall on alice's system must score as alice's recall: {scoped} vs {named}"
+        );
+        assert!(
+            scoped > unowned,
+            "the owner's temporal fact must boost its source: {scoped} owned vs {unowned} unowned"
         );
     }
 }

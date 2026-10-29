@@ -1594,6 +1594,30 @@ pub fn asks_for_temporal_answer(query: &str) -> bool {
     matches!(detect_temporal_intent(query), TemporalIntent::WhenQuestion)
 }
 
+/// Whether the query asks for the newest state of something ("what is X using now?",
+/// "the latest release"), where a newer memory on the same topic supersedes an older one.
+/// "When did X happen?" is not recency intent: it asks for the memory where X happened.
+pub fn has_recency_intent(query: &str) -> bool {
+    const PHRASES: &[&str] = &["most recent", "these days", "the last time", "as of now"];
+    const WORDS: &[&str] = &[
+        "latest",
+        "lately",
+        "recent",
+        "recently",
+        "current",
+        "currently",
+        "now",
+        "nowadays",
+        "still",
+        "anymore",
+    ];
+    let lower = query.to_lowercase();
+    PHRASES.iter().any(|p| lower.contains(p))
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| WORDS.contains(&w))
+}
+
 // ============================================================================
 // B4: TEMPORAL ANSWER-DERIVATION
 // ============================================================================
@@ -5595,6 +5619,30 @@ fn clean_sub_query(part: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recency_intent_is_a_question_about_the_newest_state_not_any_when() {
+        for q in [
+            "What is Caroline's latest painting?",
+            "Is Melanie still running?",
+            "Which database are we using now?",
+            "What has Jon been doing lately?",
+            "When was the last time Gina went to Paris?",
+            "Does Nate play the guitar anymore?",
+        ] {
+            assert!(has_recency_intent(q), "{q}");
+        }
+        for q in [
+            "When did Caroline go to the LGBTQ support group?",
+            "When is Melanie planning on going camping?",
+            "What did Jon do in May 2023?",
+            "How long has Gina known her friends?",
+            "Who knows the stillwater trail?",
+            "What did John know about the recentering exercise?",
+        ] {
+            assert!(!has_recency_intent(q), "{q}");
+        }
+    }
 
     #[test]
     fn test_noun_detection() {

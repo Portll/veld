@@ -1157,16 +1157,17 @@ pub const ONTOLOGICAL_ENTITY_PENALTY: f32 = 0.6;
 /// Uses same scale as entities_average_density() (edges per entity).
 pub const ONTOLOGICAL_DENSITY_THRESHOLD: f32 = 8.0;
 
-/// Post-RRF boost per type-matching entity connected to a memory (Layer 4.9).
-/// Additive on fused score. 0.15 per match, max 0.40.
+/// Post-fusion boost per type-matching entity connected to a memory (Layer 4.9), as a share
+/// of the memory's fused score. 0.15 per match, max 0.40.
 /// Increased from 0.08/0.25 to strengthen WH-word gravity signal:
 /// WHERE→Location, WHO→Person, WHEN→Temporal entities get meaningful advantage.
 pub const ONTOLOGICAL_RERANK_BOOST: f32 = 0.15;
 
-/// Maximum ontological re-rank boost per memory.
+/// Maximum ontological re-rank boost per memory, as a share of its fused score.
 pub const ONTOLOGICAL_RERANK_MAX: f32 = 0.40;
 
-/// Penalty for memories with ZERO type-matching entities (Layer 4.9).
+/// Penalty for memories with ZERO type-matching entities (Layer 4.9), as a share of the
+/// memory's fused score.
 /// Applied only when ontological intent has expected_labels AND the memory
 /// has entity_refs but none match. Asymmetric gating: penalties require
 /// higher confidence than boosts to avoid punishing entity extraction gaps.
@@ -2420,13 +2421,38 @@ pub const SEMANTIC_CLUSTER_THRESHOLD: f32 = 0.75;
 /// - Longer windows would merge unrelated sessions
 pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 
-/// Additive RRF boost for memories whose IDs appear in temporal fact matches.
+/// Layer 4.525's boost for one query word that matches a memory's entities, as a share of the
+/// memory's fused score, before the word is weighted by how few candidates carry it
+/// (`entity_match_specificity`). An identifier match counts as one full-weight word. Four
+/// full-weight matches are the cap, a factor of 9.
+pub const ENTITY_OVERLAP_SHARE: f32 = 2.0;
+
+/// Boost for memories whose IDs appear in temporal fact matches, as a share of the memory's
+/// fused score.
 ///
 /// Applied in Layer 4.55 when the query has temporal intent and
 /// TemporalFactStore returns facts whose `source_memory_id` matches a
-/// candidate.  0.20 is calibrated to lift temporal-source memories by ~2
-/// RRF positions without overriding strong semantic matches.
+/// candidate. A source memory the fusion did not find is not added.
 pub const TEMPORAL_RECALL_BOOST: f32 = 0.20;
+
+/// Layer 4.5: share of its fused score a memory gains when it holds both the entity and a
+/// value of the attribute an attribute query asks about ("Caroline is single" for "what is
+/// Caroline's relationship status?"). Upstream's value from #174, where the boost became a
+/// factor (2.5x); it had been an absolute 0.5, 31 times a typical reciprocal-rank score, and
+/// it also added matching memories the fusion had not found.
+pub const ATTRIBUTE_QUERY_BOOST: f32 = 1.5;
+
+/// Layer 4.52: share of its fused score a Decision-type memory gains on a decision query
+/// ("which ... did we choose"). It was an absolute 0.15, about four top reciprocal-rank
+/// scores, which put every Decision memory above every other candidate; the query test it
+/// fires on matches "what ... use" as well, so it is held well under the attribute share.
+pub const DECISION_TYPE_BOOST: f32 = 0.5;
+
+/// Layer 4.7: share of its fused score a memory gains per matching prospective-signal term,
+/// times the square root of the match count, capped at [`PROSPECTIVE_BOOST_MAX`]
+/// (shodh-memory #174; additive 0.15 per match, max 0.5, before it).
+pub const PROSPECTIVE_BOOST_PER_MATCH: f32 = 0.25;
+pub const PROSPECTIVE_BOOST_MAX: f32 = 0.75;
 
 /// Minimum inter-memory gap (seconds) marking a session boundary.
 /// Haar wavelet coefficient at this scale exceeds threshold iff gap > 7200s.
@@ -2825,13 +2851,40 @@ pub const QUERY_COVERAGE_MIN_TERMS: usize = 2;
 pub const PEOPLE_BOOST_MAX: f32 = 0.0;
 
 /// Pseudo-relevance feedback: a second lexical pass whose query is the original plus terms
-/// shared by the first pass's top documents, fused as its own reciprocal-rank leg at
-/// [`PRF_WEIGHT`] of the hybrid weight. Pulls in siblings of strong hits that share their
-/// vocabulary but not the query's.
+/// shared by the first pass's top documents, fused as its own leg at [`PRF_WEIGHT`] of the
+/// hybrid weight. Pulls in siblings of strong hits that share their vocabulary but not the
+/// query's.
 pub const PRF_ENABLED_DEFAULT: bool = false;
 pub const PRF_DOCS: usize = 3;
 pub const PRF_TERMS: usize = 5;
 pub const PRF_WEIGHT: f32 = 0.3;
+
+/// FLAT fusion (recall Layer 4, shodh-memory #320): the share of the weaker of a candidate's
+/// two calibrated hybrid scores, vector and BM25, added to the stronger. The stronger alone
+/// keeps a candidate one list ranks well from being buried by the other list's crowd; the
+/// share is the credit for both lists finding it. Upstream's value. Upstream measured FLAT
+/// against reciprocal-rank fusion at +0.0665 recall@10 on its LoCoMo run, and on veld's
+/// 100-case gate (2026-10-24, rule-based NER) at recall@10 0.664 against 0.622, p@1 0.48
+/// against 0.50.
+///
+/// FLAT is not veld's default. On the LoCoMo hold-out (1,166 cases, paired against main
+/// 351f02a1, run 40686627313) FLAT scored p@1 -0.0497 [-0.0695, -0.0300] and recall@10
+/// +0.0317, lower on every category (run 40832148811); reciprocal rank under the same bounded
+/// boosts scored p@1 +0.0232 [+0.0077, +0.0395] and recall@10 +0.0431 (run 40832157818).
+pub const FLAT_CONSENSUS: f32 = 0.3;
+
+/// Graph activation bonus in recall Layer 4 (shodh-memory #174): a graph candidate's graph
+/// term is multiplied by `1 + graph_w × this × activation`, activation clamped to [0, 1].
+/// A fully activated hit gains 3% at the densest graph's weight (0.1) and 15% at the
+/// sparsest's (0.5). It replaced an additive `0.2 × graph_w × activation`, up to 0.1,
+/// which outweighed every reciprocal-rank score the fusion produced.
+pub const ACTIVATION_BONUS_SCALE: f32 = 0.3;
+
+/// Cap on the recall Layer 5 factor `1 + Σ signal shares` that multiplies a fused score
+/// (upstream's 2.5, #174). Under default constants the shares sum to at most about 1.3, with
+/// an explicit-recency query's 0.5 recency term, so the cap bites only on a caller's
+/// `recency_weight`, which is unbounded.
+pub const UNIFIED_SIGNAL_FACTOR_MAX: f32 = 2.5;
 
 /// Duration of the reconsolidation labile window in seconds.
 ///

@@ -53,6 +53,39 @@ fn default_working_memory_threshold() -> u32 {
 /// (each `MemorySystem` opens that user's own database), so a bare key is sufficient.
 pub const COGNITIVE_DIALS_KEY: &[u8] = b"cognitive_dials";
 
+/// How recall Layer 4 joins its candidate lists into one fused score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FusionMode {
+    /// Calibrated max (shodh-memory's FLAT fusion, #320). Each list enters at its weight
+    /// times the candidate's score over the list's best score; the vector and BM25 lists
+    /// join as the larger of the two plus [`crate::constants::FLAT_CONSENSUS`] of the
+    /// smaller. Not the default: on veld's LoCoMo hold-out it cost p@1 (see
+    /// [`crate::constants::FLAT_CONSENSUS`]).
+    Flat,
+    /// Reciprocal rank, the default: each list adds `weight / (k + rank)`, with k from
+    /// `rrf_k_outer`.
+    Rrf,
+}
+
+impl FusionMode {
+    /// Parses `flat` or `rrf`, in any case.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "flat" => Some(Self::Flat),
+            "rrf" => Some(Self::Rrf),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Rrf => "rrf",
+        }
+    }
+}
+
 /// Runtime-tunable cognitive parameters for a single user's [`crate::memory::MemorySystem`].
 ///
 /// See the module docs. All reconsolidation toggles default OFF; all retrieval overrides
@@ -154,11 +187,26 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub date_window_leg: Option<bool>,
 
+    /// How recall Layer 4 fuses its candidate lists. `None` is [`FusionMode::Rrf`] unless
+    /// `SHODH_FUSION_FLAT` asks for FLAT ([`crate::memory::ablation`]); a set dial wins over
+    /// that variable.
+    #[serde(default)]
+    pub fusion: Option<FusionMode>,
+
+    /// Whether the graph leg only admits candidates to recall Layer 4. A graph hit joins the
+    /// pool, but its fused score comes from the vector and BM25 lists alone: a hit neither list
+    /// returned is scored as the vector list would have scored it, its cosine over the list's
+    /// best, and the graph's activation and hop weight add nothing anywhere. `None` and
+    /// `Some(false)` score the graph leg.
+    #[serde(default)]
+    pub graph_candidates_only: Option<bool>,
+
     // ---- Recall ranking sliders (None = compile-time constant default) ---------------
     // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
     // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
     // each one's default / recommended / absolute range.
-    /// RRF k for the outer graph+hybrid fusion (recall.rs Layer 4). Default 20.
+    /// RRF k for the outer graph+hybrid fusion (recall.rs Layer 4), read only under
+    /// [`FusionMode::Rrf`]. Default 20.
     #[serde(default)]
     pub rrf_k_outer: Option<f32>,
     /// RRF k for the decomposed sub-query merge. Default 20.
@@ -184,13 +232,15 @@ pub struct CognitiveDials {
     /// BM25 minimum-score floor for lexical candidates. Default 0.1.
     #[serde(default)]
     pub bm25_min_score: Option<f32>,
-    /// Ontological rerank boost per entity-label match. Default 0.15.
+    /// Ontological rerank boost per entity-label match, as a share of the memory's fused
+    /// score. Default 0.15.
     #[serde(default)]
     pub onto_rerank_boost: Option<f32>,
-    /// Ontological rerank boost cap. Default 0.40.
+    /// Ontological rerank boost cap, as a share of the fused score. Default 0.40.
     #[serde(default)]
     pub onto_rerank_max: Option<f32>,
-    /// Ontological rerank mismatch penalty (negative). Default -0.08.
+    /// Ontological rerank mismatch penalty (negative), as a share of the fused score: -1
+    /// zeroes it. Default -0.08.
     #[serde(default)]
     pub onto_rerank_penalty: Option<f32>,
     /// Cross-encoder share of the Layer 5.3 blend for every query shape at once, except that
@@ -198,7 +248,7 @@ pub struct CognitiveDials {
     /// and `constants::CE_BLEND_*` decide. See `ce_share`.
     #[serde(default)]
     pub ce_blend: Option<f32>,
-    /// Temporal-fact source-memory boost. Default 0.20.
+    /// Temporal-fact source-memory boost, as a share of the memory's fused score. Default 0.20.
     #[serde(default)]
     pub temporal_recall_boost: Option<f32>,
     /// Cross-encoder share for one query shape; each overrides its `constants::CE_BLEND_*`
@@ -270,7 +320,8 @@ pub struct CognitiveDials {
     /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
-    /// `people_density`, `prf`.
+    /// `people_density`, `prf`, `entity_overlap`, `length_penalty`,
+    /// `temporal_topic_dedup`, `temporal_fact_boost`, `temporal_fact_untimed_fallback`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
 }
@@ -638,6 +689,8 @@ impl Default for CognitiveDials {
             rerank_model: None,
             rrf_weights: None,
             date_window_leg: None,
+            fusion: None,
+            graph_candidates_only: None,
             rrf_k_outer: None,
             rrf_k_decomp: None,
             rrf_k_inner: None,
@@ -809,7 +862,8 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG,
+    /// FUSION,GRAPH_CANDIDATES_ONLY}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -869,6 +923,22 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_DATE_WINDOW_LEG") {
             d.date_window_leg = Some(v);
+        }
+        // Empty is unset in both, as the recall gate passes an unused workflow input.
+        if let Some(v) = std::env::var("VELD_DIALS_GRAPH_CANDIDATES_ONLY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            let v = v.trim();
+            d.graph_candidates_only = Some(v.eq_ignore_ascii_case("true") || v == "1");
+        }
+        if let Ok(raw) = std::env::var("VELD_DIALS_FUSION") {
+            if !raw.trim().is_empty() {
+                d.fusion = FusionMode::parse(&raw);
+                if d.fusion.is_none() {
+                    tracing::warn!("VELD_DIALS_FUSION={raw:?} is neither flat nor rrf (ignored)");
+                }
+            }
         }
         // Recall sliders — VELD_TUNE_* (unset keeps the const default).
         d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
@@ -986,6 +1056,8 @@ mod tests {
         assert!(d.rerank_model.is_none());
         assert!(d.rrf_weights.is_none());
         assert!(d.date_window_leg.is_none());
+        assert!(d.fusion.is_none());
+        assert!(d.graph_candidates_only.is_none());
         assert_eq!(
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS
@@ -1046,6 +1118,11 @@ mod tests {
             "people_density",
             "prf",
             "duplicate_derank",
+            "entity_overlap",
+            "length_penalty",
+            "temporal_topic_dedup",
+            "temporal_fact_boost",
+            "temporal_fact_untimed_fallback",
         ];
         for id in &all_ids {
             assert!(
@@ -1177,6 +1254,19 @@ mod tests {
         }
         .sanitized();
         assert_eq!(empty.rerank_model, None);
+    }
+
+    #[test]
+    fn fusion_dial_parses_and_round_trips() {
+        assert_eq!(FusionMode::parse(" RRF "), Some(FusionMode::Rrf));
+        assert_eq!(FusionMode::parse("flat"), Some(FusionMode::Flat));
+        assert_eq!(FusionMode::parse("sum"), None);
+        let d: CognitiveDials = serde_json::from_str(r#"{"fusion": "rrf"}"#).unwrap();
+        assert_eq!(d.fusion, Some(FusionMode::Rrf));
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""fusion":"rrf""#), "{json}");
+        let older: CognitiveDials = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.fusion, None);
     }
 
     #[test]

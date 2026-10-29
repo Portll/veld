@@ -389,6 +389,14 @@ pub struct MemorySystem {
     /// and suppress frequently-ignored memories (up to 20% penalty for negative momentum)
     feedback_store: Option<Arc<parking_lot::RwLock<FeedbackStore>>>,
 
+    /// The tenant this system belongs to, set by the manager, which opens one
+    /// MemorySystem per user and otherwise keeps the id only in its cache key.
+    /// Without it an in-process recall that names no user (the recall harness)
+    /// skipped every per-user fact layer the HTTP path runs. The Python bindings
+    /// build their system directly and hold no user id, so their recall still
+    /// runs unscoped unless the query names one.
+    owner_user_id: Option<String>,
+
     /// External dimension scores (Spine): topological health of the knowledge graph.
     /// Pushed by Spine via `/api/spine/dimensions` (`/api/sleight/dimensions` is a
     /// retained alias), read during Layer 5 scoring.
@@ -1709,6 +1717,7 @@ impl MemorySystem {
             graph_memory: None,
             // Feedback store is optional - wire up with set_feedback_store() for momentum scoring (PIPE-9)
             feedback_store: None,
+            owner_user_id: None,
             // External dimension scores (Sleight): initialized empty, populated via API push
             external_scores: Arc::new(parking_lot::RwLock::new(None)),
             // Persistent learning history for retrieval boosting
@@ -1829,6 +1838,16 @@ impl MemorySystem {
     /// This provides consistent feedback integration across all retrieval paths.
     pub fn set_feedback_store(&mut self, feedback: Arc<parking_lot::RwLock<FeedbackStore>>) {
         self.feedback_store = Some(feedback);
+    }
+
+    /// Record the tenant this system belongs to; a recall that names no user is then
+    /// scoped to this one, as the HTTP handler scopes every recall.
+    pub fn set_owner_user_id(&mut self, user_id: impl Into<String>) {
+        self.owner_user_id = Some(user_id.into());
+    }
+
+    pub fn owner_user_id(&self) -> Option<&str> {
+        self.owner_user_id.as_deref()
     }
 
     /// Get reference to the optional feedback store
