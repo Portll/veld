@@ -5766,8 +5766,18 @@ impl MemorySystem {
     /// Such a snapshot takes the stored vector when the stored record has the same
     /// content, else a vector embedded here.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
+        self.upsert_snapshots(memories)
+            .map(|refitted| refitted.len())
+    }
+
+    /// [`Self::upsert_memories`], returning for each of `memories`, in order, the record
+    /// as stored when its vector was refitted and `None` when it was stored as given. A
+    /// caller that journals the snapshots journals the refitted ones, so its log holds
+    /// what its store holds.
+    pub fn upsert_snapshots(&self, memories: &[Memory]) -> Result<Vec<Option<Memory>>> {
         let mut fitted: Vec<Memory> = Vec::with_capacity(memories.len());
         let mut vectors_kept: Vec<bool> = Vec::with_capacity(memories.len());
+        let mut refitted: Vec<Option<Memory>> = Vec::with_capacity(memories.len());
         for memory in memories {
             let indexed = self.retriever.is_indexed(&memory.id);
             let foreign = memory
@@ -5781,7 +5791,12 @@ impl MemorySystem {
             } else {
                 None
             };
-            let memory = self.fit_snapshot_vector(memory, stored.as_ref());
+            let given = memory;
+            let memory = self.fit_snapshot_vector(given, stored.as_ref());
+            refitted.push(
+                (memory.experience.embeddings != given.experience.embeddings)
+                    .then(|| memory.clone()),
+            );
             // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
             // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
             // them, and a replica applying every snapshot grew 18.7 vectors per memory.
@@ -5830,7 +5845,7 @@ impl MemorySystem {
                 }
             }
         }
-        Ok(memories.len())
+        Ok(refitted)
     }
 
     /// `memory` with a primary vector this store's index can hold: its own when it fits,

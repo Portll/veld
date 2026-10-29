@@ -587,7 +587,8 @@ fn check_tenant(user_id: &str, frames: &[(u64, IntentPayload)]) -> Result<()> {
 }
 
 /// Follower side: apply a page of leader frames to the canonical store, then
-/// journal the applied frames here, as one batch, so the local projections and log follow. The
+/// journal the applied frames here, as one batch, so the local projections and log follow
+/// (a snapshot whose vector was refitted to this index is journaled as stored). The
 /// page is coalesced first; the BM25 projection indexes snapshots as their frames
 /// are journaled, on its own commit cadence. Idempotent:
 /// a snapshot is an upsert, a forget of an unknown id is a no-op. Returns the
@@ -629,14 +630,43 @@ pub fn apply_replicated_page(
             snapshots.push(memory);
         }
     }
-    memory_sys.read().upsert_memories(&snapshots)?;
+    let refitted = memory_sys.read().upsert_snapshots(&snapshots)?;
+    // The local log records what the store holds: a snapshot whose vector was refitted
+    // is journaled refitted, so this instance's projections, and a replay of its own
+    // log, see the vector its index holds. A coalesced page has one snapshot per id.
+    let mut refitted_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    for memory in refitted.into_iter().flatten() {
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
+            .map_err(|e| anyhow!("encoding the refitted snapshot of {}: {e}", memory.id.0))?;
+        refitted_bytes.insert(memory.id.0.to_string(), bytes);
+    }
     for (_, payload) in &frames {
         apply_non_snapshot(manager, user_id, payload)?;
     }
     // One writer lock, append batch and fsync for the page rather than one per frame.
     // All or nothing: a page that fails journals no frame, and its retry adds no
     // duplicates of the frames before the failure.
-    let payloads: Vec<IntentPayload> = frames.into_iter().map(|(_, payload)| payload).collect();
+    let payloads: Vec<IntentPayload> = frames
+        .into_iter()
+        .map(|(_, mut payload)| {
+            if let IntentPayload::Remember {
+                memory_id,
+                memory_bincode,
+                ..
+            }
+            | IntentPayload::Update {
+                memory_id,
+                memory_bincode,
+                ..
+            } = &mut payload
+            {
+                if let Some(bytes) = refitted_bytes.remove(memory_id.as_str()) {
+                    *memory_bincode = bytes;
+                }
+            }
+            payload
+        })
+        .collect();
     Ok(manager.journal_and_apply_batch(user_id, &payloads)?.len() as u64)
 }
 
@@ -1969,6 +1999,33 @@ mod tests {
             assert_eq!(vector_indexed, stored, "{what}: index coverage");
         };
         indexed_with_fitting_vector("first page");
+        let journaled_vector_lengths = || -> Vec<usize> {
+            let writer = follower.get_user_journaled_writer(user).unwrap();
+            let writer = writer.lock();
+            writer
+                .log()
+                .iter()
+                .unwrap()
+                .filter_map(
+                    |record| match payload::decode_record(&record.unwrap()).unwrap().1 {
+                        IntentPayload::Remember { memory_bincode, .. }
+                        | IntentPayload::Update { memory_bincode, .. } => Some(
+                            crate::memory::storage::decode_memory_snapshot(&memory_bincode)
+                                .unwrap()
+                                .experience
+                                .embeddings
+                                .map_or(dim, |v| v.len()),
+                        ),
+                        _ => None,
+                    },
+                )
+                .collect()
+        };
+        assert_eq!(
+            journaled_vector_lengths(),
+            vec![dim; memories.len()],
+            "the follower's own log holds the vectors its store holds"
+        );
         let stored_vector = |memory: &Memory| {
             memory_sys
                 .read()
@@ -1999,6 +2056,7 @@ mod tests {
             vectors_before,
             "the same text keeps its indexed vectors"
         );
+        assert_eq!(journaled_vector_lengths(), vec![dim; memories.len() + 1]);
     }
 
     #[test]
