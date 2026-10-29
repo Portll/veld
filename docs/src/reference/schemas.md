@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **487** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **275** routes over **499** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -159,6 +159,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/entity/attribute` | body [`SetAttributeRequest`](#setattributerequest) | `serde_json::Value` |
 | `POST` | `/api/entity/merge` | body [`MergeEntitiesRequest`](#mergeentitiesrequest) | `serde_json::Value` |
 | `POST` | `/api/entity/resolve` | body [`EntityResolveRequest`](#entityresolverequest) | [`EntityResolveResponse`](#entityresolveresponse) |
+| `POST` | `/api/entity/sentiment` | body [`EntitySentimentRequest`](#entitysentimentrequest) | [`EntitySentimentResponse`](#entitysentimentresponse) |
 
 ### /events
 
@@ -433,6 +434,12 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `POST` | `/api/seed` | body [`SeedRequest`](#seedrequest) | [`SeedResponse`](#seedresponse) |
+
+### /sentiment
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `POST` | `/api/sentiment/analyze` | body [`AnalyzeSentimentRequest`](#analyzesentimentrequest) | [`AnalyzeSentimentResponse`](#analyzesentimentresponse) |
 
 ### /sessions
 
@@ -717,6 +724,37 @@ Defined in `src/memory/facets.rs`. Records which agent was operating from which 
 | `parent_repo` | `Option<PathBuf>` | no | default when absent; Path of the main worktree (the original clone) when this session is running in a sibling/linked worktree. Anchors a child worktree back to its parent so a branch-aware tool can group siblings. |
 | `declared` | [`DeclaredWriter`](#declaredwriter) | no | default when absent; What the CALLER said about itself — see [`DeclaredWriter`]. |
 | `verified` | [`VerifiedWriter`](#verifiedwriter) | no | default when absent; What the SERVER established — see [`VerifiedWriter`]. |
+
+### AnalyzeSentimentRequest
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `text` | `String` | yes |  |
+| `targets` | `Vec<String>` | no | default when absent; Entities to read stance toward; matched on whole words, case-insensitively. |
+| `scale` | `u8` | no | default when absent; Likert width, 3..=11. |
+
+### AnalyzeSentimentResponse
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `valence` | `f32` | yes | Whole-text valence in (-1, 1). |
+| `likert` | [`LikertProjection`](#likertprojection) | yes |  |
+| `mentions` | `usize` | yes | Target mentions located, with or without an opinion. |
+| `opinions` | Vec&lt;[`AnalyzedOpinion`](#analyzedopinion)&gt; | yes |  |
+
+### AnalyzedOpinion
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `opinion` | [`Opinion`](#opinion) | yes | flattened into the parent |
+| `likert` | [`LikertProjection`](#likertprojection) | yes |  |
+| `snippet` | `String` | yes |  |
 
 ### AnchorRequest (handlers/crud)
 
@@ -2148,6 +2186,35 @@ Defined in `src/handlers/prompt_gen.rs`.
 | `resolved` | Vec&lt;[`ResolvedEntity`](#resolvedentity)&gt; | yes |  |
 | `unresolved` | `Vec<String>` | yes |  |
 
+### EntitySentimentRequest
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `entity` | `String` | yes |  |
+| `scale` | `u8` | no | default when absent; Likert width, 3..=11. |
+| `half_life_days` | `f32` | no | default when absent; Opinions lose half their weight every this many days; 0 turns decay off. |
+| `max_episodes` | `usize` | no | default when absent; Episodes read, up to 10 000. |
+| `evidence` | `usize` | no | default when absent; Strongest opinions returned as evidence, up to 50. |
+| `holder` | `Option<String>` | no | Restrict `stance` to one holder: `"speaker"`, `"other"`, or a name such as a transcript speaker. |
+
+### EntitySentimentResponse
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `entity` | `String` | yes | The entity's canonical name. |
+| `surface_forms` | `Vec<String>` | yes | Names searched for in episode text: the canonical name and its aliases. |
+| `episodes_scanned` | `usize` | yes |  |
+| `episodes_mentioning` | `usize` | yes | Episodes whose text names the entity. |
+| `neutral_mentions` | `usize` | yes | Mentions with no opinion attached. |
+| `stance` | Option&lt;[`StanceSummary`](#stancesummary)&gt; | no | All opinions, or the requested holder's; `None` when there are none. |
+| `by_holder` | Vec&lt;[`HolderStance`](#holderstance)&gt; | yes | Stance per holder, heaviest evidence first. |
+| `evidence` | Vec&lt;[`SentimentEvidence`](#sentimentevidence)&gt; | yes |  |
+
 ### EnvironmentContext
 
 Defined in `src/memory/types.rs`. Environment context
@@ -2970,6 +3037,27 @@ Defined in `src/handlers/ui.rs`.
 | `tags` | `usize` | yes |  |
 | `occurrences` | `usize` | yes |  |
 
+### Holder
+
+Defined in `src/memory/sentiment.rs`. Who holds an opinion.
+
+Enum, adjacently tagged: `{"kind": <variant>, "name": <payload>}`.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `speaker` | none | The author of the text ("I love Rust"). |
+| `named` | `String` | A named person: a `Name:` speaker prefix, or a capitalised subject ("Alice hates Go"). |
+| `other` | none | Someone the text does not name ("they", "my team"). |
+
+### HolderStance
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `holder` | [`Holder`](#holder) | yes |  |
+| `stance` | [`StanceSummary`](#stancesummary) | yes |  |
+
 ### ImportResult
 
 Defined in `src/mif/import.rs`. Result of an import operation.
@@ -3213,6 +3301,18 @@ Defined in `src/storage/write_latch.rs`. What `/health` publishes about one latc
 | `failed_writes` | `u64` | yes |  |
 | `recovery_attempts` | `u32` | yes |  |
 | `hard` | `bool` | yes | A flush+retry has already failed; only a restart clears it. |
+
+### LikertProjection
+
+Defined in `src/memory/sentiment.rs`. A stance placed on a `scale`-point Likert scale.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `scale` | `u8` | yes |  |
+| `point` | `f32` | yes | Continuous position in `1..=scale`. |
+| `rounded` | `u8` | yes |  |
+| `label` | `Option<&'static str>` | no | Named for 3-, 5- and 7-point scales. |
+| `distribution` | `Vec<f32>` | yes | Share of evidence at each point, each opinion split between its two nearest points. |
 
 ### LineageAddEdgeRequest (handlers/lineage)
 
@@ -3975,6 +4075,22 @@ Defined in `src/handlers/ui.rs`.
 | `times` | `usize` | yes |  |
 | `last_asked` | `DateTime<Utc>` | yes |  |
 
+### Modifier (memory/sentiment)
+
+Defined in `src/memory/sentiment.rs`. A word near the cue that changed its strength or sign.
+
+Enum, internally tagged: the payload's fields plus `"kind": <variant>`.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `booster` | `{ word: String, factor: f32 }` | `factor` is as applied: a booster inside a negation's scope weakens instead ("not very good" is milder than "not good"). |
+| `dampener` | `{ word: String, factor: f32 }` |  |
+| `negation` | `{ word: String }` |  |
+| `historical` | none | "used to": the stance was held, not necessarily still held. |
+| `exclamation` | `{ count: u8 }` |  |
+| `emphasis` | none | The cue was written in capitals inside text that is not. |
+| `comparative_loser` | none | The target was the losing side of a comparison. |
+
 ### MultiModalSearchRequest (handlers/search)
 
 Defined in `src/handlers/search.rs`.
@@ -3997,6 +4113,20 @@ Defined in `src/memory/types.rs`. Raw experience data to be stored (ENHANCED wit
 | `confidence` | `f32` | yes |  |
 | `start_char` | `Option<usize>` | no | default when absent; Character offset of entity start in source content |
 | `end_char` | `Option<usize>` | no | default when absent; Character offset of entity end in source content |
+
+### Opinion
+
+Defined in `src/memory/sentiment.rs`. One holder's stance toward one target, from one clause.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `target` | `String` | yes | The target as the caller named it. |
+| `holder` | [`Holder`](#holder) | yes |  |
+| `cue` | `String` | yes | The lexicon word or phrase that carried the polarity. |
+| `raw` | `f32` | yes | Score on the lexicon's scale after modifiers. |
+| `valence` | `f32` | yes | `raw` squashed into (-1, 1). |
+| `weight` | `f32` | yes | Evidential weight in (0, 1]; "used to" lowers it. |
+| `modifiers` | Vec&lt;[`Modifier`](#modifier-memory-sentiment)&gt; | yes |  |
 
 ### OriginCounts
 
@@ -5435,6 +5565,21 @@ Defined in `src/memory/compression.rs`. A semantic fact extracted from episodic 
 | `purged_at` | `Option<chrono::DateTime<chrono::Utc>>` | no | default when absent; When this fact was administratively purged. `None` = never purged. |
 | `purge_reason` | Option&lt;[`PurgeReason`](#purgereason)&gt; | no | default when absent; Why this fact was purged. `None` when `purged_at` is `None`. |
 
+### SentimentEvidence
+
+Defined in `src/handlers/sentiment.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `episode_id` | `String` | yes |  |
+| `at` | `DateTime<Utc>` | yes |  |
+| `holder` | [`Holder`](#holder) | yes |  |
+| `cue` | `String` | yes |  |
+| `valence` | `f32` | yes |  |
+| `weight` | `f32` | yes |  |
+| `modifiers` | Vec&lt;[`Modifier`](#modifier-memory-sentiment)&gt; | yes |  |
+| `snippet` | `String` | yes |  |
+
 ### Session
 
 Defined in `src/memory/sessions.rs`. A user session
@@ -5746,6 +5891,21 @@ Defined in `src/handlers/graph.rs`.
 | `min_records` | `Option<usize>` | no |  |
 | `min_tags` | `Option<usize>` | no |  |
 | `limit` | `Option<usize>` | no |  |
+
+### StanceSummary
+
+Defined in `src/memory/sentiment.rs`. Opinions toward one target, aggregated.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `opinions` | `usize` | yes |  |
+| `effective_weight` | `f32` | yes | Sum of opinion weights after recency decay. |
+| `valence` | `f32` | yes | Recency-weighted mean valence in (-1, 1). |
+| `all_time_valence` | `f32` | yes | Mean valence with no recency decay; a gap from `valence` means the stance moved. |
+| `spread` | `f32` | yes | Recency-weighted standard deviation of valence. |
+| `confidence` | `f32` | yes | Grows with evidence, shrinks with disagreement; in [0, 1). |
+| `last_reversal` | `Option<DateTime<Utc>>` | no | When the stance last changed sign: the newest opinion whose polarity differs from the one before it in time. Near-neutral opinions are passed over. |
+| `likert` | [`LikertProjection`](#likertprojection) | yes |  |
 
 ### StatsQuery
 

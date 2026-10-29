@@ -15,7 +15,7 @@ use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
     lineage, memory_ops, mif, prompt_gen, query, recall, remember, replication, search, seed,
-    sessions, sleep_time, storage_migration, todos, ui, user_admin, user_auth, users,
+    sentiment, sessions, sleep_time, storage_migration, todos, ui, user_admin, user_auth, users,
     visualization, webhooks,
 };
 
@@ -326,6 +326,8 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         )
         .route("/api/entity/merge", post(prompt_gen::merge_entities))
         .route("/api/entity/alias", post(prompt_gen::add_entity_alias))
+        .route("/api/entity/sentiment", post(sentiment::entity_sentiment))
+        .route("/api/sentiment/analyze", post(sentiment::analyze_sentiment))
         // =================================================================
         // MEMORY CRUD OPERATIONS
         // =================================================================

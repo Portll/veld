@@ -444,6 +444,13 @@
       "response": "EntityResolveResponse"
     },
     {
+      "method": "POST",
+      "path": "/api/entity/sentiment",
+      "handler": "sentiment::entity_sentiment",
+      "body": "EntitySentimentRequest",
+      "response": "EntitySentimentResponse"
+    },
+    {
       "method": "GET",
       "path": "/api/events",
       "handler": "webhooks::memory_events_sse",
@@ -1248,6 +1255,13 @@
       "handler": "seed::seed_project",
       "body": "SeedRequest",
       "response": "SeedResponse"
+    },
+    {
+      "method": "POST",
+      "path": "/api/sentiment/analyze",
+      "handler": "sentiment::analyze_sentiment",
+      "body": "AnalyzeSentimentRequest",
+      "response": "AnalyzeSentimentResponse"
     },
     {
       "method": "POST",
@@ -2352,6 +2366,113 @@
           "doc": "What the SERVER established — see [`VerifiedWriter`].",
           "refs": [
             "VerifiedWriter"
+          ]
+        }
+      ]
+    },
+    "AnalyzeSentimentRequest": {
+      "name": "AnalyzeSentimentRequest",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "text",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "targets",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Entities to read stance toward; matched on whole words, case-insensitively.",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "scale",
+          "type": "u8",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Likert width, 3..=11."
+        }
+      ]
+    },
+    "AnalyzeSentimentResponse": {
+      "name": "AnalyzeSentimentResponse",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "valence",
+          "type": "f32",
+          "required": true,
+          "doc": "Whole-text valence in (-1, 1)."
+        },
+        {
+          "name": "likert",
+          "type": "LikertProjection",
+          "required": true,
+          "refs": [
+            "LikertProjection"
+          ]
+        },
+        {
+          "name": "mentions",
+          "type": "usize",
+          "required": true,
+          "doc": "Target mentions located, with or without an opinion."
+        },
+        {
+          "name": "opinions",
+          "type": "Vec<AnalyzedOpinion>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "AnalyzedOpinion"
+          ]
+        }
+      ]
+    },
+    "AnalyzedOpinion": {
+      "name": "AnalyzedOpinion",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "opinion",
+          "type": "Opinion",
+          "required": true,
+          "notes": [
+            "flattened into the parent"
+          ],
+          "refs": [
+            "Opinion"
+          ]
+        },
+        {
+          "name": "likert",
+          "type": "LikertProjection",
+          "required": true,
+          "refs": [
+            "LikertProjection"
+          ]
+        },
+        {
+          "name": "snippet",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
           ]
         }
       ]
@@ -7781,6 +7902,147 @@
         }
       ]
     },
+    "EntitySentimentRequest": {
+      "name": "EntitySentimentRequest",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "entity",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "scale",
+          "type": "u8",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Likert width, 3..=11."
+        },
+        {
+          "name": "half_life_days",
+          "type": "f32",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Opinions lose half their weight every this many days; 0 turns decay off."
+        },
+        {
+          "name": "max_episodes",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Episodes read, up to 10 000."
+        },
+        {
+          "name": "evidence",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Strongest opinions returned as evidence, up to 50."
+        },
+        {
+          "name": "holder",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "Restrict `stance` to one holder: `\"speaker\"`, `\"other\"`, or a name such as a transcript speaker.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "EntitySentimentResponse": {
+      "name": "EntitySentimentResponse",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entity",
+          "type": "String",
+          "required": true,
+          "doc": "The entity's canonical name.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "surface_forms",
+          "type": "Vec<String>",
+          "required": true,
+          "doc": "Names searched for in episode text: the canonical name and its aliases.",
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "episodes_scanned",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "episodes_mentioning",
+          "type": "usize",
+          "required": true,
+          "doc": "Episodes whose text names the entity."
+        },
+        {
+          "name": "neutral_mentions",
+          "type": "usize",
+          "required": true,
+          "doc": "Mentions with no opinion attached."
+        },
+        {
+          "name": "stance",
+          "type": "Option<StanceSummary>",
+          "required": false,
+          "doc": "All opinions, or the requested holder's; `None` when there are none.",
+          "refs": [
+            "Option",
+            "StanceSummary"
+          ]
+        },
+        {
+          "name": "by_holder",
+          "type": "Vec<HolderStance>",
+          "required": true,
+          "doc": "Stance per holder, heaviest evidence first.",
+          "refs": [
+            "Vec",
+            "HolderStance"
+          ]
+        },
+        {
+          "name": "evidence",
+          "type": "Vec<SentimentEvidence>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "SentimentEvidence"
+          ]
+        }
+      ]
+    },
     "EnvironmentContext": {
       "name": "EnvironmentContext",
       "file": "src/memory/types.rs",
@@ -11125,6 +11387,51 @@
         }
       ]
     },
+    "Holder": {
+      "name": "Holder",
+      "file": "src/memory/sentiment.rs",
+      "doc": "Who holds an opinion.",
+      "kind": "enum",
+      "representation": "adjacently tagged: `{\"kind\": <variant>, \"name\": <payload>}`",
+      "variants": [
+        {
+          "name": "speaker",
+          "doc": "The author of the text (\"I love Rust\")."
+        },
+        {
+          "name": "named",
+          "payload": "String",
+          "doc": "A named person: a `Name:` speaker prefix, or a capitalised subject (\"Alice hates Go\")."
+        },
+        {
+          "name": "other",
+          "doc": "Someone the text does not name (\"they\", \"my team\")."
+        }
+      ]
+    },
+    "HolderStance": {
+      "name": "HolderStance",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "holder",
+          "type": "Holder",
+          "required": true,
+          "refs": [
+            "Holder"
+          ]
+        },
+        {
+          "name": "stance",
+          "type": "StanceSummary",
+          "required": true,
+          "refs": [
+            "StanceSummary"
+          ]
+        }
+      ]
+    },
     "ImportResult": {
       "name": "ImportResult",
       "file": "src/mif/import.rs",
@@ -12050,6 +12357,48 @@
           "type": "bool",
           "required": true,
           "doc": "A flush+retry has already failed; only a restart clears it."
+        }
+      ]
+    },
+    "LikertProjection": {
+      "name": "LikertProjection",
+      "file": "src/memory/sentiment.rs",
+      "doc": "A stance placed on a `scale`-point Likert scale.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "scale",
+          "type": "u8",
+          "required": true
+        },
+        {
+          "name": "point",
+          "type": "f32",
+          "required": true,
+          "doc": "Continuous position in `1..=scale`."
+        },
+        {
+          "name": "rounded",
+          "type": "u8",
+          "required": true
+        },
+        {
+          "name": "label",
+          "type": "Option<&'static str>",
+          "required": false,
+          "doc": "Named for 3-, 5- and 7-point scales.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "distribution",
+          "type": "Vec<f32>",
+          "required": true,
+          "doc": "Share of evidence at each point, each opinion split between its two nearest points.",
+          "refs": [
+            "Vec"
+          ]
         }
       ]
     },
@@ -14963,6 +15312,44 @@
         }
       ]
     },
+    "Modifier (memory/sentiment)": {
+      "name": "Modifier",
+      "file": "src/memory/sentiment.rs",
+      "doc": "A word near the cue that changed its strength or sign.",
+      "kind": "enum",
+      "representation": "internally tagged: the payload's fields plus `\"kind\": <variant>`",
+      "variants": [
+        {
+          "name": "booster",
+          "payload": "{ word: String, factor: f32 }",
+          "doc": "`factor` is as applied: a booster inside a negation's scope weakens instead (\"not very good\" is milder than \"not good\")."
+        },
+        {
+          "name": "dampener",
+          "payload": "{ word: String, factor: f32 }"
+        },
+        {
+          "name": "negation",
+          "payload": "{ word: String }"
+        },
+        {
+          "name": "historical",
+          "doc": "\"used to\": the stance was held, not necessarily still held."
+        },
+        {
+          "name": "exclamation",
+          "payload": "{ count: u8 }"
+        },
+        {
+          "name": "emphasis",
+          "doc": "The cue was written in capitals inside text that is not."
+        },
+        {
+          "name": "comparative_loser",
+          "doc": "The target was the losing side of a comparison."
+        }
+      ]
+    },
     "MultiModalSearchRequest (handlers/search)": {
       "name": "MultiModalSearchRequest",
       "file": "src/handlers/search.rs",
@@ -15052,6 +15439,67 @@
           "doc": "Character offset of entity end in source content",
           "refs": [
             "Option"
+          ]
+        }
+      ]
+    },
+    "Opinion": {
+      "name": "Opinion",
+      "file": "src/memory/sentiment.rs",
+      "doc": "One holder's stance toward one target, from one clause.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "target",
+          "type": "String",
+          "required": true,
+          "doc": "The target as the caller named it.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "holder",
+          "type": "Holder",
+          "required": true,
+          "refs": [
+            "Holder"
+          ]
+        },
+        {
+          "name": "cue",
+          "type": "String",
+          "required": true,
+          "doc": "The lexicon word or phrase that carried the polarity.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "raw",
+          "type": "f32",
+          "required": true,
+          "doc": "Score on the lexicon's scale after modifiers."
+        },
+        {
+          "name": "valence",
+          "type": "f32",
+          "required": true,
+          "doc": "`raw` squashed into (-1, 1)."
+        },
+        {
+          "name": "weight",
+          "type": "f32",
+          "required": true,
+          "doc": "Evidential weight in (0, 1]; \"used to\" lowers it."
+        },
+        {
+          "name": "modifiers",
+          "type": "Vec<Modifier>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "Modifier"
           ]
         }
       ]
@@ -21141,6 +21589,73 @@
         }
       ]
     },
+    "SentimentEvidence": {
+      "name": "SentimentEvidence",
+      "file": "src/handlers/sentiment.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "episode_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "holder",
+          "type": "Holder",
+          "required": true,
+          "refs": [
+            "Holder"
+          ]
+        },
+        {
+          "name": "cue",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "valence",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "weight",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "modifiers",
+          "type": "Vec<Modifier>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "Modifier"
+          ]
+        },
+        {
+          "name": "snippet",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "Session": {
       "name": "Session",
       "file": "src/memory/sessions.rs",
@@ -22158,6 +22673,68 @@
           "required": false,
           "refs": [
             "Option"
+          ]
+        }
+      ]
+    },
+    "StanceSummary": {
+      "name": "StanceSummary",
+      "file": "src/memory/sentiment.rs",
+      "doc": "Opinions toward one target, aggregated.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "opinions",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "effective_weight",
+          "type": "f32",
+          "required": true,
+          "doc": "Sum of opinion weights after recency decay."
+        },
+        {
+          "name": "valence",
+          "type": "f32",
+          "required": true,
+          "doc": "Recency-weighted mean valence in (-1, 1)."
+        },
+        {
+          "name": "all_time_valence",
+          "type": "f32",
+          "required": true,
+          "doc": "Mean valence with no recency decay; a gap from `valence` means the stance moved."
+        },
+        {
+          "name": "spread",
+          "type": "f32",
+          "required": true,
+          "doc": "Recency-weighted standard deviation of valence."
+        },
+        {
+          "name": "confidence",
+          "type": "f32",
+          "required": true,
+          "doc": "Grows with evidence, shrinks with disagreement; in [0, 1)."
+        },
+        {
+          "name": "last_reversal",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "doc": "When the stance last changed sign: the newest opinion whose polarity differs from the one before it in time. Near-neutral opinions are passed over.",
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "likert",
+          "type": "LikertProjection",
+          "required": true,
+          "refs": [
+            "LikertProjection"
           ]
         }
       ]

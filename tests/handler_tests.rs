@@ -3563,3 +3563,105 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
         );
     }
 }
+
+async fn entity_sentiment_of(
+    h: &Harness,
+    user: &str,
+    entity: &str,
+) -> (StatusCode, serde_json::Value) {
+    json_of(
+        h.app(),
+        authed_post(
+            "/api/entity/sentiment",
+            json!({"user_id": user, "entity": entity, "scale": 7}),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn entity_sentiment_reads_stance_from_episodes_and_forgets_with_them() {
+    let h = Harness::new();
+    let user = "sentiment-user";
+    let mut ids = Vec::new();
+    for content in [
+        "I absolutely love Rust for systems work.",
+        "Rust is great for the memory engine.",
+        "We rewrote the indexer in Rust this week.",
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({"user_id": user, "content": content, "tags": ["rust"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = veld::uuid::Uuid::parse_str(body["id"].as_str().expect("id")).unwrap();
+        wait_for_episode_entity(&h, user, id, "rust").await;
+        ids.push(id);
+    }
+    wait_for_background_work(&h).await;
+
+    let (status, body) = entity_sentiment_of(&h, user, "rust").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["episodes_mentioning"], 3, "{body:#}");
+    assert_eq!(body["neutral_mentions"], 1, "{body:#}");
+    assert_eq!(body["stance"]["opinions"], 2, "{body:#}");
+    assert!(
+        body["stance"]["likert"]["rounded"].as_u64().unwrap() >= 6,
+        "{body:#}"
+    );
+    assert_eq!(
+        body["by_holder"][0]["holder"]["kind"], "speaker",
+        "{body:#}"
+    );
+    assert_eq!(body["evidence"][0]["cue"], "love", "{body:#}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_delete(&format!("/api/forget/{}?user_id={user}", ids[0])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for_background_work(&h).await;
+
+    let (status, body) = entity_sentiment_of(&h, user, "rust").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["episodes_mentioning"], 2, "{body:#}");
+    assert_eq!(body["stance"]["opinions"], 1, "{body:#}");
+    assert_eq!(body["evidence"][0]["cue"], "great", "{body:#}");
+
+    let (status, _) = entity_sentiment_of(&h, user, "cobol").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn sentiment_analyze_is_a_protected_stateless_route() {
+    let h = Harness::new();
+    let request = json!({
+        "text": "I don't really like Go, but Rust is fantastic!",
+        "targets": ["Go", "Rust"]
+    });
+    assert_eq!(
+        status_of(
+            h.app(),
+            noauth_post("/api/sentiment/analyze", request.clone())
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, body) = json_of(h.app(), authed_post("/api/sentiment/analyze", request)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let opinions = body["opinions"].as_array().expect("opinions");
+    let valence = |target: &str| {
+        opinions
+            .iter()
+            .find(|o| o["target"] == target)
+            .and_then(|o| o["valence"].as_f64())
+            .unwrap_or_else(|| panic!("no opinion on {target}: {body:#}"))
+    };
+    assert!(valence("Go") < 0.0 && valence("Rust") > 0.5, "{body:#}");
+    assert_eq!(body["likert"]["scale"], 5);
+}

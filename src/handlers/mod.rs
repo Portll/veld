@@ -95,6 +95,9 @@ pub mod dials;
 // Prompt generation (end-to-end context assembly) and entity resolution
 pub mod prompt_gen;
 
+// Derived entity sentiment with Likert projection
+pub mod sentiment;
+
 // User auth (Phase C) — password + TOTP + recovery codes behind a flag
 pub mod user_auth;
 // Administering logins and keys: Admin session plus step-up

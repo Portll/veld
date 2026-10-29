@@ -46,6 +46,7 @@ pub mod relation_extraction;
 pub mod replay;
 pub mod retrieval;
 pub mod segmentation;
+pub mod sentiment;
 pub mod session_detect;
 pub mod sessions;
 pub mod sleep_time;
