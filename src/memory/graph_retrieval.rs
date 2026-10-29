@@ -45,14 +45,14 @@ use crate::constants::{
     QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC, QUERY_TYPE_EXPLORATORY_GRAPH,
     QUERY_TYPE_EXPLORATORY_LINGUISTIC, QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH,
     QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, RECALL_GRAPH_LEG_ENTITIES,
-    RECALL_GRAPH_LEG_EPISODES_PER_ENTITY, RECALL_GRAPH_LEG_POOL, RECALL_PPR_EXPAND_HOPS,
-    RECALL_PPR_MAX_EXPANSIONS, RECALL_PPR_MAX_ITERATIONS, RECALL_PPR_MAX_NODES,
-    RECALL_PPR_POTENTIATION_MIN_FLOW, RECALL_PPR_RESTART, RECALL_PPR_TOLERANCE,
-    SALIENCE_BOOST_FACTOR, SEED_COVERAGE_BONUS, SPREADING_ACTIVATION_THRESHOLD,
-    SPREADING_DEGREE_NORMALIZATION, SPREADING_EARLY_TERMINATION_CANDIDATES,
-    SPREADING_EARLY_TERMINATION_RATIO, SPREADING_FRONTIER_CAP, SPREADING_MAX_HOPS,
-    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
-    SPREADING_RELAXED_THRESHOLD,
+    RECALL_GRAPH_LEG_EPISODES_PER_ENTITY, RECALL_GRAPH_LEG_EPISODE_READS, RECALL_GRAPH_LEG_POOL,
+    RECALL_PPR_EXPAND_HOPS, RECALL_PPR_MAX_EXPANSIONS, RECALL_PPR_MAX_ITERATIONS,
+    RECALL_PPR_MAX_NODES, RECALL_PPR_POTENTIATION_MIN_FLOW, RECALL_PPR_RESTART,
+    RECALL_PPR_TOLERANCE, SALIENCE_BOOST_FACTOR, SEED_COVERAGE_BONUS,
+    SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
+    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO,
+    SPREADING_FRONTIER_CAP, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS,
+    SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EntityLabel, EpisodicNode, GraphMemory, RelationType};
@@ -861,7 +861,8 @@ pub(crate) fn personalized_pagerank(
 ///
 /// Entities are visited by mass, at most `RECALL_GRAPH_LEG_ENTITIES` of them; each gives its
 /// newest `RECALL_GRAPH_LEG_EPISODES_PER_ENTITY` episodes, and the pool stops at
-/// `RECALL_GRAPH_LEG_POOL`. `admit` drops episodes outside the query's scope.
+/// `RECALL_GRAPH_LEG_POOL` episodes or `RECALL_GRAPH_LEG_EPISODE_READS` episode reads.
+/// `admit` drops episodes outside the query's scope.
 ///
 /// An episode's activation is the summed mass of every entity it names, plus the ones it was
 /// reached through, times `1 + SEED_COVERAGE_BONUS × (seeds named − 1)`.
@@ -877,13 +878,18 @@ pub(crate) fn ppr_episode_pool(
     // Per pooled episode, the entities whose mass it collects.
     let mut pool: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
     let mut pooled: HashMap<Uuid, usize> = HashMap::new();
+    let mut reads_left = RECALL_GRAPH_LEG_EPISODE_READS;
     'entities: for (entity, _) in by_mass.into_iter().take(RECALL_GRAPH_LEG_ENTITIES) {
         let room = RECALL_GRAPH_LEG_POOL - pool.len();
-        if room == 0 {
+        if room == 0 || reads_left == 0 {
             break;
         }
-        let limit = RECALL_GRAPH_LEG_EPISODES_PER_ENTITY.min(room);
-        for episode in graph.get_recent_episodes_by_entity(entity, limit)? {
+        let limit = RECALL_GRAPH_LEG_EPISODES_PER_ENTITY
+            .min(room)
+            .min(reads_left);
+        let episodes = graph.get_recent_episodes_by_entity(entity, limit)?;
+        reads_left = reads_left.saturating_sub(episodes.len());
+        for episode in episodes {
             if let Some(&i) = pooled.get(&episode.uuid) {
                 pool[i].1.push(*entity);
                 continue;

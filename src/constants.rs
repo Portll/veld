@@ -1113,6 +1113,11 @@ pub const RECALL_GRAPH_LEG_EPISODES_PER_ENTITY: usize = 500;
 /// the later layers, and one cosine against the query.
 pub const RECALL_GRAPH_LEG_POOL: usize = 1000;
 
+/// Episode records the graph leg decodes at most per recall, across all its entities.
+/// Entities share episodes, so without it the strongest entities of a hub-dense store could
+/// each decode 500 episodes the pool already holds: 64,000 reads for 1000 candidates.
+pub const RECALL_GRAPH_LEG_EPISODE_READS: usize = 5000;
+
 /// Graph leg candidates handed to fusion, best first.
 pub const RECALL_GRAPH_LEG_CANDIDATES: usize = 200;
 
