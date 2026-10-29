@@ -34,11 +34,14 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use tracing::info;
 
 use super::vamana::{DistanceMetric, VamanaConfig, VamanaIndex, VamanaNode, VectorStorage};
@@ -164,10 +167,20 @@ fn compute_checksum(data: &[u8]) -> u64 {
 }
 
 /// Sibling temp file a save writes before renaming it over `path`.
-fn saving_path(path: &Path) -> std::path::PathBuf {
+fn saving_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".saving");
-    std::path::PathBuf::from(name)
+    PathBuf::from(name)
+}
+
+/// One lock per saved path. Two saves of one index share its `.saving` file: the
+/// second's truncate pulls the pages out from under the first's mapping, and the
+/// process dies of SIGBUS. That killed the redb replica on 2026-10-29, when the
+/// shutdown fallback saved the indices a timed-out flush was still saving.
+static SAVE_LOCKS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
+
+fn save_lock(path: &Path) -> Arc<Mutex<()>> {
+    SAVE_LOCKS.entry(path.to_path_buf()).or_default().clone()
 }
 
 /// Make a rename in `path`'s directory durable. Directories cannot be opened as files
@@ -296,7 +309,11 @@ impl VamanaIndex {
     /// these locks. The bytes go to a sibling temp file that is synced, then renamed
     /// over `path` and the directory synced, so a crash or SIGKILL mid-save leaves the
     /// previous file whole instead of a truncated one that forces a rebuild on open.
+    /// Saves to one path run one at a time, each copying the index when its turn
+    /// comes, so the last to finish writes the newest state.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let lock = save_lock(path);
+        let _saving = lock.lock();
         let start = std::time::Instant::now();
 
         let (vector_data, neighbor_counts, neighbors, deleted, medoid, num_vectors, inserts) = {
@@ -750,6 +767,55 @@ mod tests {
         second.build(axes(5)).unwrap();
         second.save_to_file(&path).unwrap();
         assert_eq!(VamanaIndex::load_from_file(&path).unwrap().len(), 5);
+        assert!(!saving_path(&path).exists());
+    }
+
+    #[test]
+    fn saves_of_one_index_running_at_once_each_finish_whole() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("index.vamana");
+        let dimension = 32;
+        let mut index = VamanaIndex::new(VamanaConfig {
+            dimension,
+            max_degree: 16,
+            use_mmap: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let vectors: Vec<Vec<f32>> = (0..1_000)
+            .map(|i| {
+                (0..dimension)
+                    .map(|j| ((i * 31 + j * 17) % 97) as f32 / 97.0 + 0.01)
+                    .collect()
+            })
+            .collect();
+        index.build(vectors).unwrap();
+
+        // The shape of the 2026-10-29 shutdown: a flush still saving every tenant's
+        // index when the fallback pass started saving the same ones.
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let savers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..25)
+                            .filter_map(|_| index.save_to_file(&path).err())
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            savers
+                .into_iter()
+                .flat_map(|saver| saver.join().unwrap())
+                .collect()
+        });
+
+        assert!(
+            failures.is_empty(),
+            "overlapping saves failed: {failures:?}"
+        );
+        assert!(VamanaIndex::verify_index_file(&path).unwrap());
+        assert_eq!(VamanaIndex::load_from_file(&path).unwrap().len(), 1_000);
         assert!(!saving_path(&path).exists());
     }
 }
