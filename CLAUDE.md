@@ -367,7 +367,7 @@ The default release binary is ~30 MB. `--features embedded-docs` adds ~3-5 MB fo
 | Rust crate | `veld` on crates.io |
 | Node / MCP | `@veld/memory-mcp` on npm |
 | Python | `veld` on PyPI |
-| Docker | `varunveld/veld` |
+| Docker | `ghcr.io/portll/veld` |
 | MCP Registry | `veld` |
 | Cursor Directory | `veld-1` |
 
