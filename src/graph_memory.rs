@@ -525,6 +525,19 @@ impl EntityLabel {
     }
 }
 
+/// Selectivity of an entity from the Forman-Ricci curvatures of its incident edges: their
+/// sample standard deviation divided by their count, or 1.0 under two edges, where there is
+/// no spread to measure (upstream #214).
+fn curvature_selectivity(incident: &[f32]) -> f32 {
+    let n = incident.len() as f32;
+    if incident.len() < 2 {
+        return 1.0;
+    }
+    let mean = incident.iter().sum::<f32>() / n;
+    let variance = incident.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / (n - 1.0);
+    variance.sqrt() / n
+}
+
 /// The ontological class a curated naming convention recognises in `tag`, or `None`.
 ///
 /// Ported verbatim from upstream shodh-memory #509 (a292546f). Each rule recognises a
@@ -2348,6 +2361,11 @@ pub struct GraphMemory {
 
     /// Uuids of the entity and relationship rows written through `store`.
     change_log: Arc<GraphChangeLog>,
+
+    /// Entity selectivity from the last [`Self::compute_entity_selectivity`] pass. Held in
+    /// memory: empty until a heavy maintenance cycle scores the graph, and an entity it has
+    /// not scored reads as unknown, never as low.
+    entity_selectivity: parking_lot::RwLock<HashMap<Uuid, f32>>,
 }
 
 impl GraphMemory {
@@ -2565,6 +2583,7 @@ impl GraphMemory {
                 std::collections::VecDeque::new(),
             )),
             change_log,
+            entity_selectivity: parking_lot::RwLock::new(HashMap::new()),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
@@ -4782,6 +4801,7 @@ impl GraphMemory {
         self.entity_lowercase_index.write().clear();
         self.entity_stemmed_index.write().clear();
         self.entity_path_suffix_index.write().clear();
+        self.entity_selectivity.write().clear();
 
         // Reset counters
         self.entity_count.store(0, Ordering::Relaxed);
@@ -7103,6 +7123,47 @@ impl GraphMemory {
     /// Episodes in the graph: the N of the PMI gate at edge birth. O(1).
     pub fn total_episode_count(&self) -> usize {
         self.episode_count.load(Ordering::Relaxed)
+    }
+
+    /// Score every entity's selectivity from the Forman-Ricci curvature of its edges, and hold
+    /// the scores for [`Self::entity_selectivity`]. Returns how many entities were scored.
+    ///
+    /// Ported from upstream shodh-memory #214 (`compute_forman_ricci_curvature`). An edge's
+    /// curvature is `4 - deg(u) - deg(v)`, and an entity's selectivity is the standard
+    /// deviation of its incident curvatures divided by its degree. A hub joined to nodes of
+    /// every degree scores low once its degree is large; an entity with one edge scores 1.0.
+    /// Upstream writes the score onto each entity and the curvature onto each edge; veld's
+    /// records are positional bincode, so the scores live in memory and a heavy maintenance
+    /// cycle recomputes them.
+    pub fn compute_entity_selectivity(&self) -> Result<usize> {
+        let edges = self.get_all_relationships()?;
+        let mut degree: HashMap<Uuid, i32> = HashMap::new();
+        for edge in &edges {
+            *degree.entry(edge.from_entity).or_insert(0) += 1;
+            *degree.entry(edge.to_entity).or_insert(0) += 1;
+        }
+        let mut curvatures: HashMap<Uuid, Vec<f32>> = HashMap::new();
+        for edge in &edges {
+            let curvature = (4 - degree[&edge.from_entity] - degree[&edge.to_entity]) as f32;
+            curvatures
+                .entry(edge.from_entity)
+                .or_default()
+                .push(curvature);
+            curvatures.entry(edge.to_entity).or_default().push(curvature);
+        }
+        let scores: HashMap<Uuid, f32> = curvatures
+            .into_iter()
+            .map(|(entity, incident)| (entity, curvature_selectivity(&incident)))
+            .collect();
+        let scored = scores.len();
+        *self.entity_selectivity.write() = scores;
+        Ok(scored)
+    }
+
+    /// The entity's selectivity from the last [`Self::compute_entity_selectivity`] pass, or
+    /// `None` when that pass has not scored it.
+    pub fn entity_selectivity(&self, entity: &Uuid) -> Option<f32> {
+        self.entity_selectivity.read().get(entity).copied()
     }
 
     /// Get graph statistics - O(1) using atomic counters
@@ -11314,6 +11375,43 @@ mod tests {
         ] {
             assert_eq!(recognised_tag_label(prose), None, "{prose:?}");
         }
+    }
+
+    /// A star's hub sees the same curvature on every edge, the stop-word signature; a leaf
+    /// with one edge has no spread to measure and reads neutral.
+    #[test]
+    fn compute_entity_selectivity_scores_a_star_hub_low_and_its_leaves_neutral() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let hub = graph.add_entity(named_entity("Hub")).unwrap();
+        let leaves: Vec<Uuid> = (0..12)
+            .map(|k| graph.add_entity(named_entity(&format!("Leaf{k}"))).unwrap())
+            .collect();
+        for leaf in &leaves {
+            graph
+                .add_relationship(typed_edge(hub, *leaf, RelationType::RelatedTo, 0.5))
+                .unwrap();
+        }
+        assert_eq!(graph.entity_selectivity(&hub), None, "unscored is unknown");
+
+        assert_eq!(graph.compute_entity_selectivity().unwrap(), 13);
+        let hub_score = graph.entity_selectivity(&hub).unwrap();
+        assert!(
+            hub_score < crate::constants::GRAPH_LOW_SELECTIVITY,
+            "{hub_score}"
+        );
+        for leaf in &leaves {
+            assert_eq!(graph.entity_selectivity(leaf), Some(1.0));
+        }
+    }
+
+    #[test]
+    fn curvature_selectivity_is_spread_over_degree() {
+        assert_eq!(curvature_selectivity(&[-3.0]), 1.0);
+        assert_eq!(curvature_selectivity(&[-5.0, -5.0, -5.0]), 0.0);
+        // Sample deviation of {0, 2} is sqrt(2); over two edges.
+        let spread = curvature_selectivity(&[0.0, 2.0]);
+        assert!((spread - 2f32.sqrt() / 2.0).abs() < 1e-6, "{spread}");
     }
 
     #[test]

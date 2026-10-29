@@ -380,6 +380,20 @@ pub const GRAPH_PMI_GATE_ENV: &str = "SHODH_GRAPH_PMI_GATE";
 /// Env var overriding [`GRAPH_PMI_GATE_MIN`].
 pub const GRAPH_PMI_GATE_MIN_ENV: &str = "SHODH_GRAPH_PMI_GATE_MIN";
 
+/// Selectivity under which an entity reads as a stop-word hub (upstream #214): its edges reach
+/// nodes of every degree at an even rate. No edge is born between two such entities. Scores
+/// come from a heavy maintenance cycle (`GraphMemory::compute_entity_selectivity`); until one
+/// has run, no entity is low and the skip is inert, as it is upstream before its first cycle.
+pub const GRAPH_LOW_SELECTIVITY: f32 = 0.2;
+
+/// Env switch for the selectivity skip and the scoring pass behind it: `0` or `false` turns
+/// both off. On by default.
+pub const GRAPH_SELECTIVITY_SKIP_ENV: &str = "VELD_GRAPH_SELECTIVITY_SKIP";
+
+/// Fewest edges a graph needs before its selectivity is scored (upstream's
+/// `CURVATURE_MIN_EDGES`): below it the degree distribution has no spread to read.
+pub const CURVATURE_MIN_EDGES: usize = 10;
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay

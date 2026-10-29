@@ -3438,6 +3438,29 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
+
+            // Selectivity for the edge-birth skip, scored on the post-decay graph as upstream
+            // scores its curvature. Held in memory by the graph, replaced whole each pass.
+            if is_heavy && env_switch(crate::constants::GRAPH_SELECTIVITY_SKIP_ENV, true) {
+                if let Ok(graph) = self.get_user_graph(&user_id) {
+                    let graph_guard = graph.read();
+                    let edges = graph_guard.get_stats().map_or(0, |s| s.relationship_count);
+                    if edges >= crate::constants::CURVATURE_MIN_EDGES {
+                        match graph_guard.compute_entity_selectivity() {
+                            Ok(scored) => tracing::debug!(
+                                user_id = %user_id,
+                                scored,
+                                "Entity selectivity scored"
+                            ),
+                            Err(e) => tracing::debug!(
+                                "Entity selectivity failed for user {}: {}",
+                                user_id,
+                                e
+                            ),
+                        }
+                    }
+                }
+            }
         }
 
         #[cfg(feature = "multi-tenant")]
@@ -4950,6 +4973,9 @@ impl MultiUserMemoryManager {
         // Per entry: the episodes that have mentioned the entity, this one included (the
         // document frequency of the PMI gate). Declared entries are exempt and hold 1.
         let mut mentions: Vec<usize> = Vec::new();
+        // Per entry: selectivity from the last heavy maintenance cycle, None when unscored.
+        // Declared entries are exempt and hold None.
+        let mut selectivity: Vec<Option<f32>> = Vec::new();
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
@@ -4970,6 +4996,7 @@ impl MultiUserMemoryManager {
                             1
                         }
                     };
+                    selectivity.push(graph_guard.entity_selectivity(&uuid));
                     entity_uuids.push((name, uuid));
                     declared_weight.push(None);
                     at_cap.push(hub);
@@ -4985,6 +5012,7 @@ impl MultiUserMemoryManager {
                     declared_weight.push(Some(weight));
                     at_cap.push(false);
                     mentions.push(1);
+                    selectivity.push(None);
                 }
                 Err(e) => tracing::debug!("Failed to add declared entity {}: {}", name, e),
             }
@@ -5082,6 +5110,7 @@ impl MultiUserMemoryManager {
 
         let mut hub_edges_skipped = 0u64;
         let mut pmi_gated = 0usize;
+        let mut selectivity_skipped = 0usize;
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
                 // Two names `add_entity` resolved to one node (a case, stem or concept merge)
@@ -5092,6 +5121,18 @@ impl MultiUserMemoryManager {
                 if at_cap[i] || at_cap[j] {
                     hub_edges_skipped += 1;
                     continue;
+                }
+                // Selectivity skip (upstream #214): two entities that each spread their edges
+                // evenly over the graph co-occur out of habit, not association.
+                if admission.selectivity_skip {
+                    if let (Some(si), Some(sj)) = (selectivity[i], selectivity[j]) {
+                        if si < crate::constants::GRAPH_LOW_SELECTIVITY
+                            && sj < crate::constants::GRAPH_LOW_SELECTIVITY
+                        {
+                            selectivity_skipped += 1;
+                            continue;
+                        }
+                    }
                 }
                 let declared_strength = match (declared_weight[i], declared_weight[j]) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -5187,11 +5228,12 @@ impl MultiUserMemoryManager {
                 "Skipped co-occurrence edges on entities already at the degree cap"
             );
         }
-        if pmi_gated > 0 {
+        if pmi_gated + selectivity_skipped > 0 {
             tracing::debug!(
                 memory_id = %memory_id.0,
                 pmi_gated,
-                "Co-occurrence edges not born: the pair co-occurs no more than chance"
+                selectivity_skipped,
+                "Co-occurrence edges not born: chance co-occurrence, or two low-selectivity hubs"
             );
         }
         // Lock released here
@@ -5947,6 +5989,8 @@ struct GraphAdmission {
     /// A generic edge is born only when its pair's PMI reaches `pmi_gate_min`.
     pmi_gate: bool,
     pmi_gate_min: f32,
+    /// No edge between two entities a heavy cycle scored as low-selectivity hubs.
+    selectivity_skip: bool,
 }
 
 impl GraphAdmission {
@@ -5960,6 +6004,7 @@ impl GraphAdmission {
                 .min(c::MAX_ENTITY_DEGREE - 1),
             pmi_gate: env_switch(c::GRAPH_PMI_GATE_ENV, true),
             pmi_gate_min: env_number(c::GRAPH_PMI_GATE_MIN_ENV, c::GRAPH_PMI_GATE_MIN),
+            selectivity_skip: env_switch(c::GRAPH_SELECTIVITY_SKIP_ENV, true),
         }
     }
 }
@@ -6199,6 +6244,7 @@ mod graph_admission_tests {
         admission.verb_entities = false;
         admission.hub_degree_max = crate::constants::MAX_ENTITY_DEGREE - 1;
         admission.pmi_gate = false;
+        admission.selectivity_skip = false;
         admission
     }
 
@@ -6367,6 +6413,28 @@ mod graph_admission_tests {
             assert_eq!(joined(&mgr, "Xavier", "Yusuf"), pair_joined);
             assert!(joined(&mgr, "Xavier", "Zelda"));
             assert!(joined(&mgr, "Yusuf", "Zelda"));
+        }
+    }
+
+    /// Two star hubs, each joined to three one-edge leaves, score selectivity 0 once a
+    /// maintenance pass has scored the graph; an edge between them is not born.
+    #[test]
+    fn two_low_selectivity_hubs_are_not_joined() {
+        let mut skipping = legacy();
+        skipping.selectivity_skip = true;
+        for (admission, hubs_joined) in [(skipping, false), (legacy(), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            for leaf in ["Alma", "Amos", "Abel"] {
+                write_people(&mgr, &["Hubert", leaf], admission);
+            }
+            for leaf in ["Boris", "Bruno", "Bodil"] {
+                write_people(&mgr, &["Horace", leaf], admission);
+            }
+            let graph = mgr.get_user_graph(USER).unwrap();
+            assert_eq!(graph.read().compute_entity_selectivity().unwrap(), 8);
+            write_people(&mgr, &["Hubert", "Horace"], admission);
+            assert_eq!(joined(&mgr, "Hubert", "Horace"), hubs_joined);
         }
     }
 }
