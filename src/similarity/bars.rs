@@ -12,7 +12,7 @@ use prometheus::IntCounter;
 
 use crate::metrics::{SIMILARITY_BAR_EVALUATED_TOTAL, SIMILARITY_BAR_FIRED_TOTAL};
 
-const BAR_COUNT: usize = 15;
+const BAR_COUNT: usize = 13;
 
 /// One threshold comparison on a mapped cosine. A new bar is a new variant, so the label set
 /// a dashboard reads stays closed.
@@ -47,12 +47,6 @@ pub enum SimilarityBar {
     InterferenceSevereSync,
     /// A deferred write's neighbour is a duplicate.
     InterferenceSevereDeferred,
-    /// The write gate's nearest neighbour is an absorption candidate
-    /// (`WRITE_GATE_ABSORPTION_THRESHOLD`). Deferred writes only.
-    WriteGateCandidate,
-    /// A write-gate candidate whose text adds nothing, absorbed. Evaluated once per candidate,
-    /// so its fire rate is the share of candidates the text check lets through.
-    WriteGateAbsorbed,
 }
 
 impl SimilarityBar {
@@ -71,8 +65,6 @@ impl SimilarityBar {
         SimilarityBar::InterferenceDeferred,
         SimilarityBar::InterferenceSevereSync,
         SimilarityBar::InterferenceSevereDeferred,
-        SimilarityBar::WriteGateCandidate,
-        SimilarityBar::WriteGateAbsorbed,
     ];
 
     pub fn label(self) -> &'static str {
@@ -90,8 +82,6 @@ impl SimilarityBar {
             SimilarityBar::InterferenceDeferred => "interference_deferred",
             SimilarityBar::InterferenceSevereSync => "interference_severe_sync",
             SimilarityBar::InterferenceSevereDeferred => "interference_severe_deferred",
-            SimilarityBar::WriteGateCandidate => "write_gate_candidate",
-            SimilarityBar::WriteGateAbsorbed => "write_gate_absorbed",
         }
     }
 

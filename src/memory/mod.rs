@@ -15,6 +15,7 @@ pub mod compression;
 pub mod context;
 pub mod context_blocks;
 pub mod dials;
+pub mod duplicates;
 pub mod embed_queue;
 pub mod embedding_backlog;
 pub mod embedding_cache;
@@ -76,7 +77,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::metrics::{EMBEDDING_CACHE_CONTENT, EMBEDDING_CACHE_CONTENT_SIZE};
-use crate::similarity::bars::{SimilarityBar, WritePath};
+use crate::similarity::bars::WritePath;
 use embed_queue::EmbedPurpose;
 
 use crate::constants::{
@@ -201,8 +202,8 @@ pub use crate::memory::hybrid_search::{
     LearnedWeights, RRFusion, SignalScores,
 };
 pub use crate::memory::introspection::{
-    AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
-    ConsolidationStats, EdgeFormationReason, FactChange, InterferenceEvent, InterferenceType,
+    AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationInterference,
+    ConsolidationReport, ConsolidationStats, EdgeFormationReason, FactChange, InterferenceType,
     MemoryChange, PruningReason, ReplayEvent, ReportPeriod, StrengtheningReason,
 };
 pub use crate::memory::learning_history::{
@@ -228,7 +229,7 @@ pub use crate::memory::segmentation::{
 };
 pub use crate::memory::sessions::{
     Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore, SessionStoreStats,
-    SessionSummary, TemporalContext, TimeOfDay,
+    SessionSummary, SessionTimeContext, TimeOfDay,
 };
 pub use crate::memory::temporal_facts::{
     ContradictionType, EventType, ResolvedTime, TemporalFact, TemporalFactStore,
@@ -958,20 +959,6 @@ enum VectorIndexing {
     Failed(anyhow::Error),
 }
 
-/// Whether every word of `incoming` already appears in `existing`, compared
-/// case-insensitively over alphanumeric runs. The write gate's test that a memory is
-/// redundant and not merely similar: a number, name or date the neighbour lacks is a
-/// word it lacks, so the memory is kept.
-fn adds_no_new_words(incoming: &str, existing: &str) -> bool {
-    fn words(text: &str) -> std::collections::HashSet<String> {
-        text.split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(str::to_lowercase)
-            .collect()
-    }
-    words(incoming).is_subset(&words(existing))
-}
-
 impl MemorySystem {
     /// Persist a NEW memory and, unless `defer_embedding`, its vector mapping in one
     /// storage write. The vectors enter the in-memory index first because their ids
@@ -1509,7 +1496,7 @@ impl MemorySystem {
                             failed += 1;
                             tracing::error!(
                                 memory_id = %memory.id.0,
-                                error = %e,
+                                error = format!("{e:#}"),
                                 "Failed to repair orphaned memory"
                             );
                         }
@@ -2785,6 +2772,11 @@ impl MemorySystem {
             }
             return Ok(EmbedIndexOutcome::default());
         }
+        // Replacing a vector is not an arrival: the memory passed the write gate when its first
+        // vector was made, so the gate, interference and the drift update do not run again.
+        let refit = stored_space
+            .as_ref()
+            .is_some_and(|space| space != &index_space);
         if stored_space.as_ref() != Some(&index_space) {
             // Use enriched searchable text (with context prefix) for consistency
             // with the synchronous index_memory() path. Without this, deferred
@@ -2817,7 +2809,8 @@ impl MemorySystem {
 
             // E6: update the TCM drift state from this memory's embedding and
             // snapshot it onto the WhenFacet (encode-driven; persisted just below).
-            let context_drift = self.update_tcm_context(&embedding);
+            // A refit is not an encode: the memory keeps the drift it was encoded with.
+            let context_drift = (!refit).then(|| self.update_tcm_context(&embedding));
 
             // Persist embedding to storage so restarts don't re-embed. The record is
             // read again under the write lock and given only what this pass computed:
@@ -2864,7 +2857,9 @@ impl MemorySystem {
                         }
                     }
                     fresh.experience.set_primary_vector(embedding, space);
-                    fresh.when.context_drift = context_drift;
+                    if let Some(context_drift) = context_drift {
+                        fresh.when.context_drift = context_drift;
+                    }
                 }
                 // R3: populate the conjunctive binding from the engram's W-facets
                 // (was dead scaffold). Surfaced at recall so the consumer can tell a
@@ -2914,15 +2909,31 @@ impl MemorySystem {
             }
         }
 
-        // Vector index (uses pre-computed embedding for short content, re-embeds chunks)
+        // Vector index (uses pre-computed embedding for short content, re-embeds chunks).
+        // A memory the index already holds (a startup repair indexed its chunks while its stored
+        // vector was in another space) is reindexed, so the old vectors go rather than gaining a
+        // twin.
         let memory_arc = Arc::new(memory);
-        if let Err(e) = self.retriever.index_memory(&memory_arc) {
+        let already_indexed = self.retriever.is_indexed(memory_id);
+        let indexed = if already_indexed {
+            self.retriever.reindex_memory(&memory_arc)
+        } else {
+            self.retriever.index_memory(&memory_arc)
+        };
+        if let Err(e) = indexed {
             self.note_index_failure(memory_id, &e, "background memory");
         } else {
-            self.stats.write().vector_index_count += 1;
+            if !already_indexed {
+                self.stats.write().vector_index_count += 1;
+            }
             if let Err(e) = self.embedding_backlog.delete(memory_id) {
                 tracing::error!("embedding backlog: could not clear {}: {e}", memory_id.0);
             }
+        }
+
+        if refit {
+            crate::metrics::EMBED_BACKGROUND_DURATION.observe(start.elapsed().as_secs_f64());
+            return Ok(outcome);
         }
 
         // Write gate + interference detection (retroactive + proactive)
@@ -2932,75 +2943,83 @@ impl MemorySystem {
             .as_ref()
             .filter(|_| purpose == EmbedPurpose::Write)
         {
-            if let Ok(similar_ids) =
-                self.retriever
-                    .search_by_embedding(embedding, 5, Some(&memory_arc.id))
-            {
+            if let Ok(similar_ids) = self.retriever.search_by_embedding(
+                embedding,
+                crate::constants::WRITE_GATE_NEIGHBOURS,
+                Some(&memory_arc.id),
+            ) {
                 if !similar_ids.is_empty() {
-                    let similar_memories: Vec<_> = similar_ids
+                    let neighbours: Vec<(f32, Memory)> = similar_ids
                         .iter()
                         .filter_map(|(id, similarity)| {
                             self.retriever.get_from_storage(id).ok().map(|m| {
-                                (
-                                    id.0.to_string(),
-                                    // Interference's bars are MiniLM-tuned; read on that scale.
-                                    crate::similarity::scale::to_reference(*similarity),
-                                    m.importance(),
-                                    m.created_at,
-                                    m.experience.content.chars().take(50).collect::<String>(),
-                                )
+                                // Interference's bars are MiniLM-tuned; read on that scale.
+                                (crate::similarity::scale::to_reference(*similarity), m)
                             })
                         })
                         .collect();
+                    let similar_memories: Vec<_> = neighbours
+                        .iter()
+                        .map(|(similarity, m)| {
+                            (
+                                m.id.0.to_string(),
+                                *similarity,
+                                m.importance(),
+                                m.created_at,
+                                m.experience.content.chars().take(50).collect::<String>(),
+                            )
+                        })
+                        .collect();
 
-                    // ── Write gate: absorption ──────────────────────────────
-                    // A nearest neighbour above the absorption threshold is only a
-                    // candidate: similar vectors can carry different facts, and
-                    // the caller already holds this memory's id. It is absorbed
-                    // only when its text adds nothing the neighbour lacks.
-                    // `similar_memories` already holds cosines on MiniLM's scale, so the
-                    // MiniLM-tuned bar applies as is; mapping `best_sim` again would double it.
-                    let total_memories = self.stats.read().total_memories;
-                    if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
-                        if let Some((best_id, best_sim, _, _, _)) =
-                            similar_memories.iter().max_by(|a, b| {
-                                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                        {
-                            let candidate = SimilarityBar::WriteGateCandidate.record(
-                                *best_sim >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD,
+                    // ── Write gate: duplicates ──────────────────────────────
+                    // Decided on the text, so the bar is the same under every embedder.
+                    // Only an exact copy is absorbed; a near-exact one is kept, tagged and
+                    // ranked below what it repeats; anything else is left alone. The
+                    // closest neighbour wins a tie between two of the same kind.
+                    let repeated = neighbours
+                        .iter()
+                        .filter(|(_, existing)| !existing.is_forgotten())
+                        .map(|(similarity, existing)| {
+                            let kind = duplicates::classify(
+                                &memory_arc.experience.content,
+                                &existing.experience.content,
                             );
-                            let survivor = candidate
-                                .then(|| uuid::Uuid::parse_str(best_id).ok())
-                                .flatten()
-                                .and_then(|id| self.long_term_memory.get(&MemoryId(id)).ok())
-                                .filter(|existing| {
-                                    !existing.is_forgotten()
-                                        && adds_no_new_words(
-                                            &memory_arc.experience.content,
-                                            &existing.experience.content,
-                                        )
-                                });
-                            if candidate {
-                                SimilarityBar::WriteGateAbsorbed.record(survivor.is_some());
-                            }
-                            if let Some(survivor) = survivor {
-                                outcome.note_rewritten(memory_id);
-                                outcome.note_rewritten(&survivor.id);
-                                self.absorb_redundant_memory(
-                                    &memory_arc,
-                                    survivor,
-                                    importance,
-                                    *best_sim,
-                                    bm25,
-                                );
-                                let elapsed = start.elapsed();
-                                crate::metrics::EMBED_BACKGROUND_DURATION
-                                    .observe(elapsed.as_secs_f64());
-                                return Ok(outcome);
+                            (kind, *similarity, existing)
+                        })
+                        .filter(|(kind, _, _)| *kind != duplicates::DuplicateKind::Distinct)
+                        .min_by_key(|(kind, _, _)| std::cmp::Reverse(*kind));
+                    let memory_arc = match repeated {
+                        Some((duplicates::DuplicateKind::Exact, similarity, survivor)) => {
+                            outcome.note_rewritten(memory_id);
+                            outcome.note_rewritten(&survivor.id);
+                            self.absorb_redundant_memory(
+                                &memory_arc,
+                                survivor.clone(),
+                                importance,
+                                similarity,
+                                bm25,
+                            );
+                            let elapsed = start.elapsed();
+                            crate::metrics::EMBED_BACKGROUND_DURATION
+                                .observe(elapsed.as_secs_f64());
+                            return Ok(outcome);
+                        }
+                        Some((_, similarity, original)) => {
+                            match self.keep_near_exact_duplicate(
+                                &memory_arc,
+                                original.clone(),
+                                similarity,
+                            ) {
+                                Some(tagged) => {
+                                    outcome.note_rewritten(memory_id);
+                                    outcome.note_rewritten(&original.id);
+                                    tagged
+                                }
+                                None => Arc::clone(&memory_arc),
                             }
                         }
-                    }
+                        None => Arc::clone(&memory_arc),
+                    };
 
                     // ── Standard interference detection ─────────────────────
                     if !similar_memories.is_empty() {
@@ -3092,8 +3111,8 @@ impl MemorySystem {
         Ok(outcome)
     }
 
-    /// Fold a redundant new memory into `survivor`: the survivor gains importance and
-    /// any tag it lacked, and the redundant memory is soft-forgotten rather than
+    /// Fold a new memory whose text exactly repeats `survivor` into it: the survivor gains
+    /// importance and any tag it lacked, and the copy is soft-forgotten rather than
     /// deleted. Its id was returned when it was remembered, so the record stays
     /// readable, marked `absorbed_by`, while recall, listing and the indexes drop it.
     fn absorb_redundant_memory(
@@ -3154,6 +3173,84 @@ impl MemorySystem {
             similarity = %similarity,
             "Write gate: absorbed redundant memory"
         );
+    }
+
+    /// Keep `duplicate`, a near-exact copy of `original`: tag it and name what it repeats,
+    /// so recall ranks it below that memory, and give `original` the importance a repeat
+    /// earns. Returns the tagged record, or `None` when it could not be stored and the
+    /// memory stays as it was.
+    fn keep_near_exact_duplicate(
+        &self,
+        duplicate: &Memory,
+        original: Memory,
+        similarity: f32,
+    ) -> Option<Arc<Memory>> {
+        let mut tagged = duplicate.clone();
+        if !tagged
+            .experience
+            .tags
+            .iter()
+            .any(|tag| tag == duplicates::DUPLICATE_TAG)
+        {
+            tagged
+                .experience
+                .tags
+                .push(duplicates::DUPLICATE_TAG.to_string());
+        }
+        let metadata = &mut tagged.experience.metadata;
+        metadata.insert(
+            duplicates::DUPLICATE_OF_KEY.to_string(),
+            original.id.0.to_string(),
+        );
+        metadata.insert(
+            duplicates::DUPLICATE_KIND_KEY.to_string(),
+            duplicates::DuplicateKind::NearExact.label().to_string(),
+        );
+        if let Err(e) = self.long_term_memory.update(&tagged) {
+            tracing::warn!(
+                memory_id = %duplicate.id.0,
+                "Write gate: could not tag a near-exact duplicate, so it stays untagged: {e}"
+            );
+            return None;
+        }
+        let tagged = Arc::new(tagged);
+        // Recall reads a resident copy before storage, so an untagged one would escape the
+        // de-rank until it left the tier.
+        {
+            let mut working = self.working_memory.write();
+            if working.contains(&tagged.id) {
+                let _ = working.remove(&tagged.id);
+                let _ = working.add_shared(Arc::clone(&tagged));
+            }
+        }
+        {
+            let mut session = self.session_memory.write();
+            if session.contains(&tagged.id) {
+                let _ = session.remove(&tagged.id);
+                let _ = session.add_shared(Arc::clone(&tagged));
+            }
+        }
+
+        let original_importance = original.importance();
+        original.boost_importance(crate::constants::WRITE_GATE_ABSORPTION_BOOST);
+        match self.long_term_memory.update(&original) {
+            Ok(()) => self.note_importance_change(original_importance, original.importance()),
+            Err(e) => tracing::warn!(
+                original = %original.id.0,
+                "Write gate: could not reinforce the memory a duplicate repeats: {e}"
+            ),
+        }
+
+        crate::metrics::WRITE_GATE_DUPLICATES
+            .with_label_values(&[duplicates::DuplicateKind::NearExact.label()])
+            .inc();
+        tracing::info!(
+            memory_id = %duplicate.id.0,
+            duplicate_of = %original.id.0,
+            similarity = %similarity,
+            "Write gate: kept a near-exact duplicate, tagged and de-ranked"
+        );
+        Some(tagged)
     }
 
     /// Remember with agent context for multi-agent systems
@@ -4214,14 +4311,15 @@ impl MemorySystem {
         if retrieval::is_space_mismatch(error) {
             return;
         }
+        // The whole chain: the context alone hides a dimension refusal.
         tracing::warn!(
-            "Failed to index {what} {} in vector DB: {error}",
+            "Failed to index {what} {} in vector DB: {error:#}",
             memory_id.0
         );
         if let Err(record_err) = self.embedding_backlog.record(
             memory_id,
             embedding_backlog::EnqueueReason::IndexFailed,
-            Some(&error.to_string()),
+            Some(&format!("{error:#}")),
         ) {
             tracing::error!(
                 "embedding backlog: could not record {}: {record_err}",
@@ -5900,58 +5998,137 @@ impl MemorySystem {
     ///
     /// The records are written in one atomic store write (one commit and sync for a
     /// follower's page, not one per memory), so `memories` should name each id once.
+    ///
+    /// A snapshot is indexed with its primary vector only when that is in this corpus's
+    /// space. A leader whose embedding migration rewrote its records without journaling them
+    /// still logs the old model's vector for every memory not written since. Such a snapshot
+    /// takes the stored vector when the stored record has the same content; else its other
+    /// vectors are indexed where an index holds their space and the embed queue gives it one
+    /// here.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
-        // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
-        // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
-        // them, and a replica applying every snapshot grew 18.7 vectors per memory.
-        let vectors_kept: Vec<bool> = memories
-            .iter()
-            .map(|memory| {
-                self.retriever.is_indexed(&memory.id)
-                    && self.long_term_memory.get(&memory.id).is_ok_and(|stored| {
+        self.upsert_snapshots(memories)
+            .map(|refitted| refitted.len())
+    }
+
+    /// [`Self::upsert_memories`], returning for each of `memories`, in order, the record
+    /// as stored when its vector was refitted and `None` when it was stored as given. A
+    /// caller that journals the snapshots journals the refitted ones, so its log holds
+    /// what its store holds.
+    pub fn upsert_snapshots(&self, memories: &[Memory]) -> Result<Vec<Option<Memory>>> {
+        let index_space = self.retriever.index_space().clone();
+        let holds_own_vector = |memory: &Memory| {
+            memory.experience.primary_space(Some(&index_space)).as_ref() == Some(&index_space)
+        };
+        let mut fitted: Vec<Memory> = Vec::with_capacity(memories.len());
+        let mut vectors_kept: Vec<bool> = Vec::with_capacity(memories.len());
+        let mut refitted: Vec<Option<Memory>> = Vec::with_capacity(memories.len());
+        for memory in memories {
+            let indexed = self.retriever.is_indexed(&memory.id);
+            // Read only when it can matter: a replay's new memories, with their vector, are
+            // neither indexed nor waiting for one.
+            let stored = if indexed || !holds_own_vector(memory) {
+                self.long_term_memory.get(&memory.id).ok()
+            } else {
+                None
+            };
+            let given = memory;
+            let memory = self.fit_snapshot_vector(given, stored.as_ref());
+            refitted.push(
+                (memory.experience.embeddings != given.experience.embeddings)
+                    .then(|| memory.clone()),
+            );
+            // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
+            // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
+            // them, and a replica applying every snapshot grew 18.7 vectors per memory.
+            vectors_kept.push(
+                indexed
+                    && stored.is_some_and(|stored| {
                         keeps_vectors(&stored, &memory.experience.content)
                             && stored.experience.embeddings == memory.experience.embeddings
-                    })
-            })
-            .collect();
-        self.long_term_memory.update_many(memories)?;
-        let index_space = self.retriever.index_space().clone();
-        for (memory, vectors_kept) in memories.iter().zip(vectors_kept) {
-            let holds_own_vector =
-                memory.experience.primary_space(Some(&index_space)).as_ref() == Some(&index_space);
-            if !vectors_kept && holds_own_vector {
-                if let Err(e) = self.retriever.reindex_memory(memory) {
+                    }),
+            );
+            fitted.push(memory);
+        }
+        self.long_term_memory.update_many(&fitted)?;
+        for (memory, vectors_kept) in fitted.into_iter().zip(vectors_kept) {
+            if !vectors_kept && holds_own_vector(&memory) {
+                if let Err(e) = self.retriever.reindex_memory(&memory) {
                     tracing::warn!(
-                        "Failed to reindex memory {} in vector DB: {}",
-                        memory.id.0,
-                        e
+                        "Failed to reindex memory {} in vector DB: {e:#}",
+                        memory.id.0
                     );
+                    if let Err(record_err) = self.embedding_backlog.record(
+                        &memory.id,
+                        embedding_backlog::EnqueueReason::IndexFailed,
+                        Some(&format!("{e:#}")),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            memory.id.0
+                        );
+                    }
                 }
             } else if !vectors_kept {
                 // No vector in this corpus's space: its other vectors are indexed where an index
                 // holds their space, and the queue embeds it here, a batch at a time.
-                self.retriever.reindex_other_spaces(memory);
+                self.retriever.reindex_other_spaces(&memory);
                 if !memory.is_forgotten() {
                     self.enqueue_replica_embedding(&memory.id);
                 }
             }
-            let shared = std::sync::Arc::new(memory.clone());
+            let shared = std::sync::Arc::new(memory);
             {
                 let mut working = self.working_memory.write();
-                if working.contains(&memory.id) {
-                    let _ = working.remove(&memory.id);
+                if working.contains(&shared.id) {
+                    let _ = working.remove(&shared.id);
                     let _ = working.add_shared(std::sync::Arc::clone(&shared));
                 }
             }
             {
                 let mut session = self.session_memory.write();
-                if session.contains(&memory.id) {
-                    let _ = session.remove(&memory.id);
+                if session.contains(&shared.id) {
+                    let _ = session.remove(&shared.id);
                     let _ = session.add_shared(shared);
                 }
             }
         }
-        Ok(memories.len())
+        Ok(refitted)
+    }
+
+    /// `memory` with a primary vector in this corpus's space when the stored record of the
+    /// same content holds one and the snapshot does not. A leader that re-embedded its
+    /// records without journaling them re-sends the old model's vector with every access;
+    /// taking the stored vector spares a re-embed and a reindex per snapshot. The snapshot's
+    /// own vector in another space is kept beside it. Otherwise the snapshot is unchanged
+    /// and the embed queue gives it a vector here.
+    fn fit_snapshot_vector(&self, memory: &Memory, stored: Option<&Memory>) -> Memory {
+        let mut memory = memory.clone();
+        let index_space = self.retriever.index_space();
+        let given_space = memory.experience.primary_space(Some(index_space));
+        if given_space.as_ref() == Some(index_space) {
+            return memory;
+        }
+        let Some(reusable) = stored
+            .filter(|s| s.experience.content == memory.experience.content)
+            .filter(|s| s.experience.primary_space(Some(index_space)).as_ref() == Some(index_space))
+            .and_then(|s| s.experience.embeddings.clone())
+        else {
+            return memory;
+        };
+        let displaced = memory.experience.embeddings.take().zip(given_space);
+        memory
+            .experience
+            .set_primary_vector(reusable, index_space.clone());
+        // After the slot is restamped: a vector in the slot's own space is not kept twice.
+        if let Some((vector, from)) = displaced {
+            memory.experience.keep_vector(from, vector);
+        }
+        tracing::debug!(
+            memory_id = %memory.id.0,
+            space = %index_space,
+            "snapshot took the stored vector of the same content"
+        );
+        memory
     }
 
     /// Set or update the parent of a memory for hierarchical organization
@@ -8413,6 +8590,18 @@ impl MemorySystem {
         self.session_memory.read().contains(id)
     }
 
+    /// Test-only: the primary index's vector ids for `id`; empty when it is not indexed.
+    #[cfg(test)]
+    pub(crate) fn test_vector_ids(&self, id: &MemoryId) -> Vec<u32> {
+        self.retriever.vector_ids_of(id)
+    }
+
+    /// Test-only: the dimension the primary index holds.
+    #[cfg(test)]
+    pub(crate) fn test_primary_dimension(&self) -> usize {
+        self.embedder.primary_dimension()
+    }
+
     /// Test-only: force `access_history` + `last_accessed` on a stored memory so
     /// a synthetic access rhythm can be exercised deterministically. Updates both
     /// the long-term store and the in-memory session/working copies so the tick's
@@ -10692,13 +10881,180 @@ mod vector_index_reopen_tests {
 }
 
 #[cfg(test)]
+mod foreign_vector_tests {
+    use super::*;
+
+    /// A dimension the primary index does not hold: the other of the two the store has
+    /// used (MiniLM 384, Nomic 768).
+    fn foreign_dimension(system: &MemorySystem) -> usize {
+        if system.embedder.primary_dimension() == 768 {
+            384
+        } else {
+            768
+        }
+    }
+
+    /// Stored as a follower stored a pre-migration snapshot, before snapshots were refitted.
+    fn stored_with_foreign_vector(system: &MemorySystem, content: &str) -> Memory {
+        let memory = Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                embeddings: Some(vec![0.05; foreign_dimension(system)]),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        system
+            .long_term_memory
+            .update_many(std::slice::from_ref(&memory))
+            .expect("store");
+        memory
+    }
+
+    fn stored_vector_len(system: &MemorySystem, id: &MemoryId) -> usize {
+        system
+            .long_term_memory
+            .get(id)
+            .expect("stored")
+            .experience
+            .embeddings
+            .map_or(0, |e| e.len())
+    }
+
+    /// The live replica's 18: stored with a 384-d vector against a 768-d index, retried by
+    /// the drain every minute and refused every time. The drain re-embeds the stored vector
+    /// at this index's dimension, indexes the memory once and clears its row.
+    #[test]
+    fn the_backlog_drain_refits_a_stored_vector_of_another_dimension() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let dim = system.embedder.primary_dimension();
+            let memory =
+                stored_with_foreign_vector(&system, "the night ferry leaves pier four at eleven");
+            system
+                .embedding_backlog
+                .record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some("Failed to add vector to index"),
+                )
+                .expect("backlog row");
+
+            let (report, rewritten) = system.drain_embedding_backlog_journaled(10).expect("drain");
+
+            assert_eq!(
+                (report.drained, report.failed, report.remaining),
+                (1, 0, 0),
+                "{backend}: {report:?}"
+            );
+            assert_eq!(
+                rewritten,
+                vec![memory.id.clone()],
+                "{backend}: the refit is journaled"
+            );
+            assert_eq!(
+                stored_vector_len(&system, &memory.id),
+                dim,
+                "{backend}: stored vector"
+            );
+            assert_eq!(
+                system.retriever.vector_ids_of(&memory.id).len(),
+                1,
+                "{backend}: indexed once"
+            );
+            assert!(system
+                .embedding_backlog
+                .get(&memory.id)
+                .expect("read backlog")
+                .is_none());
+        }
+    }
+
+    /// The startup repair and every reindex pass a stored record to the index as it is: a
+    /// vector of another dimension is not a lost vector but a backlog row for one in the
+    /// index's space, which the drain fills.
+    #[test]
+    fn indexing_a_record_whose_vector_is_another_dimension_queues_it_for_one() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let memory =
+                stored_with_foreign_vector(&system, "the tide tables are posted at the ramp");
+            let refused = system
+                .retriever
+                .index_memory(&memory)
+                .expect_err("a vector in another space is refused");
+            assert!(
+                retrieval::is_space_mismatch(&refused),
+                "{backend}: {refused:#}"
+            );
+            assert_eq!(
+                system.retriever.vector_index_failure_count(),
+                0,
+                "{backend}"
+            );
+            let row = system
+                .embedding_backlog
+                .get(&memory.id)
+                .expect("read backlog")
+                .unwrap_or_else(|| panic!("{backend}: no backlog row"));
+            assert_eq!(
+                row.target_space.as_ref(),
+                Some(system.retriever.index_space()),
+                "{backend}"
+            );
+
+            let (report, _) = system.drain_embedding_backlog_journaled(10).expect("drain");
+            assert_eq!(
+                (report.drained, report.failed),
+                (1, 0),
+                "{backend}: {report:?}"
+            );
+            assert_eq!(
+                system.retriever.vector_ids_of(&memory.id).len(),
+                1,
+                "{backend}"
+            );
+        }
+    }
+
+    /// Fitting a snapshot reuses the stored vector of the same content instead of embedding
+    /// it again, and leaves a vector that already fits alone.
+    #[test]
+    fn a_refit_snapshot_reuses_the_stored_vector_of_the_same_content() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let dim = system.embedder.primary_dimension();
+            let mut stored =
+                stored_with_foreign_vector(&system, "the harbour master signs off at six");
+            stored.experience.embeddings = Some(vec![0.25; dim]);
+            let mut snapshot = stored.clone();
+            snapshot.experience.embeddings = Some(vec![0.05; foreign_dimension(&system)]);
+
+            let fitted = system.fit_snapshot_vector(&snapshot, Some(&stored));
+            assert_eq!(
+                fitted.experience.embeddings, stored.experience.embeddings,
+                "{backend}"
+            );
+
+            let fits = system.fit_snapshot_vector(&stored, None);
+            assert_eq!(
+                fits.experience.embeddings, stored.experience.embeddings,
+                "{backend}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use crate::config::StorageBackend;
     use tempfile::TempDir;
 
     /// One memory system per storage engine this build carries.
-    fn systems() -> Vec<(StorageBackend, MemorySystem, TempDir)> {
+    pub(super) fn systems() -> Vec<(StorageBackend, MemorySystem, TempDir)> {
         let config_for = |tmp: &TempDir| MemoryConfig {
             storage_path: tmp.path().to_path_buf(),
             ..Default::default()
@@ -11354,25 +11710,143 @@ mod lifecycle_tests {
         forgotten.id
     }
 
+    fn observation(content: &str) -> Experience {
+        Experience {
+            experience_type: ExperienceType::Observation,
+            content: content.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn the_write_gate_counts_only_text_that_adds_no_word_as_redundant() {
-        assert!(adds_no_new_words(
-            "Deploy failed, rolled back.",
-            "rolled back: the deploy FAILED"
-        ));
-        assert!(adds_no_new_words(
-            "the deploy failed",
-            "the deploy failed at 3pm on Tuesday"
-        ));
-        assert!(!adds_no_new_words(
-            "Item 10: the deploy failed",
-            "Item 11: the deploy failed"
-        ));
-        assert!(!adds_no_new_words(
-            "the deploy succeeded",
-            "the deploy failed"
-        ));
-        assert!(!adds_no_new_words("alice owns billing", "bob owns billing"));
+    fn the_write_gate_absorbs_a_copy_that_differs_only_in_whitespace_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let original = system
+                .remember(
+                    observation("the nightly batch stalled on a stale lock file"),
+                    None,
+                )
+                .unwrap();
+            let copy = system
+                .remember_deferred(
+                    observation("the nightly batch  stalled\non a stale lock file"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_ne!(
+                copy, original,
+                "{backend}: raw bytes differ, so remember keeps both"
+            );
+
+            let outcome = system.embed_and_index_journaled(&copy).unwrap();
+
+            let absorbed = system.get_memory(&copy).unwrap();
+            assert!(absorbed.is_forgotten(), "{backend}");
+            assert_eq!(
+                absorbed.experience.metadata.get("absorbed_by"),
+                Some(&original.0.to_string()),
+                "{backend}"
+            );
+            assert!(
+                outcome.rewritten.contains(&copy) && outcome.rewritten.contains(&original),
+                "{backend}: both records owe the journal an update"
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_gate_keeps_a_near_exact_copy_tagged_as_a_duplicate_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            let original = system
+                .remember(
+                    observation("The nightly batch stalled on a stale lock file."),
+                    None,
+                )
+                .unwrap();
+            let copy = system
+                .remember_deferred(
+                    observation("the nightly batch stalled, on a stale lock file"),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let outcome = system.embed_and_index_journaled(&copy).unwrap();
+
+            let kept = system.get_memory(&copy).unwrap();
+            assert!(!kept.is_forgotten(), "{backend}: a near-exact copy is kept");
+            assert!(
+                kept.experience
+                    .tags
+                    .contains(&duplicates::DUPLICATE_TAG.to_string()),
+                "{backend}"
+            );
+            assert_eq!(
+                kept.experience.metadata.get(duplicates::DUPLICATE_OF_KEY),
+                Some(&original.0.to_string()),
+                "{backend}"
+            );
+            assert_eq!(
+                kept.experience
+                    .metadata
+                    .get(duplicates::DUPLICATE_KIND_KEY)
+                    .map(String::as_str),
+                Some("near-exact"),
+                "{backend}"
+            );
+            assert!(
+                outcome.rewritten.contains(&copy) && outcome.rewritten.contains(&original),
+                "{backend}: both records owe the journal an update"
+            );
+            assert!(
+                system
+                    .working_memory
+                    .read()
+                    .get(&copy)
+                    .is_none_or(|resident| resident
+                        .experience
+                        .metadata
+                        .contains_key(duplicates::DUPLICATE_OF_KEY)),
+                "{backend}: a resident copy carries the tag recall de-ranks on"
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_gate_leaves_a_reply_whose_words_all_appear_in_a_longer_memory_on_every_engine() {
+        for (backend, system, _tmp) in systems() {
+            system
+                .remember(
+                    observation(
+                        "Thanks, I will check the stale lock file on the nightly batch tonight",
+                    ),
+                    None,
+                )
+                .unwrap();
+            let reply = system
+                .remember_deferred(observation("Thanks, I will check"), None, None)
+                .unwrap();
+
+            system.embed_and_index_journaled(&reply).unwrap();
+
+            let kept = system.get_memory(&reply).unwrap();
+            assert!(!kept.is_forgotten(), "{backend}");
+            assert!(
+                !kept
+                    .experience
+                    .metadata
+                    .contains_key(duplicates::DUPLICATE_OF_KEY),
+                "{backend}"
+            );
+            assert!(
+                !kept
+                    .experience
+                    .tags
+                    .contains(&duplicates::DUPLICATE_TAG.to_string()),
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -11386,7 +11860,7 @@ mod lifecycle_tests {
             system.long_term_memory.store(&survivor).unwrap();
             let mut redundant = memory(
                 ExperienceType::Observation,
-                "The nightly batch stalled: stale lock file.",
+                "the nightly batch  stalled on a stale lock file",
             );
             redundant.experience.tags = vec!["batch".to_string(), "incident".to_string()];
             system.long_term_memory.store(&redundant).unwrap();

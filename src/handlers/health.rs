@@ -413,15 +413,32 @@ pub async fn health_index_user(
         authenticated_user.as_ref().map(|extension| &extension.0),
     )?;
 
+    // Dashboards poll this per tenant every few seconds; a key walk per poll was the
+    // largest route by total time on a 15k-memory store. The maintained count answers
+    // them; `exact=true` recounts the store for a caller that must not trust it.
+    let exact = params
+        .get("exact")
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+
     let memory = state
         .get_user_memory_async(&user_id)
         .await
         .map_err(AppError::Internal)?;
-    let guard = memory.read();
-    let health = guard.index_health();
-    // Populations, not error counts: a memory stored and never indexed is
-    // unretrievable and raises nothing for a counter to see.
-    let coverage = guard.index_coverage().map_err(AppError::Internal)?;
+    let (health, coverage) = tokio::task::spawn_blocking(move || {
+        let guard = memory.read();
+        let health = guard.index_health();
+        // Populations, not error counts: a memory stored and never indexed is
+        // unretrievable and raises nothing for a counter to see.
+        let coverage = if exact {
+            guard.index_coverage()?
+        } else {
+            guard.index_coverage_cached()
+        };
+        anyhow::Ok((health, coverage))
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("index health task failed: {e}")))?
+    .map_err(AppError::Internal)?;
     let (stored, vector_indexed, lexically_indexed) = coverage;
     Ok((
         StatusCode::OK,
@@ -433,6 +450,7 @@ pub async fn health_index_user(
                 "vector_indexed": vector_indexed,
                 "lexically_indexed": lexically_indexed,
                 "shortfall": vector_indexed < stored || lexically_indexed < stored,
+                "stored_source": if exact { "recount" } else { "maintained" },
             },
             "total_vectors": health.total_vectors,
             "incremental_inserts": health.incremental_inserts,

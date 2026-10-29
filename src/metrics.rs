@@ -847,13 +847,26 @@ pub static BATCH_STORE_SIZE: LazyLock<Histogram> = LazyLock::new(|| {
 // Write Gate Metrics (Predictive Coding)
 // ============================================================================
 
-/// Memories absorbed by the write gate (redundant content detected)
+/// Memories the write gate absorbed because their text exactly repeats another's once
+/// whitespace is collapsed. The only duplicates it removes.
 pub static WRITE_GATE_ABSORBED: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
         "veld_write_gate_absorbed_total",
-        "Memories absorbed by write gate due to semantic redundancy",
+        "Memories absorbed by the write gate because their text exactly repeats another",
     )
     .expect("WRITE_GATE_ABSORBED metric must be valid at compile time")
+});
+
+/// Memories the write gate kept but tagged as repeating another, by kind.
+pub static WRITE_GATE_DUPLICATES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_write_gate_duplicates_total",
+            "Memories kept and tagged as duplicates by the write gate, by kind",
+        ),
+        &["kind"],
+    )
+    .expect("WRITE_GATE_DUPLICATES metric must be valid at compile time")
 });
 
 /// Comparisons against each similarity bar (see `crate::similarity::bars`).
@@ -1179,6 +1192,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
 
     // Write gate metrics
     register!(WRITE_GATE_ABSORBED, "WRITE_GATE_ABSORBED");
+    register!(WRITE_GATE_DUPLICATES, "WRITE_GATE_DUPLICATES");
     register!(
         SIMILARITY_BAR_EVALUATED_TOTAL,
         "SIMILARITY_BAR_EVALUATED_TOTAL"

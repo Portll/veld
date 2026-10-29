@@ -770,6 +770,21 @@ pub const ENTITY_COLD_START_THRESHOLD: usize = 50;
 /// Multiplier that doubles YAKE keyword budget during cold start
 pub const ENTITY_COLD_START_YAKE_BOOST: f32 = 0.5;
 
+/// Derived tags a write may keep: NER, YAKE, ingest hints and cold-start extraction together,
+/// capped by selectivity (`crate::entity_cap`) once the shape filter has run. The writer's own
+/// tags are never counted against it, and 50 is the record-wide limit, so the default cuts
+/// nothing: `VELD_DERIVED_TAG_BUDGET` lowers it for a store that wants to measure.
+///
+/// Measured 2026-10-24 on the live portll tenant, 300 newest records: the writer authored about
+/// nine tags, the median record carried 31, 107 of the 300 sat at the cap, and the surplus was
+/// NER and YAKE output on technical text. A lower default was tried on the locomo-gate against
+/// baseline 1b76710 with a clean control (main b61e9c2b: zero cases moved): 12 lost eleven gold
+/// documents and gained three (nDCG@10 0.460 to 0.435; runs 40088815804, 40095440879), 24 lost
+/// three and gained one (run 40100873196), 50 with the shape filter moved nothing (run
+/// 40095443074). On 109-character turns the cold-start extractor and YAKE together pass twelve
+/// derived tags often enough that the cut reaches the terms a question needs.
+pub const DERIVED_TAG_BUDGET: usize = 50;
+
 // =============================================================================
 // DEFAULT CONFIGURATION VALUES
 // =============================================================================
@@ -1067,6 +1082,17 @@ pub const SPREADING_FRONTIER_CAP: usize = 200;
 /// keeps this many candidates (shortest names first) and reads salience for
 /// those alone.
 pub const QUERY_ENTITY_FUZZY_MAX_CANDIDATES: usize = 32;
+
+/// Fused-score boost for a memory that carries a declared FilePath entity the query names by a
+/// path-shaped word (`serve.mjs`, `admin/serve.mjs`).
+///
+/// The entity-overlap boost gives an identifier match the same 0.10 a shared word earns, so
+/// "what changed in admin/serve.mjs" left the declared file level with every memory whose
+/// entities include "changed", and BM25 noise picked between them: on redb, 3 runs in 14 ranked
+/// a "changed" memory first (2026-10-28). Twice the per-word rate keeps the declared file
+/// ahead of word-only matches. Only paths the graph resolves to a declared FilePath count, so
+/// a query that names no declared file is unchanged.
+pub const DECLARED_PATH_MATCH_BOOST: f32 = 0.20;
 
 /// Most recent episodes recall takes from each entity a graph traversal reaches
 pub const RECALL_GRAPH_EPISODES_PER_ENTITY: usize = 20;
@@ -2111,35 +2137,37 @@ pub const REPLAY_MIN_CONNECTIONS: usize = 0;
 // Only store information that violates expectations (exceeds novelty threshold)
 // =============================================================================
 
-/// Similarity threshold above which a new memory is considered redundant.
+/// Nearest neighbours by vector the write gate compares a new memory's text against.
 ///
-/// When a new memory's cosine similarity to its nearest neighbor exceeds this,
-/// the memory is absorbed into the existing one (importance boost) rather than
-/// stored as a separate entry.
-///
-/// Justification:
-/// - 0.90 is stricter than INTERFERENCE_SEVERE_THRESHOLD (0.95) which merely
-///   suppresses importance. The write gate catches semantically-equivalent
-///   memories that differ in phrasing but carry no new information.
-/// - Below 0.90, memories are distinct enough to warrant separate storage.
-/// - Works in concert with exact-hash dedup (catches identical content)
-///   and interference detection (handles the 0.85-0.95 band).
-pub const WRITE_GATE_ABSORPTION_THRESHOLD: f32 = 0.90;
+/// The gate decides on the text, never on cosine: a cosine bar means a different thing for
+/// every embedder. On the LoCoMo corpus a 0.90 nearest-neighbour bar flagged 3% of turns under
+/// MiniLM, 27% under nomic and 77% under arctic-embed-xs. The vector search only picks which
+/// memories to read; an exact or near-exact copy is among the closest under any embedder.
+pub const WRITE_GATE_NEIGHBOURS: usize = 5;
 
-/// Minimum memory count before the write gate activates.
-///
-/// During cold-start (< this many memories), all content is novel by definition.
-/// The gate only makes sense when there's enough prior knowledge to compare against.
-///
-/// Justification:
-/// - 30 memories provides enough vector index density for meaningful similarity
-/// - Below this, false positives dominate (small index → high similarity scores)
-pub const WRITE_GATE_COLD_START_BYPASS: usize = 30;
+/// Shortest text, in word tokens, that may be a near-exact duplicate on token overlap alone.
+/// Below it only the same words in the same order count, so "Thanks Nate" and "Thanks Jo"
+/// stay distinct.
+pub const NEAR_DUPLICATE_MIN_TOKENS: usize = 4;
 
-/// Importance boost given to the existing memory when a redundant write is absorbed.
+/// Token-set Jaccard at or above which two texts of similar length are near-exact duplicates.
+/// A 20-word memory with one word changed scores 19/21 = 0.905 and qualifies; a 10-word one
+/// with one word changed scores 0.82 and does not.
+pub const NEAR_DUPLICATE_TOKEN_JACCARD: f32 = 0.9;
+
+/// Shortest-to-longest token-count ratio two near-exact duplicates must keep, so a short
+/// memory is never taken for a copy of a longer one that contains it.
+pub const NEAR_DUPLICATE_LENGTH_RATIO: f32 = 0.9;
+
+/// Factor recall applies to a memory the write gate kept as a near-exact duplicate, so it
+/// ranks below what it repeats.
+pub const WRITE_GATE_DUPLICATE_RECALL_FACTOR: f32 = 0.8;
+
+/// Importance boost given to the existing memory when a write repeats it, exactly or
+/// near-exactly.
 ///
 /// Justification:
-/// - 0.03 (3%) per absorbed write signals "this concept keeps coming up"
+/// - 0.03 (3%) per repeating write signals "this concept keeps coming up"
 /// - Matches Hebbian boost rate for consistency
 /// - Capped at 1.0 by the boost_importance logic
 pub const WRITE_GATE_ABSORPTION_BOOST: f32 = 0.03;

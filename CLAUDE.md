@@ -219,11 +219,11 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
   | Tier | What | When |
   |---|---|---|
   | 0 | `cargo check`, `cargo clippy`, `cargo fmt --check`, `cargo test --no-run`, `cargo bench --no-run` | any time |
-  | 1 | `scripts/test-local.sh <selectors>`: the unit tests of the modules a change touches, plus `--test handler_tests` | before every commit |
-  | 2 | `scripts/ci-local.sh`: CI's version and ledger checks, then `scripts/test-local.sh --full`: fmt, clippy (default, redb-only, zenoh), and on default, redb-only and rocksdb-only `cargo nextest run --profile ci`, the doctests and a bench build | push gate only; one at a time per machine |
+  | 1 | `scripts/test-local.sh <selectors>`: the unit tests of the modules a change touches, plus `--test handler_tests`, as separate calls (a test-name filter applies to every target in the call) | before every commit |
+  | 2 | `scripts/ci-local.sh`: CI's version and ledger checks, then `scripts/test-local.sh --full`: fmt, clippy (default, redb-only, zenoh), and on default, redb-only and rocksdb-only `cargo nextest run --profile ci`, the doctests and a bench build. Routed by the paths changed since origin/main: rocksdb-only tests only build unless an engine path or a cfg/feature line changed, and the engine-parity and recall-harness tests run only when recall, storage or embedding code changed (`TEST_LOCAL_ROUTE=all` runs everything; GitHub CI always does) | push gate only; one at a time per machine |
 
   Run tests through [scripts/test-local.sh](scripts/test-local.sh), not bare `cargo test`. It runs them niced with `RUST_TEST_THREADS=4` and a private target dir. It gives them a throwaway `HOME`, sharing only the model cache, and strips every inherited `VELD_*`/`SHODH_*` variable, so a test that forgets its own storage path cannot reach a live tenant. Tier 2 holds a machine-wide lock: full matrices run side by side pushed the load to 37 on 2026-10-21 and made tests flake. Tier 2 skips only the tests listed in [scripts/test-local.known-red](scripts/test-local.known-red), each with an owner and a task.
-- **Push gate**: a push to `main`, a `v*` tag or a branch with an open PR, and `gh pr create`, need a green tier 2 for the pushed tree. spine's `bin/ci-verdict.mjs --repo <worktree> --rev <sha>` runs `scripts/ci-local.sh` on a clean checkout of that commit and records the verdict in `.claude/store/ci-verdicts.jsonl`; the `spine-push-gate.mjs` hook refuses the push without a green one. The override, `CI_LOCAL_SKIP='<reason>' git push …`, is recorded in `.claude/store/push-gate.jsonl` and is the visible exception, not a habit. GitHub CI stays the authority for what is on origin.
+- **Push gate**: a push to `main`, a `v*` tag or a branch with an open PR, and `gh pr create`, need a green tier 2 for the pushed tree. spine's `bin/ci-verdict.mjs --repo <worktree> --rev <sha>` runs `scripts/ci-local.sh` on a clean checkout of that commit and records the verdict in `.claude/store/ci-verdicts.jsonl`; the `spine-push-gate.mjs` hook refuses the push without a green one. The override, `CI_LOCAL_SKIP='<reason>' git push …`, is recorded in `.claude/store/push-gate.jsonl` and is the visible exception, not a habit. GitHub CI stays the authority for what is on origin. After a rebase, a spine `ci-verdict.mjs` that knows [scripts/ci-rebase.sh](scripts/ci-rebase.sh) carries the patch's green full verdict, and runs only `test-local.sh --rebase` (fmt, clippy, every target built per leg, the handler suite). It does so when the commits main moved by touch no file in the patch and nothing in [scripts/ci-rebase.global](scripts/ci-rebase.global). Pass `--wait` so a busy machine queues the run instead of failing it.
 - **On macOS**, prefix Cargo calls with `./scripts/cargo-dev.sh` so libclang/RocksDB build path picks up the env shim.
 - **Local install builds** use `cargo build --profile local --bin veld` in a private `CARGO_TARGET_DIR` (no LTO, incremental codegen); `--release` (fat LTO, one unit) is for tagged releases. The Python cdylib is the `veld-py` crate, built only by maturin; `build.rs` reruns only when git HEAD moves, so a no-change rebuild is a no-op.
 - **Per-user locking**: any new write handler that mutates shared per-user state should follow the `CONSOLIDATION_LOCKS` pattern in [src/handlers/consolidation.rs](src/handlers/consolidation.rs):
@@ -314,6 +314,8 @@ Tags are the cheap "what kind of thing" signal (scoring signal 15). Keep them sh
 
 A memory typically carries one domain + one kind tag (`["storage", "decision"]`); add more only if you'll search by them.
 
+Veld adds derived tags of its own (NER, YAKE, ingest hints, cold-start extraction). After redaction it drops any derived tag without a letter, under two characters, or carrying code punctuation, then keeps the rarest by graph mention count up to `DERIVED_TAG_BUDGET` ([src/entity_cap.rs](src/entity_cap.rs)). The default budget is 50, the record-wide limit, so it cuts nothing: on the recall gate a budget of 12 lost eleven gold documents and 24 lost three (PR #88). `VELD_DERIVED_TAG_BUDGET` lowers it for a store that wants to measure. Authored tags are never counted against it.
+
 ### Citation format
 
 Reference code locations as `[path/to/file.rs:42](src/path/to/file.rs#L42)`. Reference decisions as `[0001-redb-migration.md](docs/src/decisions/0001-redb-migration.md)`. Reference HTTP routes as `` `POST /api/remember` `` (backticks, full path). The wiki-render layer (LLM-Wiki Phase 3) consumes this format directly; sticking to it now means no migration cost later.
@@ -368,7 +370,7 @@ The default release binary is ~30 MB. `--features embedded-docs` adds ~3-5 MB fo
 | Rust crate | `veld` on crates.io |
 | Node / MCP | `@veld/memory-mcp` on npm |
 | Python | `veld` on PyPI |
-| Docker | `varunveld/veld` |
+| Docker | `ghcr.io/portll/veld` |
 | MCP Registry | `veld` |
 | Cursor Directory | `veld-1` |
 
@@ -385,3 +387,12 @@ The default release binary is ~30 MB. `--features embedded-docs` adds ~3-5 MB fo
 - **Rectification / remediation**: [RECTIFICATION.md](RECTIFICATION.md), [REMEDIATION_PLAN.md](REMEDIATION_PLAN.md).
 
 The memory system you're using IS this codebase. Meta, but useful context.
+
+## Operating rules (token efficiency)
+
+- One task per session. When it lands, or context reaches about 150k tokens, write the handoff into
+  the spine task, run /session, and stop.
+- Never wait in a session for a verdict or CI. Hand the wait to the land job or the batch
+  coordinator, and end the session.
+- Batch status checks into one command; do not poll.
+- Anything a spine task record can carry (state, results, handoffs) goes there, not in SendMessage.

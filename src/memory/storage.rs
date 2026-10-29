@@ -6323,7 +6323,7 @@ mod tests {
         let mut ctx = crate::memory::context::ContextBuilder::new().build();
         ctx.why.causes = vec![CausalLink {
             other: d.clone(),
-            relation: crate::memory::facets::CausalRelation::Caused,
+            relation: crate::memory::facets::CausalKind::Caused,
             confidence: 0.7,
             inferred: false,
         }];

@@ -19,8 +19,8 @@
 //!
 //! // Create a test comparing semantic vs entity weight emphasis
 //! let test = ABTest::new("semantic_vs_entity")
-//!     .with_control(LearnedWeights::default())
-//!     .with_treatment(LearnedWeights {
+//!     .with_control(LearnedSignalWeights::default())
+//!     .with_treatment(LearnedSignalWeights {
 //!         semantic: 0.5,
 //!         entity: 0.25,
 //!         ..Default::default()
@@ -53,7 +53,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::relevance::LearnedWeights;
+use crate::relevance::LearnedSignalWeights;
 
 // =============================================================================
 // CONSTANTS
@@ -341,9 +341,9 @@ pub struct ABTestConfig {
     /// Description of what's being tested
     pub description: String,
     /// Weights for control group
-    pub control_weights: LearnedWeights,
+    pub control_weights: LearnedSignalWeights,
     /// Weights for treatment group
-    pub treatment_weights: LearnedWeights,
+    pub treatment_weights: LearnedSignalWeights,
     /// Fraction of traffic to send to treatment (0.0-1.0)
     pub traffic_split: f32,
     /// Significance level for statistical tests (default 0.05)
@@ -362,8 +362,8 @@ impl Default for ABTestConfig {
             id: Uuid::new_v4().to_string(),
             name: String::new(),
             description: String::new(),
-            control_weights: LearnedWeights::default(),
-            treatment_weights: LearnedWeights::default(),
+            control_weights: LearnedSignalWeights::default(),
+            treatment_weights: LearnedSignalWeights::default(),
             traffic_split: DEFAULT_TRAFFIC_SPLIT,
             significance_level: DEFAULT_SIGNIFICANCE_LEVEL,
             min_impressions: MIN_SAMPLE_SIZE,
@@ -459,7 +459,7 @@ impl ABTest {
     }
 
     /// Get weights for a variant
-    pub fn get_weights(&self, variant: ABTestVariant) -> &LearnedWeights {
+    pub fn get_weights(&self, variant: ABTestVariant) -> &LearnedSignalWeights {
         match variant {
             ABTestVariant::Control => &self.config.control_weights,
             ABTestVariant::Treatment => &self.config.treatment_weights,
@@ -589,12 +589,12 @@ impl ABTestBuilder {
         self
     }
 
-    pub fn with_control(mut self, weights: LearnedWeights) -> Self {
+    pub fn with_control(mut self, weights: LearnedSignalWeights) -> Self {
         self.config.control_weights = weights;
         self
     }
 
-    pub fn with_treatment(mut self, weights: LearnedWeights) -> Self {
+    pub fn with_treatment(mut self, weights: LearnedSignalWeights) -> Self {
         self.config.treatment_weights = weights;
         self
     }
@@ -1596,7 +1596,7 @@ impl ABTestManager {
         &self,
         test_id: &str,
         user_id: &str,
-    ) -> Result<LearnedWeights, ABTestError> {
+    ) -> Result<LearnedSignalWeights, ABTestError> {
         let mut tests = self.tests.write();
         let test = tests
             .get_mut(test_id)
@@ -1905,8 +1905,8 @@ mod tests {
 
     #[test]
     fn test_learned_weights_integration() {
-        let control = LearnedWeights::default();
-        let mut treatment = LearnedWeights {
+        let control = LearnedSignalWeights::default();
+        let mut treatment = LearnedSignalWeights {
             semantic: 0.6,
             entity: 0.2,
             ..Default::default()
@@ -2144,7 +2144,7 @@ mod tests {
         // =================================================================
 
         // Control: Old weights (pre-CTX-3) - no momentum amplification, no access_count, no graph_strength
-        let control_weights = LearnedWeights {
+        let control_weights = LearnedSignalWeights {
             semantic: 0.35,
             entity: 0.30,
             tag: 0.10,
@@ -2157,7 +2157,7 @@ mod tests {
         };
 
         // Treatment: New weights (CTX-3) - momentum amplification, access_count, graph_strength
-        let treatment_weights = LearnedWeights::default(); // Uses current optimized defaults
+        let treatment_weights = LearnedSignalWeights::default(); // Uses current optimized defaults
 
         println!("📊 WEIGHT COMPARISON:");
         println!("   Control (old):   semantic={:.2}, entity={:.2}, momentum={:.2}, access={:.2}, graph={:.2}",

@@ -1,4 +1,3 @@
 # Tests `scripts/test-local.sh --full` skips: red on main, with an owner and a task fixing them.
 # One test name per line, then a comment naming the owner and the spine task.
 # Remove a line in the same commit that makes its test pass.
-a_declared_file_path_is_recalled_by_its_file_name  # owner veld-9e, veld-declared-path-recall:2 (PR #79): intermittent on redb-only (1 of 7 runs); admin/serve.mjs skips the reranker and the fused order then depends on what background indexing has finished

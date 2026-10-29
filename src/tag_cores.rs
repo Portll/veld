@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Serialize;
 
+use crate::entity_frequency::Undetermined;
 use crate::memory::tag_sources::TagSources;
 use crate::memory::MemoryId;
 
@@ -39,11 +40,6 @@ pub struct StampedCore {
     pub sources: BTreeMap<&'static str, usize>,
     pub redacted_placements: usize,
     pub sample_memory_ids: Vec<MemoryId>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct Undetermined {
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

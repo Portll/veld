@@ -17,7 +17,7 @@ Status: accepted by the operator 2026-10-03. Work is tracked in SPINE plan
    ([ADR 0007](../src/decisions/0007-rocksdb-default-engine.md)).
 2. **Live back on RocksDB.** Done by the write-frozen cutover (0.5) on 2026-10-03.
 3. **Web UI accepted (W11). Robotics (W12a) and anomaly finding (W12b) both taken.**
-4. **Boot-guard fix (0.3): landed** as `f25a17fd`.
+4. **Boot-guard fix (0.3): landed** as `309eb346`.
 5. **The plan and the ledger live here,** in `docs/upstream/`.
 
 ## Where things stand (measured 2026-10-03)
@@ -27,7 +27,7 @@ Status: accepted by the operator 2026-10-03. Work is tracked in SPINE plan
 | Fork base | upstream `2737b4f` (2026-03-27, PR #135), not `618d7b1` | normalised diff of veld's import `3e4d7ca7` against upstream `src/`: 14,348 differing lines, against 21,809 at `618d7b1` |
 | Upstream since then | 307 first-parent commits, 768 non-merge, to `902daf8` (2026-09-27) | `git rev-list --first-parent` |
 | Upstream releases since | none: v0.2.0 (2026-04-09) is the only tag, plus a GLiNER asset release | `gh release list` |
-| veld since import | 493 commits | `git rev-list 3e4d7ca7..b2a47508` |
+| veld since import | 493 commits | `git rev-list 3e4d7ca7..b1d9a948` |
 | Files changed on both sides | 163 (144 still in conflict) | per-file numstat, shodh→veld paths |
 | Files upstream changed that veld did not | 454: 371 new, 26 clean in-place ports, 50 deletions, 7 veld removed | same |
 | Translated patches applying cleanly | none of three trials: #559 rejected 2 of 4 hunks (one file absent), #330 rejected 3 of 3, #425 rejected 17 of 32 | `sed` rename then `git apply --reject` on veld main |
@@ -36,7 +36,7 @@ Status: accepted by the operator 2026-10-03. Work is tracked in SPINE plan
 | Already ported to veld | 20+ veld commits cite upstream PRs (#225, #235, #252, #281, #287, #290, #325, #334, #362, #389, #393, #400, #409, #411, #416, #442, #513, #518, #538, #539) | upstream report |
 | veld fixes sent upstream | 10 merged Portll PRs since the fork; #318, #555 and #556 still open | upstream report |
 | Live store | RocksDB since 2026-10-03 17:05Z, after the frozen cutover (0.5): 21 units, 2,703,826 records, every unit verified; tenants with data RocksDB 15, redb 15 (kept for the rollback window to 2026-10-10) | SPINE task 1.5 |
-| Live binary | legacy-rocksdb build of veld `bdaa1263`, both engines compiled | `/health` |
+| Live binary | legacy-rocksdb build of veld `7d63718d`, both engines compiled | `/health` |
 
 The full inventories (upstream delta, veld's layers, conflict hotspots) were measured from clones
 of both trees on 2026-10-03; `LEDGER.tsv` carries the per-commit result.
@@ -78,7 +78,7 @@ of both trees on 2026-10-03; `LEDGER.tsv` carries the per-commit result.
     Default features become `rocksdb` plus `storage-redb`; the default engine is RocksDB for a new
     data directory. CI tests the default, plus a redb-only build
     (`--no-default-features --features storage-redb`), so neither engine rots.
-0.3 **Boot guard in the redb-only build.** Landed as `f25a17fd`: with no RocksDB code, an empty
+0.3 **Boot guard in the redb-only build.** Landed as `309eb346`: with no RocksDB code, an empty
     RocksDB directory reads as empty, and one with table files still refuses.
 0.4 **CI shows clippy's verdict.** The clippy step pipes through `tee` without `pipefail`, which hides
     two deny-level errors in `tests/adaptive_memory_tests.rs` and `tests/memory_tiering_tests.rs`;
@@ -87,7 +87,7 @@ of both trees on 2026-10-03; `LEDGER.tsv` carries the per-commit result.
     implementation over the traits; the coverage matrix has no gap). Encryption-v2 on redb: done.
     Backup and point-in-time restore parity: done; the parity test found a RocksDB restore that
     deleted the tenant's data, fixed. Equal recall-gate scores: done; rank lists are repeat-stable on
-    fresh stores (9d2be1bc), and recording run 37485608452 scored the same on both engines on
+    fresh stores (8c88b17f), and recording run 37485608452 scored the same on both engines on
     every metric and every case. 14-day live soak: needs the operator, since live runs RocksDB; a
     daily soak rehearsal on a clone can run meanwhile.
 0.5 **Live back on RocksDB, with writes frozen.** Done 2026-10-03: rehearsed on an APFS clone
@@ -264,7 +264,7 @@ not through it:
   own modules.
 - **Embeddings:** LM Studio and Nomic embedders, embedding alignment, the cross-encoder registry.
   Seam: the embedder trait.
-- **Fixes upstream lacks:** the bounded `/api/relevant` walk (`b2a47508`) and the `chunk_text`
+- **Fixes upstream lacks:** the bounded `/api/relevant` walk (`b1d9a948`) and the `chunk_text`
   progress fix.
 - **Desktop, TUI, docs site, wiki rendering.** Seam: the HTTP API.
 

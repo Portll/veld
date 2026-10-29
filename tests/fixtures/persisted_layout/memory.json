@@ -98,25 +98,7 @@
       }
     }
   },
-  "CausalLink": {
-    "STRUCT": [
-      {
-        "other": "BYTES"
-      },
-      {
-        "relation": {
-          "TYPENAME": "CausalRelation"
-        }
-      },
-      {
-        "confidence": "F32"
-      },
-      {
-        "inferred": "BOOL"
-      }
-    ]
-  },
-  "CausalRelation": {
+  "CausalKind": {
     "ENUM": {
       "0": {
         "caused": "UNIT"
@@ -134,6 +116,24 @@
         "motivated": "UNIT"
       }
     }
+  },
+  "CausalLink": {
+    "STRUCT": [
+      {
+        "other": "BYTES"
+      },
+      {
+        "relation": {
+          "TYPENAME": "CausalKind"
+        }
+      },
+      {
+        "confidence": "F32"
+      },
+      {
+        "inferred": "BOOL"
+      }
+    ]
   },
   "ChangeType": {
     "ENUM": {

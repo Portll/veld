@@ -24,7 +24,7 @@ so a reader can tell a redb fault from a leader fault.
 | | |
 |---|---|
 | Start | 2026-10-21T13:29Z |
-| Build | main `1b767103`, built 2026-10-21T13:02:45Z, carrying `feat/redb-parity` (`5c225c5e`) and the index tables, content-hash layout and parity fixes from the redb-equivalence plan |
+| Build | main `90572ea9`, built 2026-10-21T13:02:45Z, carrying `feat/redb-parity` (`c76548ec`) and the index tables, content-hash layout and parity fixes from the redb-equivalence plan |
 | End of window | 2026-11-04 |
 
 Earlier replica time (2026-10-19 to 13:29Z today) ran the 0.8.4+1 build of 2026-10-20 and does
@@ -49,3 +49,8 @@ clock and names the cause.
 |---|---|---|---|---|---|
 | 0 | 2026-10-21 | 0 | 0 | 0 | clock start |
 | 1 | 2026-10-22 | 0 | 0 | 0 | data directory 18.7 GiB to 2.7 GiB: the checkpoint store compacted the `portll` and `spine` projection side-data files at first open on the new build (log 13:35Z, 14:06Z, 14:46Z); user count unchanged at 46 |
+| 2 | 2026-10-23 | 0 | 0 | 0 | leader sync failures 0 (the four on days 0-1 were the leader's feed timing out before its own install); 2.73 GiB |
+| 3 | 2026-10-24 | 0 | 0 | 0 | both servers reinstalled on the 2026-10-24T06:59Z build of main (parity fixes, dependency migrations); reading taken 01:51Z before and 17:50Z after; 2.85 GiB |
+| 4 | 2026-10-25 | 0 | 0 | 0 | 2.86 GiB |
+| 5 | 2026-10-26 | 0 | 0 | 0 | 2.87 GiB |
+| 6 | 2026-10-27 | 0 | 0 | 0 | 2.88 GiB |

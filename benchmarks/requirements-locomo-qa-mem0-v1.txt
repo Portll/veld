@@ -1,0 +1,5 @@
+# mem0 OSS 1.x (the last 1.x release) for locomo_qa_eval.py --system mem0, in its own venv
+# (~/.venvs/veld-bench-mem0-v1).
+mem0ai==1.0.11
+tiktoken==0.14.0
+requests>=2.28.0

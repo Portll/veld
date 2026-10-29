@@ -2164,6 +2164,27 @@ impl super::MemorySystem {
                 }
             }
 
+            // A memory carrying a declared FilePath the query names ranks on that match; see
+            // DECLARED_PATH_MATCH_BOOST for why the overlap boost above is not enough.
+            if let Some(paths) = resolved_entities
+                .as_ref()
+                .map(|r| &r.file_paths)
+                .filter(|p| !p.is_empty())
+            {
+                let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                for id in &ids {
+                    let carries = candidates
+                        .get(id)
+                        .is_some_and(|v| v.entities_lower.iter().any(|e| paths.contains(e)));
+                    if carries {
+                        if let Some(score) = fused.get_mut(id) {
+                            *score += crate::constants::DECLARED_PATH_MATCH_BOOST;
+                        }
+                        attr.entry(id.clone()).or_default().entity_overlap = true;
+                    }
+                }
+            }
+
             // ===========================================================================
             // LAYER 4.527: BM25 SPECIFICITY DISCOUNT
             // ===========================================================================
@@ -3358,11 +3379,22 @@ impl super::MemorySystem {
                 // entity signal before it. When the query names an identifier the memory
                 // carries as an entity, that entity is put in front of the text the
                 // cross-encoder reads. Nothing changes for a query with no identifier in it.
+                //
+                // Without a cross-encoder only dense similarity is left, and it cannot tell
+                // `serve.mjs` from `server.mjs`. A query that names a path some candidate
+                // declared keeps its fused order, which already carries the identifier boost.
+                // Hyphenated words ("dairy-free") are identifiers above but not paths here: the
+                // dense fallback ranks them better than fusion does.
+                let mut declared_path_named = false;
                 let query_identifiers: Vec<String> = query_text
                     .split_whitespace()
                     .map(clean_query_token)
                     .map(|t| t.to_lowercase())
                     .filter(|t| is_structured_token(t))
+                    .collect();
+                let query_paths: Vec<&String> = query_identifiers
+                    .iter()
+                    .filter(|t| is_path_shaped_token(t))
                     .collect();
                 let candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)> = memories
                     .iter()
@@ -3383,6 +3415,12 @@ impl super::MemorySystem {
                                 .map(String::as_str)
                                 .collect()
                         };
+                        declared_path_named |= named.iter().any(|e| {
+                            let e = e.to_lowercase();
+                            query_paths
+                                .iter()
+                                .any(|q| query_token_matches_entity(q, &e))
+                        });
                         let text = if named.is_empty() {
                             m.experience.content.clone()
                         } else {
@@ -3397,8 +3435,13 @@ impl super::MemorySystem {
                     })
                     .collect();
 
-                match reranker.rerank(query_text, candidates) {
-                    Ok(reranked) => {
+                match reranker.rerank(query_text, candidates, !declared_path_named) {
+                    Ok(None) => {
+                        tracing::debug!(
+                            "Layer 5.3: no cross-encoder for a declared path, keeping the fused order"
+                        );
+                    }
+                    Ok(Some(reranked)) => {
                         // Build score lookup from cross-encoder results
                         let ce_scores: std::collections::HashMap<MemoryId, f32> =
                             reranked.into_iter().collect();
@@ -3441,6 +3484,15 @@ impl super::MemorySystem {
                 }
             }
         }
+
+        // Layer 5.32: rank on the unified score. The cross-encoder takes its window from the
+        // fused order on purpose: the recall gate of 2026-10-29 (run 40812556433) lost five gold
+        // documents when the window was chosen by the unified score instead. When the
+        // reranker ran it already sorted the list; when it was skipped, the layers that do not
+        // re-sort (5.7, 5.8, the final cut while 5.35 and 5.36 stay quiet) used to run on an
+        // order the Layer 5 signals had never touched. Stable, so fused ties keep their
+        // content-ordered tie-break.
+        memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
 
         // =====================================================================
         // LAYER 5.35: FRAGMENT DEMOTION (FIX-R2)
@@ -3545,6 +3597,18 @@ impl super::MemorySystem {
                 people_intent = format!("{people_intent:.1}"),
                 "Layer 5.36/5.37: query-term coverage and person density"
             );
+        }
+
+        // =====================================================================
+        // LAYER 5.38: NEAR-EXACT DUPLICATE DE-RANK
+        // =====================================================================
+        // A memory the write gate kept as a near-exact copy of another ranks below what it
+        // repeats. Before MMR, so diversification sees the demoted order.
+        // [signal: duplicate_derank] Gated by the disabled_signals dial; on by default.
+        if dials_snapshot.signal_enabled("duplicate_derank")
+            && crate::memory::duplicates::derank(&mut memories)
+        {
+            tracing::debug!("Layer 5.38: de-ranked near-exact duplicates");
         }
 
         // =====================================================================
@@ -5811,6 +5875,11 @@ pub(crate) fn clean_query_token(word: &str) -> String {
         .to_string()
 }
 
+/// A token that could name a file: `serve.mjs`, `admin/serve.mjs`.
+pub(crate) fn is_path_shaped_token(token: &str) -> bool {
+    token.contains('.') || token.contains('/')
+}
+
 /// A token carrying interior [`QUERY_TOKEN_KEEP`] punctuation is an identifier, not a word.
 pub(crate) fn is_structured_token(token: &str) -> bool {
     token.chars().any(|c| QUERY_TOKEN_KEEP.contains(&c))
@@ -6141,6 +6210,8 @@ pub(crate) struct ResolvedQueryEntities {
     /// Every resolved entity in query order (focal, then the other words, then path-shaped
     /// words' FilePath entities), each once: two words resolving to one entity traverse it once.
     pub(crate) all: Vec<uuid::Uuid>,
+    /// Lowercased names of the declared FilePath entities path-shaped query words resolved to.
+    pub(crate) file_paths: Vec<String>,
 }
 
 /// Resolve recall's query words against the graph. Every word goes through the exact,
@@ -6157,6 +6228,7 @@ pub(crate) fn resolve_query_entities(
 ) -> ResolvedQueryEntities {
     let mut focal: Vec<uuid::Uuid> = Vec::new();
     let mut all: Vec<uuid::Uuid> = Vec::new();
+    let mut file_paths: Vec<String> = Vec::new();
     let mut tried: HashSet<&str> = HashSet::new();
     let add = |list: &mut Vec<uuid::Uuid>, uuid: uuid::Uuid| {
         if !list.contains(&uuid) {
@@ -6197,16 +6269,24 @@ pub(crate) fn resolve_query_entities(
     // path-shaped word, at most FILE_PATH_SUFFIX_MAX_CANDIDATES entity reads each.
     for word in query_text.split_whitespace() {
         let token = clean_query_token(word);
-        if !token.contains('.') && !token.contains('/') {
+        if !is_path_shaped_token(&token) {
             continue;
         }
         if let Ok(found) = graph.find_file_paths_by_suffix(&token) {
             for entity in found {
                 add(&mut all, entity.uuid);
+                let name = entity.name.to_lowercase();
+                if !file_paths.contains(&name) {
+                    file_paths.push(name);
+                }
             }
         }
     }
-    ResolvedQueryEntities { focal, all }
+    ResolvedQueryEntities {
+        focal,
+        all,
+        file_paths,
+    }
 }
 
 /// An entity's most recent episodes as recall's graph layer uses them, read once per recall
@@ -7154,5 +7234,33 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+
+    #[test]
+    fn a_path_shaped_word_names_the_declared_file_it_resolves_to() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let mut declared = entity("commitwork:Admin/serve.mjs");
+        declared.labels = vec![EntityLabel::FilePath];
+        let serve = graph.add_entity(declared).unwrap();
+        graph.add_entity(entity("observe.mjs")).unwrap();
+
+        for query in [
+            "what changed in serve.mjs",
+            "what changed in admin/serve.mjs",
+        ] {
+            let resolved = resolve_query_entities(&graph, &[], &[], query);
+            assert_eq!(resolved.all, vec![serve], "{query}");
+            assert_eq!(
+                resolved.file_paths,
+                vec!["commitwork:admin/serve.mjs".to_string()],
+                "{query}"
+            );
+        }
+        let none = resolve_query_entities(&graph, &[], &["changed"], "what changed recently");
+        assert!(
+            none.file_paths.is_empty(),
+            "no path-shaped word, no declared file"
+        );
     }
 }

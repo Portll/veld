@@ -33,7 +33,7 @@ docker run -d \
   --name veld \
   -p 3030:3030 \
   -v veld_data:/data \
-  varunveld/veld
+  ghcr.io/portll/veld
 ```
 
 Data persists in the named volume. Config via env vars (`VELD_*` —

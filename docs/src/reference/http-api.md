@@ -6,9 +6,9 @@
 
 # HTTP API
 
-Veld exposes **231** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
+Veld exposes **273** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
 
-> Warning: 2 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
+> Warning: 1 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
 
 Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 
@@ -34,7 +34,14 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 
 | Method | Path | Handler |
 |---|---|---|
+| `POST` | `/api/admin/replication/follow` | `replication::follow` |
+| `GET` | `/api/admin/replication/records` | `replication::records` |
+| `GET` | `/api/admin/replication/status` | `replication::status` |
+| `POST` | `/api/admin/replication/unfollow` | `replication::unfollow` |
 | `POST` | `/api/admin/reset-rate-limit` | `admin::reset_rate_limit` |
+| `POST` | `/api/admin/storage/export` | `storage_migration::export` |
+| `POST` | `/api/admin/storage/import` | `storage_migration::import` |
+| `POST` | `/api/admin/storage/migrate` | `storage_migration::migrate` |
 
 ## /anchor
 
@@ -128,7 +135,16 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 
 | Method | Path | Handler |
 |---|---|---|
+| `GET` | `/api/dials` | `dials::get_dials` |
+| `PUT` | `/api/dials` | `dials::set_dials` |
 | `GET` | `/api/dials/schema` | `dials::get_dials_schema` |
+
+## /embeddings
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/embeddings/backlog` | `consolidation::get_embedding_backlog` |
+| `POST` | `/api/embeddings/backlog/drain` | `consolidation::drain_embedding_backlog` |
 
 ## /entity
 
@@ -212,12 +228,14 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `GET` | `/api/graph/data/{user_id}` | `visualization::get_graph_data` |
 | `POST` | `/api/graph/entities/all` | `graph::get_all_entities` |
+| `POST` | `/api/graph/entities/frequency` | `graph::get_entity_frequency` |
 | `POST` | `/api/graph/entity/add` | `mif::add_entity` |
 | `DELETE` | `/api/graph/entity/delete` | `graph::delete_entity` |
 | `POST` | `/api/graph/entity/find` | `graph::find_entity` |
 | `POST` | `/api/graph/episode/get` | `graph::get_episode` |
 | `POST` | `/api/graph/relationship/add` | `mif::add_relationship` |
 | `POST` | `/api/graph/relationship/invalidate` | `graph::invalidate_relationship` |
+| `POST` | `/api/graph/tags/stamped-cores` | `graph::get_stamped_cores` |
 | `POST` | `/api/graph/traverse` | `graph::traverse_graph` |
 | `DELETE` | `/api/graph/{user_id}/clear` | `graph::clear_user_graph` |
 | `POST` | `/api/graph/{user_id}/rebuild` | `graph::rebuild_user_graph` |
@@ -284,6 +302,7 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `POST` | `/api/memories` | `crud::list_memories_post` |
 | `POST` | `/api/memories/bulk` | `crud::bulk_delete_memories` |
 | `POST` | `/api/memories/clear` | `crud::clear_all_memories` |
+| `GET` | `/api/memories/count` | `crud::count_memories` |
 | `GET` | `/api/memories/{memory_id}` | `crud::get_memory` |
 
 ## /memory
@@ -496,6 +515,14 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `GET` | `/api/todos/{todo_id}/subtasks` | `todos::list_subtasks` |
 | `POST` | `/api/todos/{todo_id}/update` | `todos::update_todo` |
 
+## /ui
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/ui/knows` | `ui::ui_knows` |
+| `GET` | `/api/ui/recall-log` | `ui::ui_recall_log` |
+| `GET` | `/api/ui/tags` | `ui::ui_tags` |
+
 ## /upsert
 
 | Method | Path | Handler |
@@ -508,12 +535,37 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/api/user_auth/2fa/confirm` | `user_auth::confirm_2fa` |
 | `POST` | `/api/user_auth/2fa/enroll` | `user_auth::enroll_2fa` |
+| `GET` | `/api/user_auth/admin/audit` | `user_admin::read_audit` |
 | `POST` | `/api/user_auth/admin/demote` | `user_auth::admin_demote` |
+| `POST` | `/api/user_auth/admin/keys/factors` | `keys::enrol_factor` |
+| `POST` | `/api/user_auth/admin/keys/init` | `keys::init` |
+| `POST` | `/api/user_auth/admin/keys/passkey` | `keys::passkey_start` |
+| `GET` | `/api/user_auth/admin/keys/passkey/{ticket}` | `keys::passkey_poll` |
+| `POST` | `/api/user_auth/admin/keys/recovery_codes` | `keys::add_recovery_code` |
+| `POST` | `/api/user_auth/admin/keys/revoke` | `keys::revoke` |
+| `POST` | `/api/user_auth/admin/keys/rotate_data_keys` | `keys::rotate_data_keys` |
+| `POST` | `/api/user_auth/admin/keys/rotate_master_keys` | `keys::rotate_master_keys` |
+| `POST` | `/api/user_auth/admin/keys/rotate_passphrase` | `keys::rotate_passphrase` |
+| `GET` | `/api/user_auth/admin/keys/status` | `keys::status` |
 | `POST` | `/api/user_auth/admin/promote` | `user_auth::admin_promote` |
+| `GET` | `/api/user_auth/admin/sessions` | `user_admin::list_sessions` |
+| `POST` | `/api/user_auth/admin/sessions/revoke` | `user_admin::revoke_session` |
+| `GET` | `/api/user_auth/admin/users` | `user_admin::list_users` |
+| `POST` | `/api/user_auth/admin/users/disable` | `user_admin::disable_user` |
+| `POST` | `/api/user_auth/admin/users/enable` | `user_admin::enable_user` |
+| `POST` | `/api/user_auth/admin/users/reset_2fa` | `user_admin::reset_2fa` |
+| `POST` | `/api/user_auth/admin/users/reset_password` | `user_admin::reset_password` |
+| `POST` | `/api/user_auth/admin/users/unlock` | `user_admin::unlock_user` |
+| `GET` | `/api/user_auth/keys/passkey/{ticket}` | `keys::passkey_page` |
+| `POST` | `/api/user_auth/keys/passkey/{ticket}/result` | `keys::passkey_result` |
 | `POST` | `/api/user_auth/login` | `user_auth::login` |
 | `POST` | `/api/user_auth/logout` | `user_auth::logout` |
+| `GET` | `/api/user_auth/me` | `user_admin::me` |
+| `POST` | `/api/user_auth/password` | `user_admin::change_password` |
 | `POST` | `/api/user_auth/recover` | `user_auth::recover` |
+| `POST` | `/api/user_auth/recovery_codes` | `user_admin::regenerate_recovery_codes` |
 | `POST` | `/api/user_auth/register` | `user_auth::register` |
+| `POST` | `/api/user_auth/sessions/revoke` | `user_admin::revoke_own_session` |
 | `POST` | `/api/user_auth/sessions/revoke_all` | `user_auth::revoke_all_sessions` |
 | `POST` | `/api/user_auth/sessions/revoke_mine` | `user_auth::revoke_my_other_sessions` |
 | `ANY` | `/api/user_auth/{*path}` | `user_auth::disabled_fallback` |
@@ -552,6 +604,29 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | Method | Path | Handler |
 |---|---|---|
 | `POST` | `/api/wintermute/dimensions` | `external_dimensions::push_dimensions` |
+
+## Aliases
+
+These paths share one handler, so they accept the same request and return the same response. The first path is the canonical one; the others are kept for older clients.
+
+| Method | Canonical | Aliases | Handler |
+|---|---|---|---|
+| `DELETE` | `/api/memory/{memory_id}` | `/api/forget/{memory_id}` | `crud::delete_memory` |
+| `GET` | `/api/memory/{memory_id}` | `/api/memories/{memory_id}` | `crud::get_memory` |
+| `GET` | `/api/context/status` | `/api/context_status` | `health::get_context_status` |
+| `GET` | `/api/events/sse` | `/api/events` | `webhooks::memory_events_sse` |
+| `POST` | `/api/backup/list` | `/api/backups` | `consolidation::list_backups` |
+| `POST` | `/api/backup/purge` | `/api/backups/purge` | `consolidation::purge_backups` |
+| `POST` | `/api/spine/dimensions` | `/api/sleight/dimensions`, `/api/external/dimensions`, `/api/wintermute/dimensions` | `external_dimensions::push_dimensions` |
+| `POST` | `/api/context/status` | `/api/context_status` | `health::update_context_status` |
+| `POST` | `/api/prompt/gen` | `/api/prompt/generate` | `prompt_gen::prompt_gen` |
+| `POST` | `/api/proactive_context` | `/api/context` | `recall::proactive_context` |
+| `POST` | `/api/recall/tags` | `/api/recall/by-tags` | `recall::recall_by_tags` |
+| `POST` | `/api/remember/batch` | `/api/batch_remember` | `remember::batch_remember` |
+| `POST` | `/api/reminders/check` | `/api/reminders/context` | `todos::check_context_reminders` |
+| `POST` | `/api/projects` | `/api/projects/add` | `todos::create_project` |
+| `POST` | `/api/reminders/set` | `/api/remind` | `todos::create_reminder` |
+| `POST` | `/api/todos` | `/api/todos/list` | `todos::list_todos` |
 
 ---
 

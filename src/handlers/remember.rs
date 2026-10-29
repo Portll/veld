@@ -1082,15 +1082,25 @@ pub(crate) fn assemble_tags(
         );
     }
 
-    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Ordered by SELECTIVITY before the cut, not by arrival. Measured 2026-08-27: the tail this
-        // used to discard was 19x more selective than the head it kept, because arrival order is
-        // uncorrelated with worth. See crate::entity_cap.
+    // The writer's tags stay; the derived tail is judged on shape, then capped at
+    // DERIVED_TAG_BUDGET by SELECTIVITY rather than arrival. Measured 2026-08-27: the tail the old
+    // arrival cut discarded was 19x more selective than the head it kept. See crate::entity_cap.
+    let (well_formed, malformed) = crate::entity_cap::well_formed_derived(
+        std::mem::take(&mut merged_entities),
+        authored_entity_count,
+    );
+    merged_entities = well_formed;
+    let derived_cap = crate::entity_cap::derived_cap(
+        authored_entity_count,
+        state.server_config.derived_tag_budget,
+        validation::MAX_ENTITIES_PER_MEMORY,
+    );
+    if merged_entities.len() > derived_cap {
         let mentions = mention_counts_for(state, user_id, &merged_entities);
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
-            validation::MAX_ENTITIES_PER_MEMORY,
+            derived_cap,
             &mentions,
         );
         merged_entities = kept;
@@ -1098,10 +1108,11 @@ pub(crate) fn assemble_tags(
             considered = report.considered,
             authored = report.authored,
             dropped = report.dropped,
+            malformed,
             // A persistent zero here means the ordering is inert and should be questioned rather
             // than trusted — which is why it is logged rather than assumed.
             rescued_by_ordering = report.rescued_by_ordering,
-            "Capped entities by selectivity"
+            "Capped derived tags by selectivity"
         );
     }
     let labelled = TagSources::label(
@@ -2021,26 +2032,32 @@ pub async fn batch_remember(
                     let redaction = crate::redaction::redact_entities(&mut merged);
                     crate::declared_entities::retain_unredacted(&mut declared);
                     let redacted = merged.clone();
-                    if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
-                        tracing::debug!(
-                            batch_index = index,
-                            count = merged.len(),
-                            max = validation::MAX_ENTITIES_PER_MEMORY,
-                            "Capping entities to maximum allowed in batch item"
-                        );
+                    let (well_formed, malformed) = crate::entity_cap::well_formed_derived(
+                        std::mem::take(&mut merged),
+                        authored_batch_count,
+                    );
+                    merged = well_formed;
+                    let derived_cap = crate::entity_cap::derived_cap(
+                        authored_batch_count,
+                        state.server_config.derived_tag_budget,
+                        validation::MAX_ENTITIES_PER_MEMORY,
+                    );
+                    if merged.len() > derived_cap {
                         let mentions = mention_counts_for(&state, &user_id, &merged);
                         let (kept, report) = crate::entity_cap::cap_by_selectivity(
                             std::mem::take(&mut merged),
                             authored_batch_count,
-                            validation::MAX_ENTITIES_PER_MEMORY,
+                            derived_cap,
                             &mentions,
                         );
                         merged = kept;
                         tracing::debug!(
+                            batch_index = index,
                             considered = report.considered,
                             dropped = report.dropped,
+                            malformed,
                             rescued_by_ordering = report.rescued_by_ordering,
-                            "Capped batch entities by selectivity"
+                            "Capped derived batch tags by selectivity"
                         );
                     }
                     let labelled =
@@ -2638,21 +2655,32 @@ pub async fn upsert_memory(
     let redaction = crate::redaction::redact_entities(&mut merged_entities);
     crate::declared_entities::retain_unredacted(&mut declared);
     let redacted_tags = merged_entities.clone();
-    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        // Selectivity-ordered, same as the store path. See crate::entity_cap.
+    // Same shape filter and derived budget as the store path. See crate::entity_cap.
+    let (well_formed, malformed) = crate::entity_cap::well_formed_derived(
+        std::mem::take(&mut merged_entities),
+        authored_entity_count,
+    );
+    merged_entities = well_formed;
+    let derived_cap = crate::entity_cap::derived_cap(
+        authored_entity_count,
+        state.server_config.derived_tag_budget,
+        validation::MAX_ENTITIES_PER_MEMORY,
+    );
+    if merged_entities.len() > derived_cap {
         let mentions = mention_counts_for_async(&state, &req.user_id, &merged_entities).await;
         let (kept, report) = crate::entity_cap::cap_by_selectivity(
             std::mem::take(&mut merged_entities),
             authored_entity_count,
-            validation::MAX_ENTITIES_PER_MEMORY,
+            derived_cap,
             &mentions,
         );
         merged_entities = kept;
         tracing::debug!(
             considered = report.considered,
             dropped = report.dropped,
+            malformed,
             rescued_by_ordering = report.rescued_by_ordering,
-            "Capped entities by selectivity in upsert"
+            "Capped derived tags by selectivity in upsert"
         );
     }
     let labelled_tags = TagSources::label(
