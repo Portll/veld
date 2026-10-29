@@ -1050,6 +1050,14 @@ impl RetrievalEngine {
         self.len() == 0
     }
 
+    /// Whether the primary index can hold `embedding`: it has the active embedder's
+    /// dimension. A memory's stored vector can have another, written by a model the
+    /// store migrated away from on a leader that rewrote its records without journaling
+    /// them, so the snapshots a follower receives still carry the old vector.
+    pub fn fits_primary(&self, embedding: &[f32]) -> bool {
+        embedding.len() == self.embedder.primary_dimension()
+    }
+
     /// Get set of all indexed memory IDs (for integrity checking)
     /// Whether the vector index holds this memory, without cloning the whole id set.
     pub fn is_indexed(&self, memory_id: &MemoryId) -> bool {
@@ -1169,13 +1177,20 @@ impl RetrievalEngine {
 
             ids
         } else {
-            // Short content: single embedding (use pre-computed if available)
-            let embedding = if let Some(emb) = &memory.experience.embeddings {
-                emb.clone()
-            } else {
-                self.embedder
+            // Short content: single embedding, the pre-computed one when this index can hold
+            // it. A stored vector of another length came from a model the store has since
+            // left (a replicated or restored snapshot), and Vamana refuses it.
+            let embedding = match memory
+                .experience
+                .embeddings
+                .as_deref()
+                .filter(|emb| self.fits_primary(emb))
+            {
+                Some(emb) => emb.to_vec(),
+                None => self
+                    .embedder
                     .encode(&text)
-                    .context("Failed to generate embedding")?
+                    .context("Failed to generate embedding")?,
             };
 
             let mut index = self.vector_index.write();
