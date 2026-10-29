@@ -930,6 +930,11 @@ pub struct ServerConfig {
     /// in the knowledge graph. 10 entities → max 45 co-occurrence edges.
     pub max_entities_per_memory: usize,
 
+    /// Derived tags (NER, YAKE, ingest hints, cold start) a stored record keeps beside the
+    /// writer's own; default `constants::DERIVED_TAG_BUDGET` (50, which cuts nothing), env
+    /// `VELD_DERIVED_TAG_BUDGET` (1–50) to lower it on a store that measures the effect.
+    pub derived_tag_budget: usize,
+
     /// Log-periodic fractal decay scales in days (default: [7.0, 30.0, 365.0])
     /// Controls resonance frequencies in the power-law decay function.
     /// Weekly/monthly/yearly rhythms by default; override via VELD_LOG_PERIODIC_SCALES
@@ -1003,6 +1008,7 @@ impl Default for ServerConfig {
             backup_max_count: 7,           // Keep 7 backups (1 week of daily backups)
             backup_enabled: false,         // Disabled by default, auto-enabled in production
             max_entities_per_memory: 10,   // Cap entities per memory (10 → max 45 edges)
+            derived_tag_budget: crate::constants::DERIVED_TAG_BUDGET,
             log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
             auto_compress: true,
             graph_mirror_sync_secs: crate::memory::slow_store::MIRROR_SYNC_TTL.as_secs(),
@@ -1414,6 +1420,20 @@ impl ServerConfig {
                     );
                 }
                 config.max_entities_per_memory = clamped;
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_DERIVED_TAG_BUDGET") {
+            if let Ok(n) = val.parse::<usize>() {
+                let clamped = n.clamp(1, 50);
+                if clamped != n {
+                    tracing::warn!(
+                        "VELD_DERIVED_TAG_BUDGET={} clamped to {} (valid range: 1–50)",
+                        n,
+                        clamped
+                    );
+                }
+                config.derived_tag_budget = clamped;
             }
         }
 

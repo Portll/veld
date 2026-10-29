@@ -770,6 +770,21 @@ pub const ENTITY_COLD_START_THRESHOLD: usize = 50;
 /// Multiplier that doubles YAKE keyword budget during cold start
 pub const ENTITY_COLD_START_YAKE_BOOST: f32 = 0.5;
 
+/// Derived tags a write may keep: NER, YAKE, ingest hints and cold-start extraction together,
+/// capped by selectivity (`crate::entity_cap`) once the shape filter has run. The writer's own
+/// tags are never counted against it, and 50 is the record-wide limit, so the default cuts
+/// nothing: `VELD_DERIVED_TAG_BUDGET` lowers it for a store that wants to measure.
+///
+/// Measured 2026-10-24 on the live portll tenant, 300 newest records: the writer authored about
+/// nine tags, the median record carried 31, 107 of the 300 sat at the cap, and the surplus was
+/// NER and YAKE output on technical text. A lower default was tried on the locomo-gate against
+/// baseline 1b76710 with a clean control (main b61e9c2b: zero cases moved): 12 lost eleven gold
+/// documents and gained three (nDCG@10 0.460 to 0.435; runs 40088815804, 40095440879), 24 lost
+/// three and gained one (run 40100873196), 50 with the shape filter moved nothing (run
+/// 40095443074). On 109-character turns the cold-start extractor and YAKE together pass twelve
+/// derived tags often enough that the cut reaches the terms a question needs.
+pub const DERIVED_TAG_BUDGET: usize = 50;
+
 // =============================================================================
 // DEFAULT CONFIGURATION VALUES
 // =============================================================================
