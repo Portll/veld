@@ -59,19 +59,36 @@ fn should_hide_dev_key() -> bool {
         .unwrap_or(false)
 }
 
+/// The keys `VELD_API_KEYS` (comma-separated), else `VELD_API_KEY`, names when one of
+/// them is non-blank. Either outranks `VELD_DEV_API_KEY`.
+fn configured_api_keys() -> Option<String> {
+    ["VELD_API_KEYS", "VELD_API_KEY"]
+        .into_iter()
+        .filter_map(|name| env::var(name).ok())
+        .find(|keys| !keys.trim().is_empty())
+}
+
+/// Which key a development-mode server checks, in [`validate_api_key`]'s order.
+#[derive(Debug, PartialEq, Eq)]
+enum DevKeySource {
+    ApiKeys { dev_key_unused: bool },
+    DevKey,
+    Generated,
+}
+
+fn dev_key_source() -> DevKeySource {
+    let has_dev_key = env::var("VELD_DEV_API_KEY").is_ok_and(|k| !k.trim().is_empty());
+    match (configured_api_keys().is_some(), has_dev_key) {
+        (true, dev_key_unused) => DevKeySource::ApiKeys { dev_key_unused },
+        (false, true) => DevKeySource::DevKey,
+        (false, false) => DevKeySource::Generated,
+    }
+}
+
 /// Log security warnings at startup based on environment configuration
 pub fn log_security_status() {
-    let has_api_keys = env::var("VELD_API_KEYS")
-        .or_else(|_| env::var("VELD_API_KEY"))
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-    let has_dev_key = env::var("VELD_DEV_API_KEY")
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-    let is_prod = is_production_mode();
-
-    if is_prod {
-        if has_api_keys {
+    if is_production_mode() {
+        if configured_api_keys().is_some() {
             tracing::info!("Running in PRODUCTION mode with API key authentication");
         } else {
             tracing::error!(
@@ -82,13 +99,31 @@ pub fn log_security_status() {
         tracing::warn!("╔════════════════════════════════════════════════════════════════╗");
         tracing::warn!("║  SECURITY WARNING: Running in DEVELOPMENT mode                 ║");
         tracing::warn!("║                                                                ║");
-        if has_dev_key {
-            tracing::warn!("║  Using VELD_DEV_API_KEY for authentication.                  ║");
-            tracing::warn!("║  DO NOT use this configuration in production!                 ║");
-        } else if !has_api_keys {
-            tracing::warn!("║  No API keys configured. Using default dev key.              ║");
-            tracing::warn!("║  DEPRECATION: Default dev key will be removed in v0.2.0.     ║");
-            tracing::warn!("║  Set VELD_DEV_API_KEY or VELD_API_KEYS to override.        ║");
+        match dev_key_source() {
+            // config.toml's api_key arrives as VELD_API_KEY, so a second instance given
+            // only VELD_DEV_API_KEY still answers to the first one's key.
+            DevKeySource::ApiKeys {
+                dev_key_unused: true,
+            } => {
+                tracing::warn!(
+                    "║  VELD_DEV_API_KEY is unused: VELD_API_KEYS or VELD_API_KEY     ║"
+                );
+                tracing::warn!(
+                    "║  outranks it (config.toml's api_key is read as VELD_API_KEY).  ║"
+                );
+            }
+            DevKeySource::ApiKeys {
+                dev_key_unused: false,
+            } => {}
+            DevKeySource::DevKey => {
+                tracing::warn!("║  Using VELD_DEV_API_KEY for authentication.                  ║");
+                tracing::warn!("║  DO NOT use this configuration in production!                 ║");
+            }
+            DevKeySource::Generated => {
+                tracing::warn!("║  No API keys configured. Using default dev key.              ║");
+                tracing::warn!("║  DEPRECATION: Default dev key will be removed in v0.2.0.     ║");
+                tracing::warn!("║  Set VELD_DEV_API_KEY or VELD_API_KEYS to override.        ║");
+            }
         }
         tracing::warn!("║                                                                ║");
         tracing::warn!("║  For production, set:                                          ║");
@@ -200,39 +235,30 @@ pub fn validate_api_key(provided_key: &str) -> Result<(), AuthError> {
     // Get API keys from environment.
     // Resolution order: VELD_API_KEYS (plural, comma-separated) → VELD_API_KEY (singular)
     //                 → VELD_DEV_API_KEY (dev mode) → built-in default (dev mode only)
-    let valid_keys = match env::var("VELD_API_KEYS") {
-        Ok(keys) if !keys.trim().is_empty() => keys,
-        _ => match env::var("VELD_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => key,
-            _ => {
-                // In production, refuse to start without API keys
-                let is_production = env::var("VELD_ENV")
-                    .map(|v| v.to_lowercase() == "production" || v.to_lowercase() == "prod")
-                    .unwrap_or(false);
+    let valid_keys = match configured_api_keys() {
+        Some(keys) => keys,
+        None => {
+            // In production, refuse to start without API keys
+            if is_production_mode() {
+                tracing::error!("VELD_API_KEYS not set in production mode");
+                return Err(AuthError::NotConfigured);
+            }
 
-                if is_production {
-                    tracing::error!("VELD_API_KEYS not set in production mode");
-                    return Err(AuthError::NotConfigured);
+            // Development mode: use VELD_DEV_API_KEY, or fall back to built-in default
+            match env::var("VELD_DEV_API_KEY") {
+                Ok(key) if !key.trim().is_empty() => {
+                    tracing::warn!("Using VELD_DEV_API_KEY for development (not for production!)");
+                    key
                 }
-
-                // Development mode: use VELD_DEV_API_KEY, or fall back to built-in default
-                match env::var("VELD_DEV_API_KEY") {
-                    Ok(key) if !key.trim().is_empty() => {
-                        tracing::warn!(
-                            "Using VELD_DEV_API_KEY for development (not for production!)"
-                        );
-                        key
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "No API key configured. Falling back to default dev key. \
-                             Set VELD_DEV_API_KEY to override."
-                        );
-                        default_dev_api_key()
-                    }
+                _ => {
+                    tracing::warn!(
+                        "No API key configured. Falling back to default dev key. \
+                         Set VELD_DEV_API_KEY to override."
+                    );
+                    default_dev_api_key()
                 }
             }
-        },
+        }
     };
 
     let keys: Vec<&str> = valid_keys.split(',').map(|k| k.trim()).collect();
@@ -670,6 +696,49 @@ mod tests {
         env::set_var("VELD_DEV_API_KEY", "dev-key-123");
         assert!(validate_api_key("dev-key-123").is_ok());
         assert!(validate_api_key("wrong").is_err());
+        clear_auth_env();
+    }
+
+    #[test]
+    fn a_configured_key_outranks_the_dev_key_and_the_banner_says_so() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        env::set_var("VELD_DEV_API_KEY", "dev-key-123");
+        env::set_var("VELD_API_KEY", "config-toml-key");
+        assert_eq!(
+            dev_key_source(),
+            DevKeySource::ApiKeys {
+                dev_key_unused: true
+            }
+        );
+        assert!(validate_api_key("config-toml-key").is_ok());
+        assert!(validate_api_key("dev-key-123").is_err());
+        clear_auth_env();
+    }
+
+    #[test]
+    fn the_banner_reads_keys_in_the_order_validation_does() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        assert_eq!(dev_key_source(), DevKeySource::Generated);
+        env::set_var("VELD_DEV_API_KEY", "dev-key-123");
+        assert_eq!(dev_key_source(), DevKeySource::DevKey);
+        env::set_var("VELD_API_KEYS", "  ");
+        env::set_var("VELD_API_KEY", "singular-key");
+        assert_eq!(
+            dev_key_source(),
+            DevKeySource::ApiKeys {
+                dev_key_unused: true
+            }
+        );
+        assert!(validate_api_key("singular-key").is_ok());
+        env::remove_var("VELD_DEV_API_KEY");
+        assert_eq!(
+            dev_key_source(),
+            DevKeySource::ApiKeys {
+                dev_key_unused: false
+            }
+        );
         clear_auth_env();
     }
 
