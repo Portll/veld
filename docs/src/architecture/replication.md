@@ -106,7 +106,11 @@ While an instance follows a leader, only the frames it applies write to it:
   empty or stale data: todos and their comments, projects and project files, reminders,
   context blocks, the knowledge graph and tag provenance, facts, lineage, sessions, A/B
   tests, datasets, consolidation events and Claude session status. Memory reads (recall,
-  list, get, search, export) are served.
+  list, get, search, export) are served. Where a served read also draws on such a store,
+  it says so in `not_replicated`: `proactive_context` lists its `relevant_todos`,
+  `due_reminders`, `context_reminders` and `relevant_facts` sections, and
+  `/api/export/mif` lists `todos`, `projects`, `reminders` and, when asked for,
+  `knowledge_graph`.
 - **Recall makes no usage writes**, as under `VELD_RECALL_READONLY=1`: no access counts,
   coactivation edges, interference, retrieval counter, reconsolidation boost or feedback.
   `proactive_context` does not auto-ingest, and its `ingested_memory_id` is empty.

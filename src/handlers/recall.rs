@@ -545,6 +545,10 @@ pub struct ProactiveContextResponse {
     /// Entities detected in the query context
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_entities: Vec<DetectedEntityInfo>,
+    /// On a follower, the sections read from stores replication does not carry: they
+    /// hold this instance's own data, not its leader's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_replicated: Vec<&'static str>,
 }
 
 // =============================================================================
@@ -1377,6 +1381,7 @@ pub async fn proactive_context(
             relevant_facts: Vec::new(),
             latency_ms: 0.0,
             detected_entities: Vec::new(),
+            not_replicated: Vec::new(),
         }));
     }
 
@@ -2696,6 +2701,16 @@ pub async fn proactive_context(
         relevant_facts,
         latency_ms,
         detected_entities,
+        not_replicated: if state.replication.client_writes_allowed() {
+            Vec::new()
+        } else {
+            vec![
+                "relevant_todos",
+                "due_reminders",
+                "context_reminders",
+                "relevant_facts",
+            ]
+        },
     }))
 }
 

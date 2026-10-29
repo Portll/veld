@@ -116,7 +116,7 @@ pub async fn export_mif(
     .map_err(AppError::Internal)?;
 
     // Convert to requested output format
-    let output = if req.format == "veld" || req.format == "json" {
+    let mut output = if req.format == "veld" || req.format == "json" {
         serde_json::to_value(&doc).map_err(|e| AppError::Internal(e.into()))?
     } else {
         let registry = AdapterRegistry::new();
@@ -132,6 +132,15 @@ pub async fn export_mif(
             "todo_count": doc.todos.len(),
         })
     };
+    // On a follower these hold this instance's own data, not its leader's. An import
+    // ignores the field.
+    if !state.replication.client_writes_allowed() {
+        let mut stores = vec!["todos", "projects", "reminders"];
+        if req.include_graph {
+            stores.push("knowledge_graph");
+        }
+        output["not_replicated"] = serde_json::json!(stores);
+    }
 
     state.log_event(
         &user_id,

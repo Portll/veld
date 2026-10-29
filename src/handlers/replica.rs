@@ -743,6 +743,16 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert!(body["ingested_memory_id"].is_null(), "{body}");
+            assert_eq!(
+                body["not_replicated"],
+                json!([
+                    "relevant_todos",
+                    "due_reminders",
+                    "context_reminders",
+                    "relevant_facts"
+                ]),
+                "{body}"
+            );
         }
         // Long enough for any fire-and-forget write a handler spawned to land.
         tokio::time::sleep(Duration::from_millis(300)).await;
