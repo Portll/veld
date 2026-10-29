@@ -6605,6 +6605,101 @@ mod graph_admission_tests {
             }
         }
     }
+
+    /// `(edges, typed edges)` after a short conversation goes through the write path: the
+    /// fallback NER, `remember`'s tag assembly with its YAKE keywords and provenance ledger,
+    /// then the graph write under `admission`.
+    fn conversation_edges(admission: GraphAdmission) -> (usize, usize) {
+        const TURNS: [&str; 6] = [
+            "Caroline: I went to the LGBTQ support group yesterday and it was so powerful.",
+            "Melanie: That sounds amazing, Caroline. I painted a sunrise by the lake last week.",
+            "Caroline: I moved to Boston from Sweden four years ago with my mom.",
+            "Melanie: My kids and I went camping in the mountains near Seattle.",
+            "Caroline: I am researching adoption agencies because I want to be a mom.",
+            "Melanie: Pottery class is my favorite way to relax after work, Caroline.",
+        ];
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let ner = NeuralNer::new_fallback(NerConfig::default());
+        let keywords = mgr.get_keyword_extractor();
+        for turn in TURNS {
+            let records: Vec<NerEntityRecord> = ner
+                .extract(turn)
+                .unwrap()
+                .into_iter()
+                .map(|e| NerEntityRecord {
+                    text: e.text,
+                    entity_type: e.entity_type.as_str().to_string(),
+                    confidence: e.confidence,
+                    start_char: Some(e.start),
+                    end_char: Some(e.end),
+                })
+                .collect();
+            let assembled = crate::handlers::remember::assemble_tags(
+                &mgr,
+                USER,
+                &mut Vec::new(),
+                crate::handlers::remember::TagInputs {
+                    content: turn,
+                    filename: None,
+                    tags: &[],
+                    intent_tags: &[],
+                    ingest_tags: &[],
+                    ner_entities: records,
+                    keywords: keywords.extract_texts(turn),
+                },
+            );
+            let experience = Experience {
+                content: turn.to_string(),
+                entities: assembled.entities.clone(),
+                tags: assembled.entities,
+                ner_entities: assembled.ner_entities,
+                ..Default::default()
+            };
+            let id = MemoryId(uuid::Uuid::new_v4());
+            mgr.build_experience_graph(
+                USER,
+                &experience,
+                &id,
+                &[],
+                Some(&assembled.labelled),
+                admission,
+            )
+            .unwrap();
+        }
+        let graph = mgr.get_user_graph(USER).unwrap();
+        let edges = graph.read().get_all_relationships().unwrap();
+        let typed = edges
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e.relation_type,
+                    RelationType::RelatedTo | RelationType::CoOccurs | RelationType::CoRetrieved
+                )
+            })
+            .count();
+        (edges.len(), typed)
+    }
+
+    /// The measurement behind this gate set, at test scale: on the LoCoMo gate veld wrote
+    /// 9,965 edges, none typed, where upstream wrote 615, 8.6% typed. The semantic typer is
+    /// off on both sides so the typed count does not depend on which embedder loads.
+    #[test]
+    fn a_short_conversation_yields_fewer_edges_and_typed_ones() {
+        let mut before = legacy();
+        before.verb_entities = true;
+        let mut after = GraphAdmission::from_env();
+        after.semantic_relations = false;
+
+        let (edges_before, typed_before) = conversation_edges(before);
+        let (edges_after, typed_after) = conversation_edges(after);
+        assert_eq!(typed_before, 0, "the old graph typed only causal cues");
+        assert!(
+            edges_after * 2 < edges_before,
+            "gated {edges_after} edges against {edges_before} ungated"
+        );
+        assert!(typed_after > 0, "{typed_after} of {edges_after} typed");
+    }
 }
 
 /// Annotate a query with NER-extracted entity names.
