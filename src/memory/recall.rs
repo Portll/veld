@@ -255,7 +255,7 @@ impl super::MemorySystem {
 
         // Usage writes below (access counts, coactivation, retrieval counter) are skipped under
         // read-only recall — see `recall_readonly()` for why an eval must not teach the store.
-        let readonly = super::recall_readonly();
+        let readonly = self.recall_readonly();
 
         // Update access counts with instrumentation for consolidation events
         if !readonly {
@@ -392,7 +392,7 @@ impl super::MemorySystem {
                 .then_with(|| a.id.cmp(&b.id))
         });
         memories.truncate(limit);
-        if !super::recall_readonly() {
+        if !self.recall_readonly() {
             if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
                 self.stats.write().total_retrievals = count;
             }
@@ -432,7 +432,7 @@ impl super::MemorySystem {
         let criteria = storage::SearchCriteria::ByDate { start, end };
         let mut memories = self.advanced_search(criteria)?;
         memories.truncate(limit);
-        if !super::recall_readonly() {
+        if !self.recall_readonly() {
             if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
                 self.stats.write().total_retrievals = count;
             }
@@ -4363,7 +4363,7 @@ impl super::MemorySystem {
 
             // Suppression COMPUTES in every mode (per-query ranking); interference
             // ACCUMULATION is a usage write, so read-only recall must not teach the detector.
-            let record_state = !super::recall_readonly();
+            let record_state = !self.recall_readonly();
             let competition_result = self
                 .interference_detector
                 .write()
@@ -4627,7 +4627,7 @@ impl super::MemorySystem {
 
         // Usage writes from here on (access counts, coactivation, retrieval counter) are
         // skipped under read-only recall — see `recall_readonly()`.
-        let readonly = super::recall_readonly();
+        let readonly = self.recall_readonly();
 
         // Update access counts with instrumentation for consolidation events
         // (only for memories that survived competition)
@@ -5640,7 +5640,7 @@ impl super::MemorySystem {
     /// ```
     pub fn recall_tracked(&self, query: &Query) -> Result<TrackedRetrieval> {
         let result = self.retriever.search_tracked(query, query.max_results)?;
-        if !super::recall_readonly() {
+        if !self.recall_readonly() {
             if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
                 self.stats.write().total_retrievals = count;
             }

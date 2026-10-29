@@ -348,6 +348,8 @@ proptest = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 serde-reflection = "0.6.0"
 tempfile = "3.24"
+# A WebSocket client for the /api/stream tests: the version axum's `ws` feature already builds.
+tokio-tungstenite = "0.29"
 
 [[bench]]
 name = "memory_benchmarks"

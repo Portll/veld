@@ -399,6 +399,11 @@ pub struct MultiUserMemoryManager {
     /// How far replication followers have read each tenant's feed, for the
     /// journal purge (kept only while the purge is on).
     feed_floors: parking_lot::Mutex<crate::replication::FeedFloors>,
+
+    /// What this instance follows. While it follows a leader it is a read-only replica:
+    /// every tenant store shares the flag, so recall makes no usage writes and
+    /// maintenance changes no record.
+    pub replication: Arc<crate::replication::Replication>,
 }
 
 /// How many tenants [`MultiUserMemoryManager::close_all_tenants`] closes at once.
@@ -852,6 +857,7 @@ impl MultiUserMemoryManager {
             feed_floors: parking_lot::Mutex::new(crate::replication::FeedFloors::load(
                 &base_path_for_floors,
             )),
+            replication: Arc::default(),
         };
 
         info!("Running initial audit log rotation...");
@@ -1654,6 +1660,7 @@ impl MultiUserMemoryManager {
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
         user_mem.set_owner_user_id(user_id);
+        user_mem.share_replica_readonly(self.replication.following_flag());
 
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
 
@@ -2216,7 +2223,7 @@ impl MultiUserMemoryManager {
         // Retry with backoff for RocksDB lock contention (same pattern as get_user_memory).
         // Graph eviction drops synchronously so contention is rare, but possible on Windows
         // where file handle release can lag.
-        let graph_memory = {
+        let mut graph_memory = {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
@@ -2262,6 +2269,7 @@ impl MultiUserMemoryManager {
                 }
             }
         };
+        graph_memory.share_replica_readonly(self.replication.following_flag());
         let graph_arc = Arc::new(parking_lot::RwLock::new(graph_memory));
 
         self.graph_memories
@@ -3233,6 +3241,12 @@ impl MultiUserMemoryManager {
         journaled
     }
 
+    /// Whether request handlers skip recall's usage writes (access bumps, reconsolidation,
+    /// coactivation edges, feedback): under the env gate, and always on a follower.
+    pub fn recall_readonly(&self) -> bool {
+        !self.replication.client_writes_allowed() || crate::memory::recall_readonly()
+    }
+
     /// Get graph statistics for a user
     pub fn get_user_graph_stats(&self, user_id: &str) -> Result<GraphStats> {
         let graph = self.get_user_graph(user_id)?;
@@ -3240,10 +3254,75 @@ impl MultiUserMemoryManager {
         graph_guard.get_stats()
     }
 
-    /// Run maintenance on all cached user memories
-    /// Erase from `user_id`'s sealed journal segments the frames of memories
-    /// forgotten more than `min_age` ago (see [`crate::intent_log::purge`]). One
-    /// pass per tenant at a time; best effort, a failure is logged.
+    /// Heavy-cycle housekeeping: flush the stores and prune the per-tenant caches of
+    /// evicted tenants. It changes no record, so a follower runs it too.
+    fn heavy_cycle_housekeeping(&self) {
+        if let Err(e) = self.flush_all_databases() {
+            tracing::warn!("Periodic flush failed: {}", e);
+        }
+
+        // Prune init locks: remove entries for users no longer in cache.
+        // This prevents unbounded growth of the DashMaps over time.
+        let active_users: std::collections::HashSet<String> = self
+            .user_memories
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        self.user_memory_init_locks
+            .retain(|user_id, _| active_users.contains(user_id));
+        self.user_graph_init_locks
+            .retain(|user_id, _| active_users.contains(user_id));
+        // Prune SlowStore cache for evicted users to prevent unbounded DashMap growth.
+        // Each SlowStore holds an open SQLite connection with 8MB page cache.
+        let pre_slow = self.slow_stores.len();
+        self.slow_stores
+            .retain(|user_id, _| active_users.contains(user_id));
+        let pruned_slow = pre_slow.saturating_sub(self.slow_stores.len());
+        if pruned_slow > 0 {
+            tracing::info!(
+                "Pruned SlowStore connections for {} evicted users ({} active)",
+                pruned_slow,
+                self.slow_stores.len()
+            );
+        }
+        // A lock someone holds or waits on is kept: dropping it would let the next caller
+        // open the store under a fresh lock beside the open already running.
+        self.slow_store_init_locks
+            .retain(|user_id, lock| active_users.contains(user_id) || Arc::strong_count(lock) > 1);
+
+        // Prune audit logs for evicted users to prevent unbounded DashMap growth.
+        // Each user's log can hold up to audit_max_entries_per_user entries (~2-5MB),
+        // and without pruning, entries persist long after the user's memory/graph are evicted.
+        let pre_audit = self.audit_logs.len();
+        self.audit_logs
+            .retain(|user_id, _| active_users.contains(user_id));
+        let pruned_audit = pre_audit.saturating_sub(self.audit_logs.len());
+        if pruned_audit > 0 {
+            tracing::info!(
+                "Pruned audit logs for {} evicted users ({} active)",
+                pruned_audit,
+                self.audit_logs.len()
+            );
+        }
+    }
+
+    /// Rebuild each cached tenant's vector index that has degraded past its threshold.
+    /// The forgets and updates a follower applies leave deleted vectors behind as a
+    /// leader's writes do, and the maintenance pass that compacts a leader's index does
+    /// not run here. The rebuild writes the index and its vector mappings, no record.
+    fn compact_vector_indexes(&self) {
+        let tenants: Vec<(String, SharedUserMemory)> = self
+            .user_memories
+            .iter()
+            .map(|(id, memory)| (id.to_string(), memory))
+            .collect();
+        for (user_id, memory) in tenants {
+            if let Err(e) = memory.read().auto_rebuild_index_if_needed() {
+                tracing::warn!(user_id = %user_id, "Index compaction failed: {e}");
+            }
+        }
+    }
+
     /// Note that a replication follower asked for `user_id`'s frames after
     /// `after_lsn`, for [`Self::purge_forgotten_journal`]. A fresh follower (no
     /// cursor) needs no protection: it never applied what a purge erases.
@@ -3258,6 +3337,21 @@ impl MultiUserMemoryManager {
             .note(user_id, after_lsn, window, std::time::SystemTime::now());
     }
 
+    /// Heavy cycle: erase from every open tenant's sealed journal segments the frames
+    /// of memories forgotten longer ago than the configured window. Off unless
+    /// VELD_JOURNAL_FORGET_PURGE_DAYS is set. Replay still reaches the same live state,
+    /// so a follower runs it too: its journal holds its own copies of what it applied.
+    fn purge_forgotten_journals(&self) {
+        if let Some(min_age) = self.server_config.journal_forget_purge_age() {
+            for (user_id_arc, _) in self.user_memories.iter() {
+                self.purge_forgotten_journal(user_id_arc.as_ref(), min_age);
+            }
+        }
+    }
+
+    /// Erase from `user_id`'s sealed journal segments the frames of memories
+    /// forgotten more than `min_age` ago (see [`crate::intent_log::purge`]). One
+    /// pass per tenant at a time; best effort, a failure is logged.
     fn purge_forgotten_journal(&self, user_id: &str, min_age: std::time::Duration) {
         let lock = JOURNAL_PURGE_LOCKS
             .entry(user_id.to_string())
@@ -3308,6 +3402,7 @@ impl MultiUserMemoryManager {
         }
     }
 
+    /// Run maintenance on all cached user memories
     pub fn run_maintenance_all_users(&self) -> usize {
         let cycle = self
             .maintenance_cycle
@@ -3326,6 +3421,26 @@ impl MultiUserMemoryManager {
         } else {
             tracing::debug!("Maintenance cycle {} (light — in-memory only)", cycle);
         }
+
+        // Decay write-back, tier promotion, compression, consolidation, fact extraction,
+        // graph strengthening and decay, sleep-time graduation and reminder cleanup all
+        // write derived state, and on a follower that state is the leader's: its frames
+        // bring every change maintenance makes there.
+        if !self.replication.client_writes_allowed() {
+            if is_heavy {
+                self.compact_vector_indexes();
+                self.purge_forgotten_journals();
+                self.heavy_cycle_housekeeping();
+            }
+            tracing::debug!(
+                "Maintenance cycle {} skipped its writes: this instance follows a leader",
+                cycle
+            );
+            return 0;
+        }
+        // A follow can land while the cycle runs, so each tenant and each later write
+        // phase asks again: a cycle that began on a leader stops writing there.
+        let followed_since = || !self.replication.client_writes_allowed();
 
         let decay_factor = self.server_config.activation_decay_factor;
         let mut total_processed = 0;
@@ -3348,6 +3463,9 @@ impl MultiUserMemoryManager {
         let mut total_facts_reinforced = 0;
 
         for user_id in user_ids {
+            if followed_since() {
+                break;
+            }
             let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
                 #[cfg(feature = "multi-tenant")]
@@ -3373,6 +3491,9 @@ impl MultiUserMemoryManager {
             } else {
                 None
             };
+            if followed_since() {
+                break;
+            }
 
             // Direction 1: Edge strengthening + promotion boost propagation
             if let Some(ref result) = maintenance_result {
@@ -3528,7 +3649,7 @@ impl MultiUserMemoryManager {
         }
 
         #[cfg(feature = "multi-tenant")]
-        if self.server_config.multi_tenant_mode {
+        if self.server_config.multi_tenant_mode && !followed_since() {
             if let Err(error) = maintenance::run_maintenance_cycle(
                 &self.server_config.collective_store_dir,
                 &collective_weights,
@@ -3542,7 +3663,7 @@ impl MultiUserMemoryManager {
         // (R48). Both run only when the orchestrator is installed; both are
         // best-effort — a failure here does not abort the rest of the
         // maintenance cycle.
-        if is_heavy {
+        if is_heavy && !followed_since() {
             let orch_opt = self.sleep_time_orchestrator.read().clone();
             if let Some(orch) = orch_opt {
                 // R48: supersession-confidence decay across every user's
@@ -3571,6 +3692,9 @@ impl MultiUserMemoryManager {
                 // configured threshold.
                 let threshold = crate::memory::sleep_time::DEFAULT_GRADUATION_ACCESS_THRESHOLD;
                 for (user_id_arc, _) in self.user_memories.iter() {
+                    if followed_since() {
+                        break;
+                    }
                     let user_id = user_id_arc.as_ref();
                     if let Ok(user_mem) = self.get_user_memory(user_id) {
                         let user_mem_guard = user_mem.read();
@@ -3607,9 +3731,12 @@ impl MultiUserMemoryManager {
         // Per-user, isolated to each user's memory. Warms rhythm-predicted memories
         // into the session tier via add_shared (idempotent, size-bounded). Adds a
         // maintenance STEP; removes none. Best-effort — never aborts the cycle.
-        if is_heavy {
+        if is_heavy && !followed_since() {
             let mut total_warmed = 0usize;
             for (user_id_arc, _) in self.user_memories.iter() {
+                if followed_since() {
+                    break;
+                }
                 let user_id = user_id_arc.as_ref();
                 if let Ok(user_mem) = self.get_user_memory(user_id) {
                     let user_mem_guard = user_mem.read();
@@ -3625,7 +3752,7 @@ impl MultiUserMemoryManager {
         }
 
         // Heavy cycle: clean up old triggered/dismissed reminders (C4 fix)
-        if is_heavy {
+        if is_heavy && !followed_since() {
             for (user_id_arc, _) in self.user_memories.iter() {
                 let user_id = user_id_arc.as_ref();
                 match self.prospective_store.cleanup_old_tasks(user_id, 30) {
@@ -3648,68 +3775,20 @@ impl MultiUserMemoryManager {
             }
         }
 
-        // Heavy cycle: erase from sealed journal segments the frames of memories
-        // forgotten longer ago than the configured window. Off unless
-        // VELD_JOURNAL_FORGET_PURGE_DAYS is set.
         if is_heavy {
-            if let Some(min_age) = self.server_config.journal_forget_purge_age() {
-                for (user_id_arc, _) in self.user_memories.iter() {
-                    self.purge_forgotten_journal(user_id_arc.as_ref(), min_age);
-                }
-            }
+            self.purge_forgotten_journals();
         }
 
         // Flush databases only on heavy cycles — flush triggers RocksDB compaction
         // which allocates significant C++ memory through Windows CRT
         if is_heavy {
-            if let Err(e) = self.flush_all_databases() {
-                tracing::warn!("Periodic flush failed: {}", e);
-            }
-
-            // Prune init locks: remove entries for users no longer in cache.
-            // This prevents unbounded growth of the DashMaps over time.
-            let active_users: std::collections::HashSet<String> = self
-                .user_memories
-                .iter()
-                .map(|(id, _)| id.to_string())
-                .collect();
-            self.user_memory_init_locks
-                .retain(|user_id, _| active_users.contains(user_id));
-            self.user_graph_init_locks
-                .retain(|user_id, _| active_users.contains(user_id));
-            // Prune SlowStore cache for evicted users to prevent unbounded DashMap growth.
-            // Each SlowStore holds an open SQLite connection with 8MB page cache.
-            let pre_slow = self.slow_stores.len();
-            self.slow_stores
-                .retain(|user_id, _| active_users.contains(user_id));
-            let pruned_slow = pre_slow.saturating_sub(self.slow_stores.len());
-            if pruned_slow > 0 {
-                tracing::info!(
-                    "Pruned SlowStore connections for {} evicted users ({} active)",
-                    pruned_slow,
-                    self.slow_stores.len()
-                );
-            }
-            // A lock someone holds or waits on is kept: dropping it would let the next caller
-            // open the store under a fresh lock beside the open already running.
-            self.slow_store_init_locks.retain(|user_id, lock| {
-                active_users.contains(user_id) || Arc::strong_count(lock) > 1
-            });
-
-            // Prune audit logs for evicted users to prevent unbounded DashMap growth.
-            // Each user's log can hold up to audit_max_entries_per_user entries (~2-5MB),
-            // and without pruning, entries persist long after the user's memory/graph are evicted.
-            let pre_audit = self.audit_logs.len();
-            self.audit_logs
-                .retain(|user_id, _| active_users.contains(user_id));
-            let pruned_audit = pre_audit.saturating_sub(self.audit_logs.len());
-            if pruned_audit > 0 {
-                tracing::info!(
-                    "Pruned audit logs for {} evicted users ({} active)",
-                    pruned_audit,
-                    self.audit_logs.len()
-                );
-            }
+            self.heavy_cycle_housekeeping();
+        }
+        if followed_since() {
+            tracing::info!(
+                cycle,
+                "Maintenance cycle stopped writing part-way: this instance now follows a leader"
+            );
         }
 
         tracing::info!(
@@ -3851,8 +3930,12 @@ impl MultiUserMemoryManager {
     /// and emit `REMINDER_DUE` events to the broadcast channel.
     ///
     /// Called by the dedicated 60-second reminder scheduler in main.rs.
-    /// Returns the number of reminders triggered.
+    /// Returns the number of reminders triggered. None on a follower: reminders are
+    /// not replicated, and its leader fires them.
     pub fn check_and_emit_due_reminders(&self) -> usize {
+        if !self.replication.client_writes_allowed() {
+            return 0;
+        }
         let due_tasks = match self.prospective_store.get_all_due_tasks() {
             Ok(tasks) => tasks,
             Err(e) => {
@@ -6368,6 +6451,8 @@ impl MultiUserMemoryManager {
 
     /// Drain every cached user's embedding backlog, reconciling first when asked. Only users
     /// already in the cache: loading a cold user is seconds of work that a tick must not do.
+    /// Nothing on a follower: an embedding is part of the record, and its leader's frames
+    /// carry the one the leader computes.
     pub fn drain_embedding_backlogs(
         &self,
         limit_per_user: usize,
@@ -6377,6 +6462,9 @@ impl MultiUserMemoryManager {
         anyhow::Result<crate::memory::embedding_backlog::DrainReport>,
     )> {
         let mut out = Vec::new();
+        if !self.replication.client_writes_allowed() {
+            return out;
+        }
         for user_id in self.list_cached_users() {
             let Some(memory) = self.user_memories.get(&user_id) else {
                 continue;

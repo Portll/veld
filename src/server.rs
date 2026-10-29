@@ -340,7 +340,7 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
 
     // Live replication: idle until this instance follows a leader, by
     // VELD_REPLICATE_FROM at boot or POST /api/admin/replication/follow later.
-    match crate::replication::follow_from_env(&manager.base_path) {
+    match manager.replication.follow_from_env(&manager.base_path) {
         Ok(Some(status)) => {
             if let Some(t) = &status.target {
                 info!("Replication: following {}", t.source);
@@ -567,6 +567,10 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         .as_ref()
         .zip(tls_setup.as_ref())
         .map(|(listener, setup)| (listener.addr(), setup.client_auth));
+    // A leader shows it beside this instance's id; polls made before the bind omit it.
+    manager.replication.set_advertised_url(
+        tls_ready.map(|(tls_addr, _)| crate::instance_registry::tls_url(tls_addr)),
+    );
 
     // Small delay for log flush
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

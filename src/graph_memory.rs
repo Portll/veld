@@ -2241,6 +2241,9 @@ pub struct GraphMemory {
 
     /// Uuids of the entity and relationship rows written through `store`.
     change_log: Arc<GraphChangeLog>,
+
+    /// Set while this instance follows a leader; see [`Self::recall_readonly`].
+    replica_readonly: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GraphMemory {
@@ -2251,6 +2254,19 @@ impl GraphMemory {
     #[cfg(feature = "rocksdb")]
     pub fn rocksdb_for_backup(&self) -> Option<&DB> {
         self.db.as_deref()
+    }
+
+    /// Follow `flag` for whether this graph belongs to a read-only replica.
+    pub fn share_replica_readonly(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.replica_readonly = flag;
+    }
+
+    /// Whether traversal skips its usage writes: under the env gate
+    /// (`memory::recall_readonly`), and always while this instance follows a leader.
+    fn recall_readonly(&self) -> bool {
+        self.replica_readonly
+            .load(std::sync::atomic::Ordering::Acquire)
+            || crate::memory::recall_readonly()
     }
 
     #[cfg(feature = "storage-redb")]
@@ -2458,6 +2474,7 @@ impl GraphMemory {
                 std::collections::VecDeque::new(),
             )),
             change_log,
+            replica_readonly: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
@@ -5128,7 +5145,7 @@ impl GraphMemory {
         // A usage write: skipped under read-only recall (memory::recall_readonly), so an eval
         // repeat does not strengthen the edges it walked (shodh-memory 4ec3b6e).
         if !edges_to_strengthen.is_empty()
-            && !crate::memory::recall_readonly()
+            && !self.recall_readonly()
             && crate::memory::ablation::is_enabled("graph_potentiation")
         {
             match self.batch_strengthen_synapses(&edges_to_strengthen, &ambient_evidence_source()) {
@@ -5334,7 +5351,7 @@ impl GraphMemory {
 
         // Hebbian strengthening — a usage write, skipped under read-only recall.
         if !edges_to_strengthen.is_empty()
-            && !crate::memory::recall_readonly()
+            && !self.recall_readonly()
             && crate::memory::ablation::is_enabled("graph_potentiation")
         {
             if let Err(e) =
@@ -5570,7 +5587,7 @@ impl GraphMemory {
         // recall. This is the site recall's multi-hop leg reaches (memory/recall.rs), the one
         // the gate's doc comment named as the residual when the gate landed.
         if !edges_to_strengthen.is_empty()
-            && !crate::memory::recall_readonly()
+            && !self.recall_readonly()
             && crate::memory::ablation::is_enabled("graph_potentiation")
         {
             if let Err(e) =

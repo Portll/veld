@@ -91,6 +91,21 @@ static CONSOLIDATION_LOCKS: std::sync::LazyLock<
     dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 
+/// Whether a detached consolidation pass may run its next write phase. The route
+/// refuses on a follower, but the pass outlives the request: an instance that began
+/// following a leader meanwhile stops it before `phase`.
+fn may_write(state: &AppState, user_id: &str, phase: &str) -> bool {
+    let allowed = state.replication.client_writes_allowed();
+    if !allowed {
+        tracing::info!(
+            user_id = %user_id,
+            phase,
+            "Consolidation stopped: this instance now follows a leader"
+        );
+    }
+    allowed
+}
+
 // =============================================================================
 // SEMANTIC CONSOLIDATION
 // =============================================================================
@@ -152,6 +167,9 @@ pub async fn consolidate_memories(
         };
 
         // Step 1: Fact extraction
+        if !may_write(&state_clone, &user_id, "fact extraction") {
+            return;
+        }
         let result = {
             let memory = memory.clone();
             let uid = user_id.clone();
@@ -177,6 +195,9 @@ pub async fn consolidate_memories(
         // the extraction step 1 just ran; ingest_candidate makes the repeat a no-op, and the
         // maintenance pass applies its own thresholds.
         let decay_factor = state_clone.server_config().activation_decay_factor;
+        if !may_write(&state_clone, &user_id, "maintenance") {
+            return;
+        }
         let maintenance_result = {
             let memory = memory.clone();
             let uid = user_id.clone();
@@ -201,6 +222,9 @@ pub async fn consolidate_memories(
         // Step 3: Apply graph strengthening from replay results
         let mut edges_strengthened: usize = 0;
         let mut entity_edges_strengthened: usize = 0;
+        if !may_write(&state_clone, &user_id, "graph strengthening") {
+            return;
+        }
 
         // Direction 1: Edge strengthening + promotion boost propagation
         if !maintenance_result.edge_boosts.is_empty() {
@@ -265,6 +289,9 @@ pub async fn consolidate_memories(
         // Samples random pairs, computes cosine similarity, creates weak
         // RelatedTo edges for pairs in the discovery band (0.55-0.85).
         let mut dream_edges_created: usize = 0;
+        if !may_write(&state_clone, &user_id, "dream replay") {
+            return;
+        }
         {
             let memory_clone = memory.clone();
             let graph_arc = state_clone.get_user_graph_async(&user_id).await.ok();
@@ -434,6 +461,9 @@ pub async fn consolidate_memories(
         // mirror up to the graph, then detect structural gaps. One sync per
         // store at a time; when it is skipped, detection runs on the existing
         // mirror.
+        if !may_write(&state_clone, &user_id, "gap analysis") {
+            return;
+        }
         if let (Ok(graph), Ok(store)) = (
             state_clone.get_user_graph_async(&user_id).await,
             state_clone.get_user_slow_store_async(&user_id).await,
@@ -571,6 +601,9 @@ pub async fn sleep_phase_consolidation(
         };
 
         // Phase 1: Fact extraction (with heat-score-aware consolidation from A2)
+        if !may_write(&state_clone, &user_id, "fact extraction") {
+            return;
+        }
         {
             let memory = memory.clone();
             let uid = user_id.clone();
@@ -602,6 +635,9 @@ pub async fn sleep_phase_consolidation(
 
         // Phase 2: Heavy maintenance (replay + tier consolidation + decay)
         let decay_factor = state_clone.server_config().activation_decay_factor;
+        if !may_write(&state_clone, &user_id, "maintenance") {
+            return;
+        }
         let maintenance_result = {
             let memory = memory.clone();
             let uid = user_id.clone();
@@ -624,6 +660,9 @@ pub async fn sleep_phase_consolidation(
         };
 
         // Phase 3: Edge strengthening from replay
+        if !may_write(&state_clone, &user_id, "graph strengthening") {
+            return;
+        }
         if let Some(ref maint) = maintenance_result {
             if !maint.edge_boosts.is_empty() {
                 if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
@@ -671,6 +710,9 @@ pub async fn sleep_phase_consolidation(
         }
 
         // Phase 5: Flush pending maintenance (opportunistic edge pruning)
+        if !may_write(&state_clone, &user_id, "edge pruning") {
+            return;
+        }
         if let Ok(graph) = state_clone.get_user_graph_async(&user_id).await {
             let graph_guard = graph.read();
             if let Err(e) = graph_guard.flush_pending_maintenance() {
@@ -682,6 +724,9 @@ pub async fn sleep_phase_consolidation(
         }
 
         // Phase 6: Dream replay with enlarged batch
+        if !may_write(&state_clone, &user_id, "dream replay") {
+            return;
+        }
         {
             let memory_clone = memory.clone();
             let graph_arc = state_clone.get_user_graph_async(&user_id).await.ok();
@@ -785,6 +830,9 @@ pub async fn sleep_phase_consolidation(
 
         // Phase 7: Gap analysis — the post-consolidation step's mirror sync and
         // detection, on the gap worker.
+        if !may_write(&state_clone, &user_id, "gap analysis") {
+            return;
+        }
         if let (Ok(graph), Ok(store)) = (
             state_clone.get_user_graph_async(&user_id).await,
             state_clone.get_user_slow_store_async(&user_id).await,

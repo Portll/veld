@@ -22,6 +22,12 @@ pub struct AuthenticatedUser {
     pub user_id: String,
 }
 
+/// Marks a request whose API key [`auth_middleware`] verified. The paths it lets
+/// through on other grounds (webhooks, the session-authenticated user-auth surface)
+/// carry none, so a layer below can tell the two apart.
+#[derive(Clone, Copy, Debug)]
+pub struct ApiKeyVerified;
+
 /// Auto-generated dev API key, created at startup. Not hardcoded — each
 /// server instance gets a unique key. Logged to stderr so the user can copy it.
 pub(crate) fn default_dev_api_key() -> String {
@@ -516,6 +522,8 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
         None => request,
     };
 
+    let mut request = request;
+    request.extensions_mut().insert(ApiKeyVerified);
     next.run(request).await
 }
 

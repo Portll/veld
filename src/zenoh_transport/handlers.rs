@@ -24,6 +24,7 @@ use crate::handlers::recall::recall_memory_view;
 use crate::handlers::remember::{
     build_rich_context, parse_experience_type, remember_journaled, WriteOrigin,
 };
+use crate::handlers::replica::READ_ONLY_REPLICA;
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::types::{MemoryEvent, RecallFact, RecallMemory, RecallResponse, RecallTodo};
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
@@ -96,6 +97,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= (x ^ y) as u32;
     }
     diff == 0
+}
+
+/// Refuse a write on a follower as the HTTP routes do, with `READ_ONLY_REPLICA`. A
+/// sample has no reply channel, so the refusal is logged under that code.
+fn refused_on_replica(manager: &MultiUserMemoryManager, key: &str, operation: &str) -> bool {
+    if manager.replication.client_writes_allowed() {
+        return false;
+    }
+    warn!(
+        key = %key,
+        code = READ_ONLY_REPLICA,
+        operation,
+        "Zenoh write refused: this instance is a read-only replica; send writes to its leader"
+    );
+    true
 }
 
 // =============================================================================
@@ -308,6 +324,9 @@ fn default_recall_mode() -> String {
 /// 5. Fire-and-forget graph + lineage processing
 pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager>) {
     let key = sample.key_expr().as_str().to_string();
+    if refused_on_replica(&manager, &key, "remember") {
+        return;
+    }
 
     let req: ZenohRememberRequest = match deserialize_json(sample.payload()) {
         Ok(r) => r,
@@ -954,8 +973,9 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
     }
 
     // Store PendingFeedback so subsequent remember() calls with action+reward
-    // can attribute outcomes to the memories we just surfaced.
-    if !memories.is_empty() {
+    // can attribute outcomes to the memories we just surfaced. A usage write, as on
+    // the HTTP path: not under read-only recall or on a follower.
+    if !memories.is_empty() && !manager.recall_readonly() {
         let memory_for_embed = user_mem.clone();
         let query_for_embed = query_text.clone();
         let user_id_for_fb = user_id.clone();
@@ -1021,6 +1041,9 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
     }
 
     let key = sample.key_expr().as_str().to_string();
+    if refused_on_replica(&manager, &key, "forget") {
+        return;
+    }
 
     let req: ForgetRequest = match deserialize_json(sample.payload()) {
         Ok(r) => r,
@@ -1155,8 +1178,8 @@ pub async fn handle_stream_message(
                 );
             }
         }
-        crate::streaming::ExtractionResult::Error { message, .. } => {
-            warn!(session_id = %session_id, "Stream extraction error: {}", message);
+        crate::streaming::ExtractionResult::Error { code, message, .. } => {
+            warn!(session_id = %session_id, code = %code, "Stream extraction error: {}", message);
         }
         _ => {} // ContextInjection, Closed — logged internally
     }
@@ -1211,6 +1234,9 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
     }
 
     let key = sample.key_expr().as_str().to_string();
+    if refused_on_replica(&manager, &key, "mission start") {
+        return;
+    }
 
     let req: MissionStartRequest = match deserialize_json(sample.payload()) {
         Ok(r) => r,
@@ -1325,6 +1351,9 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
     }
 
     let key = sample.key_expr().as_str().to_string();
+    if refused_on_replica(&manager, &key, "mission end") {
+        return;
+    }
 
     let req: MissionEndRequest = match deserialize_json(sample.payload()) {
         Ok(r) => r,

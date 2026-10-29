@@ -568,6 +568,10 @@ pub struct ProactiveContextResponse {
     /// Entities detected in the query context
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_entities: Vec<DetectedEntityInfo>,
+    /// On a follower, the sections read from stores replication does not carry: they
+    /// hold this instance's own data, not its leader's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_replicated: Vec<&'static str>,
 }
 
 // =============================================================================
@@ -1099,7 +1103,8 @@ pub async fn recall(
     // Boost importance of recalled memories proportional to their rank score.
     // Fire-and-forget: this must not delay the response.
     // Based on Nader et al. (2000): retrieval reopens the consolidation window.
-    if count > 0 {
+    // A usage write, so not under read-only recall or on a follower.
+    if count > 0 && !state.recall_readonly() {
         let memory_for_recon = memory.clone();
         let recon_ids: Vec<(String, f32)> = recall_memories
             .iter()
@@ -1408,10 +1413,19 @@ pub async fn proactive_context(
             relevant_facts: Vec::new(),
             latency_ms: 0.0,
             detected_entities: Vec::new(),
+            not_replicated: Vec::new(),
         }));
     }
 
     let op_start = std::time::Instant::now();
+
+    // Feedback, coactivation and the pending-feedback record are usage writes. On a
+    // follower nothing a client sends is stored either: its ingest would never reach
+    // the leader, so `ingested_memory_id` comes back empty.
+    let usage_writes = !state.recall_readonly();
+    if !state.replication.client_writes_allowed() {
+        req.auto_ingest = false;
+    }
 
     let memory_system = state
         .get_user_memory_async(&req.user_id)
@@ -1431,7 +1445,8 @@ pub async fn proactive_context(
     );
 
     // 0. Process pending feedback if previous_response is provided
-    let feedback_processed = if let Some(ref prev_response) = req.previous_response {
+    let feedback_response = req.previous_response.clone().filter(|_| usage_writes);
+    let feedback_processed = if let Some(ref prev_response) = feedback_response {
         let feedback_store = state.feedback_store.clone();
         let user_id_for_feedback = req.user_id.clone();
         let response_text = super::utils::strip_mcp_response_noise(prev_response);
@@ -2066,7 +2081,7 @@ pub async fn proactive_context(
     // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
     // Changed graph.write() → graph.read(): record_memory_coactivation uses its own
     // fine-grained synapse_update_lock; no coarse graph write lock is needed.
-    if memories.len() >= 2 {
+    if usage_writes && memories.len() >= 2 {
         let graph = graph_memory.clone();
         let memory_ids: Vec<uuid::Uuid> = memories
             .iter()
@@ -2098,7 +2113,7 @@ pub async fn proactive_context(
     }
 
     // 3. Store pending feedback (fast, in-memory — do before parallel block)
-    if embedding_valid {
+    if usage_writes && embedding_valid {
         let surfaced_infos: Vec<feedback::SurfacedMemoryInfo> = memories
             .iter()
             .map(|m| {
@@ -2718,6 +2733,16 @@ pub async fn proactive_context(
         relevant_facts,
         latency_ms,
         detected_entities,
+        not_replicated: if state.replication.client_writes_allowed() {
+            Vec::new()
+        } else {
+            vec![
+                "relevant_todos",
+                "due_reminders",
+                "context_reminders",
+                "relevant_facts",
+            ]
+        },
     }))
 }
 

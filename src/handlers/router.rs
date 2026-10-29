@@ -14,8 +14,8 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, keys,
-    lineage, memory_ops, mif, prompt_gen, query, recall, remember, replication, search, seed,
-    sessions, sleep_time, spaces, storage_migration, todos, ui, user_admin, user_auth, users,
+    lineage, memory_ops, mif, prompt_gen, query, recall, remember, replica, replication, search,
+    seed, sessions, sleep_time, spaces, storage_migration, todos, ui, user_admin, user_auth, users,
     visualization, webhooks,
 };
 
@@ -419,6 +419,8 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/admin/replication/unfollow",
             post(replication::unfollow),
         )
+        // Any API key: the role of this process, not of a tenant.
+        .route("/api/replication/role", get(replica::role))
         // =================================================================
         // ADVANCED SEARCH
         // =================================================================
@@ -831,6 +833,14 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/export/mif", post(mif::export_mif))
         .route("/api/import/mif", post(mif::import_mif))
         .route("/api/mif/adapters", get(mif::list_adapters))
+        // =================================================================
+        // REPLICA GUARD — a follower refuses writes and unreplicated reads
+        // (handlers/replica.rs classifies every route above)
+        // =================================================================
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            replica::guard,
+        ))
         // =================================================================
         // STATE
         // =================================================================

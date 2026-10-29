@@ -467,7 +467,7 @@ async fn following_this_instance_through_its_tls_url_is_refused() {
     };
     let (plain_host, plain_port) = (config.host.clone(), config.port);
     let manager = Arc::new(MultiUserMemoryManager::new(storage, config).unwrap());
-    let router = build_protected_routes(manager, false)
+    let router = build_protected_routes(Arc::clone(&manager), false)
         .layer(axum::middleware::from_fn(veld::auth::auth_middleware));
     let served = serve_router(&cert, &key, None, router.clone()).await;
 
@@ -498,7 +498,7 @@ async fn following_this_instance_through_its_tls_url_is_refused() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "would_loop", "{body}");
     assert_eq!(body["detail"], format!("{source} is this instance"));
-    assert!(veld::replication::status().target.is_none());
+    assert!(manager.replication.status().target.is_none());
     served.stop().await;
 }
 

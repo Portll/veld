@@ -3,12 +3,14 @@
 //! Admin-key gated like the storage migration routes: the feed carries every
 //! tenant's memories in the clear, which the per-tenant API key must not reach.
 
+use std::net::SocketAddr;
+
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -51,12 +53,31 @@ fn own_base_url(state: &AppState) -> String {
     format!("http://{host}:{}", cfg.port)
 }
 
-/// Both roles in one reply: `users` is what this instance can feed, `following`
-/// is what it tails.
-pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// The peer of a poll as the socket gives it; absent only off a socket.
+type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
+
+/// Record a poll from a follower that names itself, once the admin key has passed.
+fn note_poll(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Peer,
+    tenant: Option<(&str, replication::FollowerTenant)>,
+) {
+    if let Some(identity) = replication::PollIdentity::from_headers(headers) {
+        let remote_addr = peer.map(|Extension(ConnectInfo(addr))| addr);
+        state.replication.note_poll(identity, remote_addr, tenant);
+    }
+}
+
+/// Both roles in one reply: `users` is what this instance can feed, `followers` who
+/// polled it lately, `following` what it tails. A follower's poll, which names
+/// itself, gets no `followers`: it reads none of them, and asks every interval.
+pub async fn status(State(state): State<AppState>, headers: HeaderMap, peer: Peer) -> Response {
     if let Err(refusal) = require_admin_key(&headers) {
         return refusal;
     }
+    let follower_poll = headers.contains_key(replication::INSTANCE_ID_HEADER);
+    note_poll(&state, &headers, peer, None);
     let users = {
         let state = state.clone();
         tokio::task::spawn_blocking(move || replication::user_logs(&state)).await
@@ -65,16 +86,17 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(u) => u,
         Err(e) => return failed(anyhow::anyhow!("listing logs: {e}")),
     };
-    let following = replication::status();
-    respond(
-        StatusCode::OK,
-        json!({
-            "base_url": own_base_url(&state),
-            "instance_id": replication::instance_id(),
-            "users": users,
-            "following": following.target.is_some().then_some(following),
-        }),
-    )
+    let following = state.replication.status();
+    let mut body = json!({
+        "base_url": own_base_url(&state),
+        "instance_id": replication::instance_id(),
+        "users": users,
+        "following": following.target.is_some().then_some(following),
+    });
+    if !follower_poll {
+        body["followers"] = json!(state.replication.followers());
+    }
+    respond(StatusCode::OK, body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,15 +118,18 @@ fn empty_as_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, 
 pub async fn records(
     State(state): State<AppState>,
     headers: HeaderMap,
+    peer: Peer,
     Query(q): Query<RecordsQuery>,
 ) -> Response {
     if let Err(refusal) = require_admin_key(&headers) {
         return refusal;
     }
     if let Err(e) = crate::validation::validate_user_id(&q.user_id) {
+        note_poll(&state, &headers, peer, None);
         return bad_request(e);
     }
     if !replication::has_log(&state, &q.user_id) {
+        note_poll(&state, &headers, peer, None);
         return respond(
             StatusCode::NOT_FOUND,
             json!({"error": "no_such_log", "detail": format!("no intent log for tenant '{}'", q.user_id)}),
@@ -112,10 +137,27 @@ pub async fn records(
     }
     state.note_feed_cursor(&q.user_id, q.after_lsn);
     let limit = q.limit.unwrap_or(replication::FEED_LIMIT).clamp(1, 5000);
-    let page = tokio::task::spawn_blocking(move || {
-        replication::feed(&state, &q.user_id, q.after_lsn, limit)
-    })
-    .await;
+    let after_lsn = q.after_lsn;
+    let page = {
+        let state = state.clone();
+        let user_id = q.user_id.clone();
+        tokio::task::spawn_blocking(move || replication::feed(&state, &user_id, after_lsn, limit))
+            .await
+    };
+    let lag = match &page {
+        Ok(Ok(page)) => Some(replication::FollowerTenant::new(
+            after_lsn,
+            page.head_lsn,
+            page.records.len() as u64,
+        )),
+        _ => None,
+    };
+    note_poll(
+        &state,
+        &headers,
+        peer,
+        lag.map(|lag| (q.user_id.as_str(), lag)),
+    );
     match page {
         Ok(Ok(page)) => respond(StatusCode::OK, json!(page)),
         Ok(Err(e)) => failed(e),
@@ -123,7 +165,7 @@ pub async fn records(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FollowRequest {
     pub source: String,
@@ -131,6 +173,19 @@ pub struct FollowRequest {
     /// The leader's API key; this server's own when absent.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for FollowRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FollowRequest")
+            .field("source", &self.source)
+            .field("admin_key", &replication::REDACTED)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| replication::REDACTED),
+            )
+            .finish()
+    }
 }
 
 /// Start tailing `source`. Refused when the source is this instance, by its address
@@ -188,17 +243,20 @@ pub async fn follow(State(state): State<AppState>, headers: HeaderMap, body: Byt
         }
         None => {}
     }
-    match replication::follow(&state.base_path, &source, &req.admin_key, Some(&api_key)) {
+    match state
+        .replication
+        .follow(&state.base_path, &source, &req.admin_key, Some(&api_key))
+    {
         Ok(status) => respond(StatusCode::OK, json!({"following": status})),
         Err(e) => failed(e),
     }
 }
 
-pub async fn unfollow(headers: HeaderMap) -> Response {
+pub async fn unfollow(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(refusal) = require_admin_key(&headers) {
         return refusal;
     }
-    let status = replication::unfollow();
+    let status = state.replication.unfollow();
     respond(
         StatusCode::OK,
         json!({"following": null, "users": status.users}),

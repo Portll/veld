@@ -11,12 +11,17 @@
 //! model's vector for every memory not written since.
 //!
 //! Scope and limits, stated rather than implied:
-//! - One direction. A follower is read-mostly; writes made on it are not sent
-//!   back, and two instances following each other would echo frames forever, so
-//!   `follow` refuses a source that reports following us.
-//! - Memories only. Todos, reminders, projects, context blocks and dials are not
-//!   journaled, so they do not replicate. The knowledge graph is rebuilt from the
-//!   memories by the follower's own consolidation.
+//! - One direction. A follower is read-only: `handlers::replica` refuses client
+//!   writes, its recall makes no usage writes and its maintenance changes no
+//!   record, so only the frames applied here write. Two instances following each
+//!   other would echo frames forever, so `follow` refuses a source that reports
+//!   following us.
+//! - Memories only. The follower applies the five [`IntentPayload`] variants,
+//!   every one of them a memory record. Todos, reminders, projects, context
+//!   blocks, the knowledge graph, facts, lineage, sessions, A/B tests and
+//!   datasets are not journaled, so they do not replicate, and a follower
+//!   answers reads of them `NOT_REPLICATED`. Dials are each process's own: a
+//!   follower recalls with its own and refuses changes to them.
 //! - Frames leave the leader decrypted (its journal cryptor opens them) and are
 //!   sealed again by the follower's own keystore on append. The admin key and API
 //!   key ride every request, so a leader that is not on this host must be https.
@@ -32,6 +37,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -116,8 +122,9 @@ pub struct FeedPage {
     pub spaces: Vec<SpaceId>,
 }
 
-/// What a follower follows. The keys never leave the process.
-#[derive(Debug, Clone, Serialize)]
+/// What a follower follows. The keys never leave the process: serialization skips
+/// them and `Debug` prints them redacted.
+#[derive(Clone, Serialize)]
 pub struct FollowTarget {
     pub source: String,
     #[serde(skip)]
@@ -128,6 +135,22 @@ pub struct FollowTarget {
     #[serde(skip)]
     pub http: reqwest::Client,
     pub since: DateTime<Utc>,
+}
+
+/// Stands in for a secret in `Debug` output.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for FollowTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The client is left out: its Debug lists any proxy, whose URL can carry
+        // credentials.
+        f.debug_struct("FollowTarget")
+            .field("source", &self.source)
+            .field("admin_key", &REDACTED)
+            .field("api_key", &REDACTED)
+            .field("since", &self.since)
+            .finish_non_exhaustive()
+    }
 }
 
 /// This server's own first API key, from the same variables the auth
@@ -198,6 +221,11 @@ impl UserProgress {
             (None, _) => None,
         };
     }
+
+    /// Holds every frame the leader had when this tenant was last read.
+    fn caught_up(&self) -> bool {
+        self.lag == Some(0) && self.last_error.is_none() && self.diverged.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -218,10 +246,70 @@ pub struct FollowStatus {
     pub last_applied: Option<DateTime<Utc>>,
     /// The last failure to reach the leader at all; per-tenant failures are on the tenant.
     pub last_error: Option<String>,
+    /// The leader's process identity, from its status route at the last pass.
+    pub leader_instance_id: Option<uuid::Uuid>,
+    /// When the last pass over every tenant the leader listed finished.
+    pub reached_leader_at: Option<DateTime<Utc>>,
+    /// When the leader was asked for its tenants by the last pass that left every
+    /// one of them at its head: this follower held all the leader had then.
+    pub caught_up_at: Option<DateTime<Utc>>,
+    /// When a request to the leader last succeeded: its status, or a page of its feed.
+    pub leader_contact_at: Option<DateTime<Utc>>,
     pub users: BTreeMap<String, UserProgress>,
 }
 
 impl FollowStatus {
+    /// Seconds from the last successful request to the leader to `now`. Unlike
+    /// [`Self::lag_seconds`] it grows while the leader is unreachable, and it stays
+    /// small through an initial sync, whose pages each reach the leader. None until a
+    /// request has succeeded since following began.
+    pub fn leader_contact_age_seconds(&self, now: DateTime<Utc>) -> Option<u64> {
+        Some((now - self.leader_contact_at?).num_seconds().max(0) as u64)
+    }
+
+    /// How far behind its leader this follower was, in seconds, when it last reached
+    /// it: the time from the last pass that caught every tenant up to the end of the
+    /// last pass. None until a pass has caught up since following began. It does not
+    /// grow while the leader is unreachable, because nothing is known to be missed;
+    /// `reached_leader_at` says how long ago that was.
+    pub fn lag_seconds(&self) -> Option<u64> {
+        let (caught_up, reached) = (self.caught_up_at?, self.reached_leader_at?);
+        Some((reached - caught_up).num_seconds().max(0) as u64)
+    }
+
+    /// Leader frames not yet applied, summed over the tenants whose lag is known.
+    pub fn lag_frames(&self) -> Option<u64> {
+        self.users
+            .values()
+            .filter_map(|progress| progress.lag)
+            .reduce(u64::saturating_add)
+    }
+
+    /// Record the end of a pass that read every tenant in `listed`, if `generation` is
+    /// still current. `asked` is when the leader was asked which tenants it has.
+    fn record_pass(
+        &mut self,
+        generation: u64,
+        leader_instance_id: Option<uuid::Uuid>,
+        listed: &[UserLogInfo],
+        asked: DateTime<Utc>,
+        finished: DateTime<Utc>,
+    ) {
+        if self.generation != generation {
+            return;
+        }
+        self.leader_instance_id = leader_instance_id;
+        self.reached_leader_at = Some(finished);
+        let caught_up = listed.iter().all(|info| {
+            self.users
+                .get(&info.user_id)
+                .is_some_and(UserProgress::caught_up)
+        });
+        if caught_up {
+            self.caught_up_at = Some(asked);
+        }
+    }
+
     /// Record one applied page for `user_id` if `generation` is still current.
     /// Returns the cursor to persist, or None when the poll is stale.
     fn record_page(
@@ -252,9 +340,6 @@ impl FollowStatus {
     }
 }
 
-static FOLLOW: LazyLock<RwLock<FollowStatus>> =
-    LazyLock::new(|| RwLock::new(FollowStatus::default()));
-
 static INSTANCE_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
 
 /// This process's identity, new at every start. The status route reports it, so the
@@ -264,12 +349,375 @@ pub fn instance_id() -> uuid::Uuid {
     *INSTANCE_ID
 }
 
-pub fn status() -> FollowStatus {
-    FOLLOW.read().clone()
+/// The leader a follower names when it refuses a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderRef {
+    /// None until the first poll has read the leader's status.
+    pub instance_id: Option<uuid::Uuid>,
+    pub url: String,
+    pub lag_seconds: Option<u64>,
+    pub contact_age_seconds: Option<u64>,
 }
 
-fn is_current(generation: u64) -> bool {
-    FOLLOW.read().generation == generation
+/// What this instance is to replication, as `GET /api/replication/role` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Leader,
+    Follower,
+    Standalone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoleReport {
+    pub role: Role,
+    pub instance_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_instance_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_frames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_seconds: Option<u64>,
+    /// See [`FollowStatus::leader_contact_age_seconds`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_contact_age_seconds: Option<u64>,
+    /// Followers that polled in the last [`FOLLOWER_TTL`]; absent when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followers_count: Option<usize>,
+    /// The largest follower lag: each follower's `lag_frames` summed over its tenants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_lag_frames: Option<u64>,
+}
+
+/// Sent by a follower on every poll: its [`instance_id`].
+pub const INSTANCE_ID_HEADER: &str = "x-veld-instance-id";
+/// Sent by a follower on every poll when it has a TLS URL. Self-reported, so the
+/// leader shows it and never dials it.
+pub const FOLLOWER_URL_HEADER: &str = "x-veld-follower-url";
+/// Followers a leader keeps; a new one past this evicts the one polled least recently.
+pub const FOLLOWERS_CAP: usize = 64;
+/// A follower that has not polled for this long is dropped from the leader's table.
+pub const FOLLOWER_TTL: Duration = Duration::from_secs(600);
+const MAX_FOLLOWER_URL_BYTES: usize = 512;
+
+/// Who is polling, as a follower identifies itself to its leader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollIdentity {
+    pub instance_id: uuid::Uuid,
+    pub url: Option<String>,
+}
+
+impl PollIdentity {
+    /// From a poll's headers: None without a valid [`INSTANCE_ID_HEADER`], as from a
+    /// follower built before it sent one. A [`FOLLOWER_URL_HEADER`] that is not an
+    /// http(s) URL of at most 512 bytes, or that carries credentials, is dropped.
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
+        let instance_id = headers
+            .get(INSTANCE_ID_HEADER)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let url = headers
+            .get(FOLLOWER_URL_HEADER)
+            .and_then(|value| displayable_url(value.as_bytes()));
+        Some(Self { instance_id, url })
+    }
+}
+
+fn displayable_url(raw: &[u8]) -> Option<String> {
+    if raw.len() > MAX_FOLLOWER_URL_BYTES {
+        return None;
+    }
+    let url = reqwest::Url::parse(std::str::from_utf8(raw).ok()?.trim()).ok()?;
+    let usable = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none();
+    usable.then(|| url.to_string())
+}
+
+/// One tenant as a follower last asked the leader's feed for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FollowerTenant {
+    /// The first LSN the follower asked for: the feed's `after_lsn` is the follower's
+    /// cursor, the last frame it applied, so the LSN it asks for next is one past it,
+    /// or 0 from a follower that has applied nothing.
+    pub requested_lsn: u64,
+    /// The LSN the leader assigns next, as the feed read it for that reply.
+    pub leader_head_lsn: u64,
+    /// Frames the leader held that the follower had still not been sent when the reply
+    /// left: `leader_head_lsn - (requested_lsn + served)`, floored at 0. The feed serves
+    /// contiguous LSNs from `requested_lsn`, so a reply that carried everything up to
+    /// the head leaves 0 and a page the limit cut short leaves the rest.
+    pub lag_frames: u64,
+}
+
+impl FollowerTenant {
+    /// A feed request from `after_lsn`, answered with `served` frames while the
+    /// leader's head was `leader_head_lsn`.
+    pub fn new(after_lsn: Option<u64>, leader_head_lsn: u64, served: u64) -> Self {
+        let requested_lsn = after_lsn.map_or(0, |applied| applied.saturating_add(1));
+        Self {
+            requested_lsn,
+            leader_head_lsn,
+            lag_frames: leader_head_lsn.saturating_sub(requested_lsn.saturating_add(served)),
+        }
+    }
+}
+
+/// A follower as its leader sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FollowerView {
+    pub instance_id: uuid::Uuid,
+    /// Self-reported; for display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The peer address of the last poll, from the socket. None only where no
+    /// socket is (an in-process router).
+    pub remote_addr: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub last_poll: DateTime<Utc>,
+    pub users: BTreeMap<String, FollowerTenant>,
+}
+
+impl FollowerView {
+    fn lag_frames(&self) -> u64 {
+        self.users
+            .values()
+            .map(|tenant| tenant.lag_frames)
+            .fold(0, u64::saturating_add)
+    }
+}
+
+/// The leader's view of who follows it, in memory only: rebuilt from the next polls
+/// after a restart. Every call takes `now` so tests can move the clock.
+#[derive(Debug, Default)]
+pub struct FollowerTable {
+    entries: HashMap<uuid::Uuid, FollowerView>,
+}
+
+impl FollowerTable {
+    fn expire(&mut self, now: DateTime<Utc>) {
+        let ttl = chrono::Duration::from_std(FOLLOWER_TTL).unwrap_or(chrono::Duration::MAX);
+        self.entries.retain(|_, view| now - view.last_poll < ttl);
+    }
+
+    /// Record a poll by `identity` from `remote_addr`, and the tenant it asked for if
+    /// it was a feed request.
+    pub fn record(
+        &mut self,
+        identity: PollIdentity,
+        remote_addr: Option<std::net::SocketAddr>,
+        tenant: Option<(&str, FollowerTenant)>,
+        now: DateTime<Utc>,
+    ) {
+        self.expire(now);
+        if !self.entries.contains_key(&identity.instance_id) && self.entries.len() >= FOLLOWERS_CAP
+        {
+            let stalest = self
+                .entries
+                .values()
+                .min_by_key(|view| view.last_poll)
+                .map(|view| view.instance_id);
+            if let Some(id) = stalest {
+                self.entries.remove(&id);
+            }
+        }
+        let view = self
+            .entries
+            .entry(identity.instance_id)
+            .or_insert_with(|| FollowerView {
+                instance_id: identity.instance_id,
+                url: None,
+                remote_addr: None,
+                first_seen: now,
+                last_poll: now,
+                users: BTreeMap::new(),
+            });
+        view.last_poll = now;
+        if identity.url.is_some() {
+            view.url = identity.url;
+        }
+        if let Some(addr) = remote_addr {
+            view.remote_addr = Some(addr.to_string());
+        }
+        if let Some((user_id, lag)) = tenant {
+            view.users.insert(user_id.to_string(), lag);
+        }
+    }
+
+    /// The followers still within [`FOLLOWER_TTL`], the longest-known first.
+    pub fn followers(&mut self, now: DateTime<Utc>) -> Vec<FollowerView> {
+        self.expire(now);
+        let mut views: Vec<FollowerView> = self.entries.values().cloned().collect();
+        views.sort_by(|a, b| {
+            a.first_seen
+                .cmp(&b.first_seen)
+                .then(a.instance_id.cmp(&b.instance_id))
+        });
+        views
+    }
+}
+
+/// One instance's replication state: what it follows and, as a leader, who follows
+/// it. Held by the manager, so every store it opens sees the same flag, and two
+/// instances in one test process do not share a role.
+#[derive(Debug, Default)]
+pub struct Replication {
+    follow: RwLock<FollowStatus>,
+    /// `follow.target.is_some()`, readable without the lock: every recall on every
+    /// tenant checks it.
+    following: Arc<AtomicBool>,
+    followers: parking_lot::Mutex<FollowerTable>,
+    /// This instance's TLS URL, sent to its leader on every poll.
+    advertised_url: RwLock<Option<String>>,
+}
+
+impl Replication {
+    pub fn status(&self) -> FollowStatus {
+        self.follow.read().clone()
+    }
+
+    /// Whether this instance follows a leader, and so is a read-only replica.
+    pub fn is_following(&self) -> bool {
+        self.following.load(Ordering::Acquire)
+    }
+
+    /// Whether anything but the replication applier may write to this instance: a
+    /// client request on any transport, a stream, maintenance, consolidation or the
+    /// sleep-time workers. False while it follows a leader, whose frames bring every
+    /// change. A writer that runs for a while asks again before each write phase, so a
+    /// follow that lands mid-pass stops it.
+    pub fn client_writes_allowed(&self) -> bool {
+        !self.is_following()
+    }
+
+    /// The flag behind [`Self::is_following`], for the per-tenant stores to share.
+    pub fn following_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.following)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.follow.read().generation == generation
+    }
+
+    /// Stop following under the caller's write lock, keeping the flag in step.
+    fn drop_target(&self, status: &mut FollowStatus) {
+        status.target = None;
+        status.generation += 1;
+        self.following.store(false, Ordering::Release);
+    }
+
+    /// Record the end of a pass over every tenant in `listed`; see
+    /// [`FollowStatus::lag_seconds`].
+    pub(crate) fn record_pass(
+        &self,
+        generation: u64,
+        leader_instance_id: Option<uuid::Uuid>,
+        listed: &[UserLogInfo],
+        asked: DateTime<Utc>,
+        finished: DateTime<Utc>,
+    ) {
+        self.follow
+            .write()
+            .record_pass(generation, leader_instance_id, listed, asked, finished);
+    }
+
+    /// Record a request to the leader that succeeded `at`, if `generation` is current.
+    pub(crate) fn note_leader_contact(&self, generation: u64, at: DateTime<Utc>) {
+        let mut status = self.follow.write();
+        if status.generation == generation {
+            status.leader_contact_at = Some(at);
+        }
+    }
+
+    pub fn leader(&self) -> Option<LeaderRef> {
+        if !self.is_following() {
+            return None;
+        }
+        let status = self.follow.read();
+        let target = status.target.as_ref()?;
+        Some(LeaderRef {
+            instance_id: status.leader_instance_id,
+            url: target.source.clone(),
+            lag_seconds: status.lag_seconds(),
+            contact_age_seconds: status.leader_contact_age_seconds(Utc::now()),
+        })
+    }
+
+    /// A leader follows nothing and has had a poll within [`FOLLOWER_TTL`]. A follower
+    /// that others follow in turn is a follower, and reports its followers too.
+    pub fn role(&self) -> RoleReport {
+        self.role_at(Utc::now())
+    }
+
+    fn role_at(&self, now: DateTime<Utc>) -> RoleReport {
+        let followers = self.followers.lock().followers(now);
+        let status = self.follow.read();
+        let mut report = RoleReport {
+            role: Role::Standalone,
+            instance_id: instance_id(),
+            leader_instance_id: None,
+            leader_url: None,
+            lag_frames: None,
+            lag_seconds: None,
+            leader_contact_age_seconds: None,
+            followers_count: None,
+            max_lag_frames: None,
+        };
+        if !followers.is_empty() {
+            report.role = Role::Leader;
+            report.followers_count = Some(followers.len());
+            report.max_lag_frames = followers.iter().map(FollowerView::lag_frames).max();
+        }
+        if let Some(target) = &status.target {
+            report.role = Role::Follower;
+            report.leader_instance_id = status.leader_instance_id;
+            report.leader_url = Some(target.source.clone());
+            report.lag_frames = status.lag_frames();
+            report.lag_seconds = status.lag_seconds();
+            report.leader_contact_age_seconds = status.leader_contact_age_seconds(now);
+        }
+        report
+    }
+
+    /// Leader side: record a poll from a follower that identified itself. A poll
+    /// naming this process is this process polling itself, which it then stops.
+    pub fn note_poll(
+        &self,
+        identity: PollIdentity,
+        remote_addr: Option<std::net::SocketAddr>,
+        tenant: Option<(&str, FollowerTenant)>,
+    ) {
+        if identity.instance_id == instance_id() {
+            return;
+        }
+        self.followers
+            .lock()
+            .record(identity, remote_addr, tenant, Utc::now());
+    }
+
+    /// Leader side: who has polled within [`FOLLOWER_TTL`].
+    pub fn followers(&self) -> Vec<FollowerView> {
+        self.followers.lock().followers(Utc::now())
+    }
+
+    /// Set the URL this instance gives its leader, from its TLS listener.
+    pub fn set_advertised_url(&self, url: Option<String>) {
+        *self.advertised_url.write() = url;
+    }
+
+    /// How this instance identifies itself when it polls a leader.
+    pub fn poll_identity(&self) -> PollIdentity {
+        PollIdentity {
+            instance_id: instance_id(),
+            url: self.advertised_url.read().clone(),
+        }
+    }
 }
 
 /// Host part of an http(s) URL, without brackets for IPv6.
@@ -939,65 +1387,97 @@ fn save_cursor(path: &Path, users: &BTreeMap<String, UserProgress>) -> Result<()
     Ok(())
 }
 
-/// Start (or switch) following `source`. The cursor saved for that source is
-/// resumed, so a follower that was stopped picks up where it left off. A poll still
-/// running for the previous target stops at its next page. Fails, naming the
-/// variable and the file, when the TLS variables do not yield a client.
-pub fn follow(
-    base: &Path,
-    source: &str,
-    admin_key: &str,
-    api_key: Option<&str>,
-) -> Result<FollowStatus> {
-    let source = normalize_source(source)?;
-    let api_key = api_key
-        .map(str::to_string)
-        .filter(|k| !k.trim().is_empty())
-        .or_else(|| default_api_key_for(&source))
-        .ok_or_else(|| {
-            anyhow!("no API key for the leader {source}: pass its key, or set {ENV_API_KEY}")
-        })?;
-    let http = leader_client(POLL_TIMEOUT)?;
-    let users = load_cursor(&cursor_path(base, &source));
-    let mut status = FOLLOW.write();
-    let generation = status.generation + 1;
-    *status = FollowStatus {
-        target: Some(FollowTarget {
-            source,
-            admin_key: admin_key.to_string(),
-            api_key,
-            http,
-            since: Utc::now(),
-        }),
-        generation,
-        users,
-        ..FollowStatus::default()
-    };
-    Ok(status.clone())
-}
+impl Replication {
+    /// Start (or switch) following `source`. The cursor saved for that source under
+    /// `base` is resumed, so a follower that was stopped picks up where it left off. A
+    /// poll still running for the previous target stops at its next page. Fails,
+    /// naming the variable and the file, when the TLS variables do not yield a client.
+    pub fn follow(
+        &self,
+        base: &Path,
+        source: &str,
+        admin_key: &str,
+        api_key: Option<&str>,
+    ) -> Result<FollowStatus> {
+        let source = normalize_source(source)?;
+        let api_key = api_key
+            .map(str::to_string)
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| default_api_key_for(&source))
+            .ok_or_else(|| {
+                anyhow!("no API key for the leader {source}: pass its key, or set {ENV_API_KEY}")
+            })?;
+        let http = leader_client(POLL_TIMEOUT)?;
+        let users = load_cursor(&cursor_path(base, &source));
+        let mut status = self.follow.write();
+        let generation = status.generation + 1;
+        *status = FollowStatus {
+            target: Some(FollowTarget {
+                source,
+                admin_key: admin_key.to_string(),
+                api_key,
+                http,
+                since: Utc::now(),
+            }),
+            generation,
+            users,
+            ..FollowStatus::default()
+        };
+        self.following.store(true, Ordering::Release);
+        Ok(status.clone())
+    }
 
-/// Stop following. A poll in progress stops at its next page; the cursor is kept.
-pub fn unfollow() -> FollowStatus {
-    let mut status = FOLLOW.write();
-    status.target = None;
-    status.generation += 1;
-    status.clone()
-}
+    /// Stop following. A poll in progress stops at its next page; the cursor is kept.
+    pub fn unfollow(&self) -> FollowStatus {
+        let mut status = self.follow.write();
+        self.drop_target(&mut status);
+        status.clone()
+    }
 
-/// `VELD_REPLICATE_FROM` + `VELD_REPLICATE_ADMIN_KEY` at boot.
-pub fn follow_from_env(base: &Path) -> Result<Option<FollowStatus>> {
-    let Some(source) = std::env::var(ENV_SOURCE)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return Ok(None);
-    };
-    let admin_key = std::env::var(ENV_ADMIN_KEY)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow!("{ENV_SOURCE} is set but {ENV_ADMIN_KEY} is not"))?;
-    let api_key = std::env::var(ENV_API_KEY).ok();
-    follow(base, &source, &admin_key, api_key.as_deref()).map(Some)
+    /// `VELD_REPLICATE_FROM` + `VELD_REPLICATE_ADMIN_KEY` at boot.
+    pub fn follow_from_env(&self, base: &Path) -> Result<Option<FollowStatus>> {
+        let Some(source) = std::env::var(ENV_SOURCE)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let admin_key = std::env::var(ENV_ADMIN_KEY)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("{ENV_SOURCE} is set but {ENV_ADMIN_KEY} is not"))?;
+        let api_key = std::env::var(ENV_API_KEY).ok();
+        self.follow(base, &source, &admin_key, api_key.as_deref())
+            .map(Some)
+    }
+
+    /// Mark a tenant diverged and persist the cursor, if the poll is still current.
+    fn mark_diverged(
+        &self,
+        generation: u64,
+        cursor: &Path,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let users = {
+            let mut status = self.follow.write();
+            if status.generation != generation {
+                return Ok(());
+            }
+            let entry = status.users.entry(user_id.to_string()).or_default();
+            if entry.diverged.is_none() {
+                tracing::error!(
+                    tenant = %user_id,
+                    reason,
+                    "replication: tenant diverged from the leader and is no longer synced; \
+                     stop this follower, remove the tenant's directory here, and it replays from the start"
+                );
+            }
+            entry.diverged = Some(reason.to_string());
+            status.users.clone()
+        };
+        save_cursor(cursor, &users)
+    }
 }
 
 pub fn interval_from_env() -> Duration {
@@ -1056,19 +1536,34 @@ async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>>
     Ok(buf)
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(target: &FollowTarget, path: &str) -> Result<T> {
+/// GET `path` on the leader. `identity` names this instance to it; a probe made
+/// before following passes none, so the leader does not list it as a follower.
+async fn get_json<T: serde::de::DeserializeOwned>(
+    target: &FollowTarget,
+    identity: Option<&PollIdentity>,
+    path: &str,
+) -> Result<T> {
     let url = format!("{}{}", target.source, path);
-    let resp = target
+    let mut request = target
         .http
         .get(&url)
         .header("X-API-Key", &target.api_key)
         .header(
             crate::handlers::admin::ADMIN_API_KEY_HEADER,
             &target.admin_key,
-        )
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+        );
+    if let Some(identity) = identity {
+        request = request.header(INSTANCE_ID_HEADER, identity.instance_id.to_string());
+        // A URL that cannot be a header value is left off: reqwest would fail the poll.
+        let own_url = identity
+            .url
+            .as_deref()
+            .and_then(|url| reqwest::header::HeaderValue::from_str(url).ok());
+        if let Some(own_url) = own_url {
+            request = request.header(FOLLOWER_URL_HEADER, own_url);
+        }
+    }
+    let resp = request.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let body = read_capped(resp, MAX_REPLY_BYTES)
         .await
@@ -1153,30 +1648,8 @@ pub async fn probe_leader(
         http,
         since: Utc::now(),
     };
-    let leader: LeaderStatus = get_json(&target, "/api/admin/replication/status").await?;
+    let leader: LeaderStatus = get_json(&target, None, "/api/admin/replication/status").await?;
     Ok(leader.into())
-}
-
-/// Mark a tenant diverged and persist the cursor, if the poll is still current.
-fn mark_diverged(generation: u64, cursor: &Path, user_id: &str, reason: &str) -> Result<()> {
-    let users = {
-        let mut status = FOLLOW.write();
-        if status.generation != generation {
-            return Ok(());
-        }
-        let entry = status.users.entry(user_id.to_string()).or_default();
-        if entry.diverged.is_none() {
-            tracing::error!(
-                tenant = %user_id,
-                reason,
-                "replication: tenant diverged from the leader and is no longer synced; \
-                 stop this follower, remove the tenant's directory here, and it replays from the start"
-            );
-        }
-        entry.diverged = Some(reason.to_string());
-        status.users.clone()
-    };
-    save_cursor(cursor, &users)
 }
 
 /// Sync one tenant from its cursor to the leader's head, page by page, persisting
@@ -1189,13 +1662,16 @@ async fn sync_user(
     info: &UserLogInfo,
     shutdown: &CancellationToken,
 ) -> Result<u64> {
+    let replication = &manager.replication;
+    let identity = replication.poll_identity();
     let mut consumed = 0u64;
     let mut head: u64;
     loop {
-        if shutdown.is_cancelled() || !is_current(generation) {
+        if shutdown.is_cancelled() || !replication.is_current(generation) {
             return Ok(consumed);
         }
-        let progress = FOLLOW
+        let progress = replication
+            .follow
             .read()
             .users
             .get(&info.user_id)
@@ -1210,12 +1686,13 @@ async fn sync_user(
                 .unwrap_or_default()
         );
         let page: FeedPage = tokio::select! {
-            page = get_json(target, &path) => page?,
+            page = get_json(target, Some(&identity), &path) => page?,
             () = shutdown.cancelled() => return Ok(consumed),
         };
+        replication.note_leader_contact(generation, Utc::now());
         head = page.head_lsn;
         if let Some(reason) = divergence(&progress, &page) {
-            mark_diverged(generation, cursor, &info.user_id, &reason)?;
+            replication.mark_diverged(generation, cursor, &info.user_id, &reason)?;
             return Ok(consumed);
         }
         let Some(last_lsn) = page.records.last().map(|r| r.lsn) else {
@@ -1240,7 +1717,7 @@ async fn sync_user(
         .await
         .map_err(|e| anyhow!("apply task: {e}"))?
         .with_context(|| format!("applying lsns up to {last_lsn} of {}", info.user_id))?;
-        let saved = FOLLOW.write().record_page(
+        let saved = replication.follow.write().record_page(
             generation,
             &info.user_id,
             &page,
@@ -1258,7 +1735,7 @@ async fn sync_user(
         }
     }
     let users = {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation != generation {
             return Ok(consumed);
         }
@@ -1282,40 +1759,44 @@ async fn poll_once(
     interval: Duration,
     shutdown: &CancellationToken,
 ) -> Result<u64> {
+    let replication = &manager.replication;
+    let identity = replication.poll_identity();
+    let asked = Utc::now();
     let leader: LeaderStatus = tokio::select! {
-        leader = get_json(target, "/api/admin/replication/status") => leader?,
+        leader = get_json(target, Some(&identity), "/api/admin/replication/status") => leader?,
         () = shutdown.cancelled() => return Ok(0),
     };
+    replication.note_leader_contact(generation, Utc::now());
     if leader.instance_id == Some(instance_id()) {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation == generation {
             let message = format!("{} is this instance; following stopped", target.source);
             tracing::error!(source = %target.source, "replication: {message}");
-            status.target = None;
-            status.generation += 1;
+            replication.drop_target(&mut status);
             status.last_error = Some(message);
         }
         return Ok(0);
     }
     let cursor = cursor_path(&manager.base_path, &target.source);
     let set_syncing = |tenant: Option<&str>| {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation == generation {
             status.syncing = tenant.map(str::to_string);
         }
     };
     {
-        let mut status = FOLLOW.write();
+        let mut status = replication.follow.write();
         if status.generation == generation {
             status.pass_started = Some(Utc::now());
         }
     }
     let mut consumed = 0u64;
     for info in &leader.users {
-        if shutdown.is_cancelled() || !is_current(generation) {
+        if shutdown.is_cancelled() || !replication.is_current(generation) {
             break;
         }
-        let progress = FOLLOW
+        let progress = replication
+            .follow
             .read()
             .users
             .get(&info.user_id)
@@ -1330,7 +1811,7 @@ async fn poll_once(
                 continue;
             }
             tracing::info!(tenant = %info.user_id, "replication: diverged tenant's local data removed; replaying it from the start");
-            let mut status = FOLLOW.write();
+            let mut status = replication.follow.write();
             if status.generation != generation {
                 break;
             }
@@ -1348,7 +1829,7 @@ async fn poll_once(
         match sync_user(manager, target, generation, &cursor, info, shutdown).await {
             Ok(n) => {
                 consumed += n;
-                let mut status = FOLLOW.write();
+                let mut status = replication.follow.write();
                 if status.generation == generation {
                     if let Some(entry) = status.users.get_mut(&info.user_id) {
                         if entry.last_error.take().is_some() {
@@ -1361,7 +1842,7 @@ async fn poll_once(
             }
             Err(e) => {
                 let message = format!("{e:#}");
-                let mut status = FOLLOW.write();
+                let mut status = replication.follow.write();
                 if status.generation != generation {
                     break;
                 }
@@ -1376,6 +1857,15 @@ async fn poll_once(
         }
     }
     set_syncing(None);
+    if !shutdown.is_cancelled() {
+        replication.record_pass(
+            generation,
+            leader.instance_id,
+            &leader.users,
+            asked,
+            Utc::now(),
+        );
+    }
     Ok(consumed)
 }
 
@@ -1385,11 +1875,12 @@ async fn poll_once(
 /// cursor, and no request or page starts after the cancel, so the store flush and
 /// the vector-index save at shutdown see no later writes.
 pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: CancellationToken) {
+    let replication = &manager.replication;
     let interval = interval_from_env();
     let mut failures = 0u32;
     loop {
         let (target, generation) = {
-            let status = FOLLOW.read();
+            let status = replication.follow.read();
             (status.target.clone(), status.generation)
         };
         let mut wait = interval;
@@ -1398,7 +1889,7 @@ pub async fn run_follower(manager: Arc<MultiUserMemoryManager>, shutdown: Cancel
             if shutdown.is_cancelled() {
                 break;
             }
-            let mut status = FOLLOW.write();
+            let mut status = replication.follow.write();
             if status.generation == generation {
                 status.polls += 1;
                 status.last_poll = Some(Utc::now());
@@ -2060,6 +2551,485 @@ mod tests {
         assert_eq!(p.lag, None);
     }
 
+    fn listed(users: &[&str]) -> Vec<UserLogInfo> {
+        users
+            .iter()
+            .map(|u| UserLogInfo {
+                user_id: u.to_string(),
+                log_bytes: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lag_seconds_run_from_the_last_pass_that_caught_every_tenant_up() {
+        let at = |s: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + s, 0).unwrap();
+        let leader = Some(uuid::Uuid::new_v4());
+        let mut status = FollowStatus {
+            generation: 2,
+            ..FollowStatus::default()
+        };
+        let progress = |lag| UserProgress {
+            lag: Some(lag),
+            ..UserProgress::default()
+        };
+        status.users.insert("a".into(), progress(0));
+        status.users.insert("b".into(), progress(40));
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(0), at(3));
+        assert_eq!(status.leader_instance_id, leader);
+        assert_eq!(
+            status.lag_seconds(),
+            None,
+            "never caught up since following began"
+        );
+        assert_eq!(status.lag_frames(), Some(40));
+
+        status.users.insert("b".into(), progress(0));
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(10), at(12));
+        assert_eq!(status.lag_seconds(), Some(2), "behind by the pass itself");
+
+        status.users.get_mut("a").unwrap().last_error = Some("timed out".into());
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(20), at(25));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(15),
+            "a failed tenant is not caught up: the lag runs from the pass at 10"
+        );
+
+        status.record_pass(1, leader, &listed(&[]), at(30), at(31));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(15),
+            "a stale poll records nothing"
+        );
+
+        status.users.get_mut("a").unwrap().diverged = Some("rolled back".into());
+        status.users.get_mut("a").unwrap().last_error = None;
+        status.record_pass(2, leader, &listed(&["a", "b"]), at(40), at(41));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(31),
+            "a diverged tenant is behind"
+        );
+
+        status.record_pass(2, leader, &listed(&["b", "new"]), at(50), at(51));
+        assert_eq!(
+            status.lag_seconds(),
+            Some(41),
+            "a tenant the follower has never read is behind"
+        );
+    }
+
+    /// The relay decides failover on `lag_seconds`, which holds still through an outage;
+    /// the contact age is what grows.
+    #[test]
+    fn the_contact_age_grows_through_an_outage_while_the_lag_holds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let at = |s: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + s, 0).unwrap();
+        let replication = Replication::default();
+        replication
+            .follow(dir.path(), "http://127.0.0.1:9", "admin", Some("key"))
+            .unwrap();
+        let generation = replication.status().generation;
+        assert_eq!(replication.role_at(at(0)).leader_contact_age_seconds, None);
+
+        replication.record_pass(generation, None, &[], at(0), at(4));
+        replication.note_leader_contact(generation, at(4));
+        let reached = replication.role_at(at(4));
+        assert_eq!(
+            (reached.lag_seconds, reached.leader_contact_age_seconds),
+            (Some(4), Some(0))
+        );
+
+        let outage = replication.role_at(at(604));
+        assert_eq!(
+            (outage.lag_seconds, outage.leader_contact_age_seconds),
+            (Some(4), Some(600)),
+            "ten minutes without reaching the leader"
+        );
+
+        replication.note_leader_contact(generation - 1, at(700));
+        assert_eq!(
+            replication.role_at(at(704)).leader_contact_age_seconds,
+            Some(700),
+            "a stale poll's contact is not recorded"
+        );
+    }
+
+    /// `after_lsn` is the follower's cursor, the last frame it applied; the feed
+    /// serves from one past it. The lag the leader records is what the reply left
+    /// unsent, so it is 0 for a reply that carried everything, and the follower's own
+    /// lag once it has applied the reply.
+    #[test]
+    fn a_followers_lag_is_what_the_reply_left_unsent() {
+        let cases = [
+            (None, 0, usize::MAX, 0, 0),
+            (None, 5, usize::MAX, 0, 0),
+            (None, 5, 2, 0, 3),
+            (Some(0), 5, usize::MAX, 1, 0),
+            (Some(0), 5, 3, 1, 1),
+            (Some(3), 5, usize::MAX, 4, 0),
+            (Some(4), 5, usize::MAX, 5, 0),
+            (Some(9), 5, usize::MAX, 10, 0),
+        ];
+        for (after_lsn, head, limit, requested, lag) in cases {
+            let floor = after_lsn.map_or(0, |applied| applied + 1);
+            let (served, more) =
+                page_below_head((0..head).map(record), floor, head, limit).unwrap();
+            let tenant = FollowerTenant::new(after_lsn, head, served.len() as u64);
+            let case = format!("after_lsn {after_lsn:?}, head {head}, limit {limit}");
+            assert_eq!(
+                (
+                    tenant.requested_lsn,
+                    tenant.leader_head_lsn,
+                    tenant.lag_frames
+                ),
+                (requested, head, lag),
+                "{case}"
+            );
+            assert_eq!(more, lag > 0, "the feed's `more` agrees: {case}");
+
+            let mut follower_side = UserProgress {
+                applied_lsn: served.last().map(|r| r.lsn).or(after_lsn),
+                leader_head_lsn: Some(head),
+                ..UserProgress::default()
+            };
+            follower_side.refresh_lag();
+            if after_lsn.is_none_or(|applied| applied < head) {
+                assert_eq!(
+                    follower_side.lag,
+                    Some(tenant.lag_frames),
+                    "the follower, having applied the reply, and its leader agree: {case}"
+                );
+            }
+        }
+    }
+
+    fn identity(n: u128, url: Option<&str>) -> PollIdentity {
+        PollIdentity {
+            instance_id: uuid::Uuid::from_u128(n),
+            url: url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_follower_table_records_polls_and_drops_the_absent() {
+        let t0 = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let mins = |m: i64| t0 + chrono::Duration::minutes(m);
+        let peer: std::net::SocketAddr = "10.0.0.7:51234".parse().unwrap();
+        let mut table = FollowerTable::default();
+
+        table.record(
+            identity(1, Some("https://replica.example:3443/")),
+            Some(peer),
+            Some(("alice", FollowerTenant::new(Some(9), 30, 5))),
+            t0,
+        );
+        table.record(identity(1, None), None, None, mins(4));
+        table.record(
+            identity(1, None),
+            None,
+            Some(("bob", FollowerTenant::new(None, 4, 1))),
+            mins(5),
+        );
+        let followers = table.followers(mins(5));
+        assert_eq!(followers.len(), 1);
+        let one = &followers[0];
+        assert_eq!(one.first_seen, t0);
+        assert_eq!(one.last_poll, mins(5));
+        assert_eq!(
+            one.url.as_deref(),
+            Some("https://replica.example:3443/"),
+            "a poll without a url keeps the one already given"
+        );
+        assert_eq!(one.remote_addr.as_deref(), Some("10.0.0.7:51234"));
+        assert_eq!(one.users["alice"], FollowerTenant::new(Some(9), 30, 5));
+        assert_eq!(one.users["alice"].lag_frames, 15, "30 - (10 + 5)");
+        assert_eq!(one.users["bob"].lag_frames, 3);
+        assert_eq!(one.lag_frames(), 18);
+
+        assert_eq!(
+            table
+                .followers(mins(5) + chrono::Duration::seconds(599))
+                .len(),
+            1
+        );
+        assert!(
+            table.followers(mins(15)).is_empty(),
+            "ten minutes without a poll drops it"
+        );
+    }
+
+    #[test]
+    fn the_follower_table_holds_64_and_evicts_the_longest_silent() {
+        let t0 = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let mut table = FollowerTable::default();
+        for n in 0..FOLLOWERS_CAP as u128 {
+            table.record(identity(n, None), None, None, at(n as i64));
+        }
+        table.record(identity(0, None), None, None, at(100));
+        assert_eq!(table.followers(at(100)).len(), FOLLOWERS_CAP);
+
+        table.record(identity(1000, None), None, None, at(101));
+        let ids: Vec<u128> = table
+            .followers(at(101))
+            .iter()
+            .map(|f| f.instance_id.as_u128())
+            .collect();
+        assert_eq!(ids.len(), FOLLOWERS_CAP);
+        assert!(ids.contains(&1000));
+        assert!(ids.contains(&0), "re-polled, so no longer the stalest");
+        assert!(!ids.contains(&1), "the follower polled longest ago went");
+    }
+
+    #[test]
+    fn a_follower_url_is_checked_capped_and_kept_for_display() {
+        let headers = |id: &str, url: Option<&str>| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(INSTANCE_ID_HEADER, id.parse().unwrap());
+            if let Some(url) = url {
+                h.insert(FOLLOWER_URL_HEADER, url.parse().unwrap());
+            }
+            h
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let url_of =
+            |url: &str| PollIdentity::from_headers(&headers(&id, Some(url))).and_then(|p| p.url);
+
+        assert_eq!(
+            PollIdentity::from_headers(&headers(&id, None)),
+            Some(PollIdentity {
+                instance_id: id.parse().unwrap(),
+                url: None
+            })
+        );
+        assert_eq!(
+            url_of("https://replica.example:3443"),
+            Some("https://replica.example:3443/".to_string())
+        );
+        let long = format!("https://replica.example/{}", "a".repeat(500));
+        assert!(long.len() > MAX_FOLLOWER_URL_BYTES);
+        assert_eq!(url_of(&long), None, "over 512 bytes");
+        assert_eq!(url_of("not a url"), None);
+        assert_eq!(url_of("ftp://replica.example"), None);
+        assert_eq!(url_of("https://user:pw@replica.example"), None);
+        assert_eq!(url_of("file:///etc/passwd"), None);
+
+        assert_eq!(
+            PollIdentity::from_headers(&headers("not-a-uuid", None)),
+            None
+        );
+        assert_eq!(
+            PollIdentity::from_headers(&axum::http::HeaderMap::new()),
+            None,
+            "a follower that does not name itself is not recorded"
+        );
+    }
+
+    #[test]
+    fn a_leader_reports_its_followers_and_their_largest_lag() {
+        let replication = Replication::default();
+        let now = Utc::now();
+        {
+            let mut table = replication.followers.lock();
+            table.record(
+                identity(1, None),
+                None,
+                Some(("a", FollowerTenant::new(Some(4), 10, 2))),
+                now,
+            );
+            table.record(
+                identity(1, None),
+                None,
+                Some(("b", FollowerTenant::new(None, 1, 0))),
+                now,
+            );
+            table.record(
+                identity(2, None),
+                None,
+                Some(("a", FollowerTenant::new(Some(1), 10, 3))),
+                now,
+            );
+        }
+        let role = replication.role_at(now);
+        assert_eq!(role.role, Role::Leader);
+        assert_eq!(role.followers_count, Some(2));
+        assert_eq!(
+            role.max_lag_frames,
+            Some(5),
+            "follower 1 lags (10 - 5 - 2) + 1, follower 2 lags 10 - 2 - 3"
+        );
+        let later = replication.role_at(now + chrono::Duration::from_std(FOLLOWER_TTL).unwrap());
+        assert_eq!(later.role, Role::Standalone, "its followers went quiet");
+        assert_eq!(later.followers_count, None);
+    }
+
+    /// The leader's two routes, recording the headers of every request they get.
+    async fn fake_leader(
+        leader_id: uuid::Uuid,
+    ) -> (
+        String,
+        Arc<parking_lot::Mutex<Vec<(String, axum::http::HeaderMap)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{extract::State, http::HeaderMap, routing::get, Json, Router};
+        type Seen = Arc<parking_lot::Mutex<Vec<(String, HeaderMap)>>>;
+        let seen: Seen = Arc::default();
+        let app = Router::new()
+            .route(
+                "/api/admin/replication/status",
+                get(
+                    move |State(seen): State<Seen>, headers: HeaderMap| async move {
+                        seen.lock().push(("status".into(), headers));
+                        Json(serde_json::json!({
+                            "instance_id": leader_id,
+                            "users": [{"user_id": "u", "log_bytes": 7}],
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/api/admin/replication/records",
+                get(|State(seen): State<Seen>, headers: HeaderMap| async move {
+                    seen.lock().push(("records".into(), headers));
+                    Json(serde_json::json!({
+                        "user_id": "u", "records": [], "head_lsn": 0, "more": false,
+                    }))
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, seen, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_follower_names_itself_on_every_poll() {
+        let leader_id = uuid::Uuid::new_v4();
+        let (leader_url, seen, server) = fake_leader(leader_id).await;
+        let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let manager = Arc::new(manager);
+        let replication = &manager.replication;
+        replication
+            .follow(&manager.base_path, &leader_url, "admin", Some("key"))
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let poll = |manager: Arc<MultiUserMemoryManager>| {
+            let shutdown = shutdown.clone();
+            async move {
+                let status = manager.replication.status();
+                let target = status.target.clone().unwrap();
+                poll_once(
+                    &manager,
+                    &target,
+                    status.generation,
+                    DEFAULT_INTERVAL,
+                    &shutdown,
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        replication.set_advertised_url(Some("https://replica.example:3443".into()));
+        poll(Arc::clone(&manager)).await;
+        {
+            let seen = seen.lock();
+            let routes: Vec<&str> = seen.iter().map(|(route, _)| route.as_str()).collect();
+            assert_eq!(routes, ["status", "records"]);
+            for (route, headers) in seen.iter() {
+                assert_eq!(
+                    headers[INSTANCE_ID_HEADER],
+                    instance_id().to_string(),
+                    "{route}"
+                );
+                assert_eq!(
+                    headers[FOLLOWER_URL_HEADER], "https://replica.example:3443",
+                    "{route}"
+                );
+            }
+        }
+        let role = replication.role();
+        assert_eq!(role.leader_instance_id, Some(leader_id));
+        assert_eq!(role.lag_frames, Some(0));
+        assert!(
+            role.lag_seconds.is_some(),
+            "the pass caught every tenant up"
+        );
+        assert!(
+            role.leader_contact_age_seconds.is_some_and(|age| age <= 1),
+            "the poll reached the leader: {role:?}"
+        );
+
+        replication.set_advertised_url(None);
+        seen.lock().clear();
+        poll(Arc::clone(&manager)).await;
+        for (route, headers) in seen.lock().iter() {
+            assert!(headers.contains_key(INSTANCE_ID_HEADER), "{route}");
+            assert!(
+                !headers.contains_key(FOLLOWER_URL_HEADER),
+                "{route}: no url, no header"
+            );
+        }
+
+        seen.lock().clear();
+        probe_leader(
+            leader_client(PROBE_TIMEOUT).unwrap(),
+            &leader_url,
+            "admin",
+            "key",
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            !seen[0].1.contains_key(INSTANCE_ID_HEADER),
+            "the probe before a follow does not make this instance a follower"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn a_process_never_lists_itself_as_its_follower() {
+        let replication = Replication::default();
+        let me = PollIdentity {
+            instance_id: instance_id(),
+            url: None,
+        };
+        replication.note_poll(me, None, None);
+        assert!(replication.followers().is_empty());
+        assert_eq!(replication.role().role, Role::Standalone);
+    }
+
+    #[test]
+    fn the_role_follows_the_follow_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let replication = Replication::default();
+        let flag = replication.following_flag();
+        let standalone = replication.role();
+        assert_eq!(standalone.role, Role::Standalone);
+        assert_eq!(standalone.instance_id, instance_id());
+        assert!(replication.leader().is_none());
+
+        replication
+            .follow(dir.path(), "http://127.0.0.1:9", "admin", Some("key"))
+            .unwrap();
+        assert!(flag.load(Ordering::Acquire), "the stores see the follow");
+        let follower = replication.role();
+        assert_eq!(follower.role, Role::Follower);
+        assert_eq!(follower.leader_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(follower.lag_seconds, None);
+
+        replication.unfollow();
+        assert!(!flag.load(Ordering::Acquire), "and the unfollow");
+        assert_eq!(replication.role().role, Role::Standalone);
+    }
+
     #[tokio::test]
     async fn the_follower_returns_once_shutdown_is_cancelled() {
         let (manager, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
@@ -2592,6 +3562,60 @@ mod tests {
     fn tls_refusal(vars: &[(&str, &str)]) -> String {
         let err = tls_from(vars).expect_err("the TLS variables are refused");
         format!("{err:#}")
+    }
+
+    #[test]
+    fn debug_output_carries_no_key_material() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["follower.example".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (cert_pem, key_pem) = (cert.pem(), key.serialize_pem());
+        let cert_path = dir.path().join("client.pem");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let tls = tls_from(&[
+            (ENV_CLIENT_CERT, cert_path.to_str().unwrap()),
+            (ENV_CLIENT_KEY, key_path.to_str().unwrap()),
+        ])
+        .unwrap();
+        assert!(tls.identity.is_some());
+
+        let (admin_key, api_key) = ("admin-SECRET-4f1c", "api-SECRET-9b2e");
+        let replication = Replication::default();
+        replication
+            .follow(dir.path(), "http://127.0.0.1:9", admin_key, Some(api_key))
+            .unwrap();
+        let request = crate::handlers::replication::FollowRequest {
+            source: "http://127.0.0.1:9".into(),
+            admin_key: admin_key.into(),
+            api_key: Some(api_key.into()),
+        };
+        let pem_bodies: Vec<&str> = cert_pem
+            .lines()
+            .chain(key_pem.lines())
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        for text in [
+            format!("{replication:?}"),
+            format!("{replication:#?}"),
+            format!("{:?}", replication.status()),
+            format!("{request:?}"),
+            format!("{tls:?}"),
+        ] {
+            assert!(!text.contains("SECRET"), "a key in {text}");
+            assert!(
+                !text.contains("BEGIN") && !pem_bodies.iter().any(|body| text.contains(body)),
+                "PEM content in {text}"
+            );
+        }
+        assert!(
+            format!("{replication:?}").contains("http://127.0.0.1:9"),
+            "the source is still shown"
+        );
     }
 
     #[test]
