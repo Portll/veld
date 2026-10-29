@@ -17,9 +17,10 @@
 //!   names one reports the ablation as unavailable instead of measuring baseline.
 //!
 //! [`DEFAULT_DISABLED`] holds `hebbian`, as upstream's does (shodh-memory #321). The
-//! term adds a graph hop decay of up to 1.0, scaled by 0.1, to fused scores whose top
+//! term added a graph hop decay of up to 1.0, scaled by 0.1, to fused scores whose top
 //! ten spread over about 0.007, and only for memories the graph leg reached. On the
-//! LoCoMo gate, switching it off lifted nDCG@10 from 0.383 to about 0.44.
+//! LoCoMo gate, switching it off lifted nDCG@10 from 0.383 to about 0.44. It is now a
+//! share of the fused score, at most 10%, and stays off until that form is measured.
 
 use std::collections::HashSet;
 
@@ -28,7 +29,7 @@ pub const DISABLE_BOOSTS_VAR: &str = "SHODH_DISABLE_BOOSTS";
 
 /// Every family veld gates, each with an [`is_enabled`] call at its site.
 ///
-/// * `hebbian` — the Layer-5 hebbian term `score + hebbian_boost * 0.1` in
+/// * `hebbian` — the Layer-5 hebbian term `score * (1 + 0.1 * hebbian_boost)` in
 ///   `recall.rs`. Off by default ([`DEFAULT_DISABLED`]); `SHODH_DISABLE_BOOSTS` set
 ///   without it, even to the empty string, switches it on. Also switchable through
 ///   the `hebbian` cognitive-dial signal; the term runs only when both allow it.

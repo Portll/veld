@@ -2846,6 +2846,12 @@ pub const FLAT_CONSENSUS: f32 = 0.3;
 /// which outweighed every reciprocal-rank score the fusion produced.
 pub const ACTIVATION_BONUS_SCALE: f32 = 0.3;
 
+/// Cap on the recall Layer 5 factor `1 + Σ signal shares` that multiplies a fused score
+/// (upstream's 2.5, #174). Under default constants the shares sum to at most about 1.3, with
+/// an explicit-recency query's 0.5 recency term, so the cap bites only on a caller's
+/// `recency_weight`, which is unbounded.
+pub const UNIFIED_SIGNAL_FACTOR_MAX: f32 = 2.5;
+
 /// Duration of the reconsolidation labile window in seconds.
 ///
 /// Justification:

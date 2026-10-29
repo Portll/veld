@@ -3051,11 +3051,11 @@ impl super::MemorySystem {
         > = std::cell::RefCell::new(std::collections::HashMap::new());
 
         for (memory_id, score) in memory_ids {
-            // Hebbian boost from learned graph weights (10% contribution)
-            // [signal: hebbian] Gated by disabled_signals dial; default = always on.
+            // Hebbian boost from learned graph weights: up to 10% of the fused score.
+            // [signal: hebbian] Gated by disabled_signals dial and the ablation family (off).
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
             let base_score = if hebbian_family_on && dials_snapshot.signal_enabled("hebbian") {
-                score + hebbian_boost * 0.1
+                score * (1.0 + hebbian_boost.clamp(0.0, 1.0) * 0.1)
             } else {
                 score
             };
@@ -3401,8 +3401,11 @@ impl super::MemorySystem {
                     1.0
                 };
 
-                let final_score = (base
-                    + recency_boost
+                // The signals are shares of the fused score, summed and then capped
+                // (shodh-memory #174): added to it, a recency or temporal term of 0.1-0.25 set the
+                // order outright over reciprocal-rank scores near 0.03, and a memory the fusion
+                // ranked last could pass every one above it.
+                let signal_share = recency_boost
                     + arousal_boost
                     + credibility_boost
                     + valence_boost
@@ -3417,7 +3420,9 @@ impl super::MemorySystem {
                     + temporal_density
                     + entity_density
                     + elaboration_boost
-                    + burstiness_boost)
+                    + burstiness_boost;
+                let final_score = base
+                    * (1.0 + signal_share).min(crate::constants::UNIFIED_SIGNAL_FACTOR_MAX)
                     * feedback_multiplier
                     * confidence_gate
                     * external_dim_multiplier;
@@ -3962,15 +3967,15 @@ impl super::MemorySystem {
         // =====================================================================
         // LAYER 5.85: LINGUISTIC BOOST (moved before 5.9 to avoid undoing pins)
         // =====================================================================
-        // Additive boost based on focal entity overlap. Must run BEFORE Layer 5.9
-        // ordinal resolution, because 5.9 pins memories to specific ranks and a
-        // post-pin re-sort would destroy those pins.
+        // Sort-key boost for focal entity overlap, 5% of the score per unit of matched IC
+        // weight. Must run BEFORE Layer 5.9 ordinal resolution, because 5.9 pins memories to
+        // specific ranks and a post-pin re-sort would destroy those pins.
         if !query_analysis.focal_entities.is_empty() {
             memories.sort_by(|a, b| {
                 let score_a = a.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05;
+                    * (1.0 + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05);
                 let score_b = b.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
+                    * (1.0 + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05);
                 score_b.total_cmp(&score_a)
             });
         }
@@ -6805,7 +6810,7 @@ mod signal_disable_gate_tests {
     }
 
     /// Simulates the hebbian gate on base_score.
-    /// When `hebbian` is disabled the 0.1× hebbian contribution is not added to base.
+    /// When `hebbian` is disabled the fused score does not take its 0.1× hebbian share.
     #[test]
     fn sd_c4_hebbian_gate_changes_base_score() {
         let rrf_score: f32 = 0.5;
@@ -6813,11 +6818,11 @@ mod signal_disable_gate_tests {
 
         let dials_enabled = CognitiveDials::default();
         let base_enabled = if dials_enabled.signal_enabled("hebbian") {
-            rrf_score + hebbian_score * 0.1
+            rrf_score * (1.0 + hebbian_score * 0.1)
         } else {
             rrf_score
         };
-        let expected = rrf_score + hebbian_score * 0.1;
+        let expected = rrf_score * (1.0 + hebbian_score * 0.1);
         assert!(
             (base_enabled - expected).abs() < 1e-6,
             "hebbian enabled: expected {expected}, got {base_enabled}"
@@ -6830,7 +6835,7 @@ mod signal_disable_gate_tests {
             ..Default::default()
         };
         let base_disabled = if dials_disabled.signal_enabled("hebbian") {
-            rrf_score + hebbian_score * 0.1
+            rrf_score * (1.0 + hebbian_score * 0.1)
         } else {
             rrf_score
         };

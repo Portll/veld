@@ -144,22 +144,23 @@ pub struct SignalAttribution {
 
 /// Full unified-scoring feature vector for one retrieved memory (R2 / LTR).
 ///
-/// SHADOW-ONLY capture: these are the EXACT additive components and multiplicative
-/// gates read out of the unified scoring assembly (recall.rs ~2586-2605) at the
+/// SHADOW-ONLY capture: these are the EXACT signal shares and multiplicative
+/// gates read out of the unified scoring assembly in recall.rs at the
 /// moment `final_score` is computed. They are recorded for a FUTURE learned ranker
-/// (R3) and never feed back into the live score. `base_score` is the fused RRF +
-/// Hebbian input; `unified_final` is `(sum of additive terms) * feedback_multiplier
-/// * confidence_gate * external_dim_multiplier` — i.e. the closure's output before
-/// any later cross-encoder / MMR / demotion stages.
+/// (R3) and never feed back into the live score. `base_score` is the fused score
+/// with its Hebbian share; `unified_final` is `base_score * min(1 + sum of the
+/// shares, UNIFIED_SIGNAL_FACTOR_MAX) * feedback_multiplier * confidence_gate *
+/// external_dim_multiplier` — i.e. the closure's output before any later
+/// cross-encoder / MMR / demotion stages.
 ///
 /// All fields are additive serde (`#[serde(default)]`) so older serialized
 /// `RetrievalTrace` rows still deserialize after the schema grows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScoringFeatures {
-    /// Fused base score (RRF score + hebbian_boost * 0.1) — the closure input.
+    /// Fused score times its Hebbian factor `1 + 0.1 * hebbian` — the closure input.
     #[serde(default)]
     pub base_score: f32,
-    // --- 17 additive components (recall.rs:2586-2602) ---
+    // --- 16 signal shares of base_score, summed into one factor ---
     #[serde(default)]
     pub recency_boost: f32,
     #[serde(default)]
@@ -192,7 +193,7 @@ pub struct ScoringFeatures {
     pub elaboration_boost: f32,
     #[serde(default)]
     pub burstiness_boost: f32,
-    // --- 3 multiplicative gates (recall.rs:2603-2605) ---
+    // --- 3 multiplicative gates ---
     #[serde(default)]
     pub feedback_multiplier: f32,
     #[serde(default)]
