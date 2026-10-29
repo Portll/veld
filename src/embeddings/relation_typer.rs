@@ -77,6 +77,7 @@ impl RelationTyper {
             return Arc::clone(cached);
         }
         let mut built = Vec::new();
+        let mut complete = true;
         for (relation, x_is_source, text) in exemplar_specs() {
             match embedder.encode(text) {
                 Ok(embedding) => built.push(Exemplar {
@@ -84,10 +85,18 @@ impl RelationTyper {
                     x_is_source,
                     embedding,
                 }),
-                Err(e) => tracing::warn!("relation exemplar embed failed ({text}): {e}"),
+                Err(e) => {
+                    complete = false;
+                    tracing::warn!("relation exemplar embed failed ({text}): {e}");
+                }
             }
         }
         let built = Arc::new(built);
+        // A partial set would type every later write without the failed relations for the life
+        // of the process; serve it this once and build again on the next write.
+        if !complete {
+            return built;
+        }
         self.exemplars
             .write()
             .entry(embedder.id().to_string())
@@ -180,6 +189,57 @@ mod tests {
 
     fn embedder() -> MiniLMEmbedder {
         MiniLMEmbedder::new_simplified(EmbeddingConfig::default()).expect("simplified embedder")
+    }
+
+    /// Fails its first `failures` encodes, then delegates.
+    struct FlakyEmbedder {
+        inner: MiniLMEmbedder,
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Embedder for FlakyEmbedder {
+        fn encode(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            use std::sync::atomic::Ordering;
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("embedder unavailable");
+            }
+            self.inner.encode(text)
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+    }
+
+    #[test]
+    fn a_failed_exemplar_encode_is_retried_rather_than_cached() {
+        let embedder = FlakyEmbedder {
+            inner: embedder(),
+            failures: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let typer = RelationTyper::default();
+        let total = exemplar_specs().len();
+
+        assert_eq!(typer.exemplars_for(&embedder).len(), total - 1);
+        assert!(
+            typer.exemplars.read().is_empty(),
+            "a partial set is not cached"
+        );
+
+        assert_eq!(typer.exemplars_for(&embedder).len(), total);
+        assert_eq!(
+            typer.exemplars.read().len(),
+            1,
+            "the complete set is cached"
+        );
     }
 
     /// The simplified (hash) embedder embeds identical strings identically, so a sentence that
