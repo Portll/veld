@@ -410,6 +410,22 @@ pub const GRAPH_LABEL_PAIR_TYPING_ENV: &str = "VELD_GRAPH_LABEL_PAIR_TYPING";
 /// generic one is spared, and conversational corpora are mostly person pairs.
 pub const GRAPH_PERSON_PERSON_KNOWS_ENV: &str = "SHODH_PERSON_PERSON_KNOWS";
 
+/// Lowest exemplar cosine, on the MiniLM reference scale, at which the semantic relation typer
+/// (`embeddings::relation_typer`) types a pair. Upstream's `SHODH_SEMREL_MIN` default: lower
+/// admits noise edges, higher reverts them to the label pair or `RelatedTo`.
+pub const SEMANTIC_RELATION_MIN_COSINE: f32 = 0.6;
+
+/// Env var overriding [`SEMANTIC_RELATION_MIN_COSINE`].
+pub const SEMANTIC_RELATION_MIN_COSINE_ENV: &str = "SHODH_SEMREL_MIN";
+
+/// Most entity pairs of one memory the semantic typer encodes. Each costs one embedding of the
+/// pair's sentence on the write path; upstream's budget.
+pub const SEMANTIC_RELATION_MAX_PAIRS: usize = 20;
+
+/// Env switch for the semantic relation typer: `0` or `false` turns it off. On by default, as
+/// upstream has run it since 9f632af5.
+pub const SEMANTIC_RELATIONS_ENV: &str = "SHODH_SEMANTIC_RELATIONS";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay

@@ -38,6 +38,7 @@ pub mod minilm;
 pub mod model_tape;
 pub mod ner;
 pub mod nomic;
+pub mod relation_typer;
 #[cfg(feature = "zenoh")]
 pub mod zenoh_embedder;
 
