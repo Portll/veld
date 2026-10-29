@@ -5148,18 +5148,6 @@ impl MultiUserMemoryManager {
                     hub_edges_skipped += 1;
                     continue;
                 }
-                // Selectivity skip (upstream #214): two entities that each spread their edges
-                // evenly over the graph co-occur out of habit, not association.
-                if admission.selectivity_skip {
-                    if let (Some(si), Some(sj)) = (selectivity[i], selectivity[j]) {
-                        if si < crate::constants::GRAPH_LOW_SELECTIVITY
-                            && sj < crate::constants::GRAPH_LOW_SELECTIVITY
-                        {
-                            selectivity_skipped += 1;
-                            continue;
-                        }
-                    }
-                }
                 let declared_strength = match (declared_weight[i], declared_weight[j]) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (Some(a), None) | (None, Some(a)) => Some(a),
@@ -5214,24 +5202,47 @@ impl MultiUserMemoryManager {
                     }
                     None => RelationType::RelatedTo,
                 };
+                // Selectivity skip (upstream #214): two entities that each spread their edges
+                // evenly over the graph co-occur out of habit, not association.
+                let low_selectivity = admission.selectivity_skip
+                    && matches!(
+                        (selectivity[i], selectivity[j]),
+                        (Some(si), Some(sj)) if si < crate::constants::GRAPH_LOW_SELECTIVITY
+                            && sj < crate::constants::GRAPH_LOW_SELECTIVITY
+                    );
                 // PMI gate (upstream #336/#364): a generic edge whose pair co-occurs no more
-                // than chance is never born. At birth the pair has co-occurred once, so
+                // than chance is not born. At birth the pair has co-occurred once, so
                 // PMI = log2(N / (df_i * df_j)). A typed edge, a fragment bridge and an edge to
                 // a declared entity carry grounding the statistic lacks and are kept.
-                if admission.pmi_gate
+                let below_chance = admission.pmi_gate
                     && declared_strength.is_none()
-                    && !fragment_of_comention[i]
-                    && !fragment_of_comention[j]
+                    && !fragment
                     && matches!(
                         relation_type,
                         RelationType::RelatedTo | RelationType::CoOccurs
                     )
+                    && {
+                        let df = mentions[i].max(1) as f32 * mentions[j].max(1) as f32;
+                        (total_episodes / df).log2() < admission.pmi_gate_min
+                    };
+                // Both gates decide only whether an edge is born. A pair that already has this
+                // edge strengthens it: an edge born while its pair was rare stays reachable after
+                // both endpoints turn common.
+                if (low_selectivity || below_chance)
+                    && !graph_guard
+                        .find_relationship_between_typed(&from_entity, &to_entity, &relation_type)
+                        .unwrap_or_else(|e| {
+                            tracing::debug!("Edge lookup failed at the birth gates: {}", e);
+                            None
+                        })
+                        .is_some()
                 {
-                    let df = mentions[i].max(1) as f32 * mentions[j].max(1) as f32;
-                    if (total_episodes / df).log2() < admission.pmi_gate_min {
+                    if low_selectivity {
+                        selectivity_skipped += 1;
+                    } else {
                         pmi_gated += 1;
-                        continue;
                     }
+                    continue;
                 }
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
@@ -6550,6 +6561,57 @@ mod graph_admission_tests {
             assert!(joined(&mgr, "Xavier", "Zelda"));
             assert!(joined(&mgr, "Yusuf", "Zelda"));
         }
+    }
+
+    fn activations(mgr: &MultiUserMemoryManager, a: &str, b: &str) -> u32 {
+        let graph = mgr.get_user_graph(USER).expect("graph");
+        let graph = graph.read();
+        let id = |name: &str| {
+            graph
+                .find_entity_by_name_strict(name)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{name} is not a node"))
+                .uuid
+        };
+        let (a, b) = (id(a), id(b));
+        graph
+            .get_all_relationships()
+            .expect("edges")
+            .iter()
+            .filter(|e| e.joins(&a, &b))
+            .map(|e| e.activation_count)
+            .sum()
+    }
+
+    /// Xavier and Yusuf are joined while both are rare. By the eighth episode each is in five
+    /// of eight, so the PMI gate would refuse their edge a birth; it still takes the
+    /// re-attestation.
+    #[test]
+    fn a_gated_pair_still_strengthens_the_edge_it_already_has() {
+        let mut gated = legacy();
+        gated.pmi_gate = true;
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        write_people(&mgr, &["Xavier", "Yusuf"], gated);
+        let born = activations(&mgr, "Xavier", "Yusuf");
+        assert!(born > 0, "precondition: the rare pair is joined");
+        for people in [
+            ["Xavier", "Abel"],
+            ["Xavier", "Amos"],
+            ["Xavier", "Arno"],
+            ["Yusuf", "Bruno"],
+            ["Yusuf", "Boris"],
+            ["Yusuf", "Basil"],
+        ] {
+            write_people(&mgr, &people, gated);
+        }
+        write_people(&mgr, &["Xavier", "Yusuf"], gated);
+        assert!(activations(&mgr, "Xavier", "Yusuf") > born);
+        write_people(&mgr, &["Xavier", "Yusuf", "Zelda"], gated);
+        assert!(
+            joined(&mgr, "Xavier", "Zelda"),
+            "a rare newcomer is still joined"
+        );
     }
 
     /// Two star hubs, each joined to three one-edge leaves, score selectivity 0 once a
