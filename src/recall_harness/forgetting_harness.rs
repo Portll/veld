@@ -660,14 +660,21 @@ mod planted_tests {
         let corroborate = row(&report, "corroborate_k_sources");
 
         // The traffic created the edge in most groups and the evidential base says
-        // what the traffic was: fifty recalls from one source are one activation.
+        // what the traffic was: fifty recalls from one source are one activation, and
+        // each of the eight sources whose recall returned the pair is one more. The
+        // means cover the groups holding the edge, and a group where the pair is close
+        // to the cut can miss it on one recall, so a group may hold fewer than eight.
         assert_eq!(control.planted_edge_present, 0);
         assert!(repeat.planted_edge_present * 2 > report.groups);
         assert!(corroborate.planted_edge_present * 2 > report.groups);
         assert_eq!(repeat.planted_edge_distinct_sources_mean, 1.0);
         assert_eq!(repeat.planted_edge_activations_mean, 1.0);
-        assert_eq!(corroborate.planted_edge_distinct_sources_mean, 8.0);
-        assert_eq!(corroborate.planted_edge_activations_mean, 8.0);
+        assert_eq!(
+            corroborate.planted_edge_activations_mean,
+            corroborate.planted_edge_distinct_sources_mean
+        );
+        assert!(corroborate.planted_edge_distinct_sources_mean > 7.0);
+        assert!(corroborate.planted_edge_distinct_sources_mean <= 8.0);
         assert!(
             corroborate.planted_edge_strength_mean > repeat.planted_edge_strength_mean,
             "corroboration must move strength where repetition did not: {} vs {}",

@@ -1205,7 +1205,7 @@ impl super::MemorySystem {
                 let (semantic_w, leg_graph_w, linguistic_w) = leg_weights;
                 candidates.prefetch(pool.iter().map(|(id, _)| id));
                 let max_activation = pool.iter().map(|(_, a)| *a).fold(0.0_f32, f32::max);
-                let mut ranked: Vec<(MemoryId, f32, f32, Arc<CandidateView>)> = pool
+                let ranked: Vec<(MemoryId, f32, f32, Arc<CandidateView>)> = pool
                     .into_iter()
                     .filter_map(|(id, activation)| {
                         let view = candidates.get(&id)?;
@@ -1243,29 +1243,20 @@ impl super::MemorySystem {
                         Some((id, score, strength, view))
                     })
                     .collect();
-                // Memories without an embedding tie; content is unique per store and
-                // repeat-stable, where ids are random per ingest.
-                ranked.sort_by(|a, b| {
-                    b.1.total_cmp(&a.1).then_with(|| {
-                        a.3.memory
-                            .experience
-                            .content
-                            .cmp(&b.3.memory.experience.content)
-                    })
-                });
-                let pre_cap = ranked.len();
-                ranked.truncate(crate::constants::RECALL_GRAPH_LEG_CANDIDATES);
-                let r: Vec<(MemoryId, f32, f32)> = ranked
-                    .into_iter()
-                    .map(|(id, score, strength, _)| (id, score, strength))
-                    .collect();
+                let pooled = ranked.len();
+                let top_score = ranked.iter().map(|x| x.1).fold(0.0_f32, f32::max);
+                let r = graph_leg_for_fusion(
+                    ranked,
+                    crate::constants::RECALL_GRAPH_LEG_CANDIDATES,
+                    |view| view.memory.experience.content.as_str(),
+                );
                 if !r.is_empty() {
                     tracing::debug!(
                         "Layer 2: {} graph results (ranked from {}), {} seeds, top={:.3}",
                         r.len(),
-                        pre_cap,
+                        pooled,
                         seed_count,
-                        r.first().map(|x| x.1).unwrap_or(0.0)
+                        top_score
                     );
                 }
                 (r, d, entity_count, weights, phrases, disc)
@@ -6179,6 +6170,31 @@ pub(crate) fn resolve_query_entities(
     }
 }
 
+/// The graph leg's list for fusion, from entries `(id, relevance score, graph strength,
+/// record)`: the best `cap` by score, equal scores by `content` (unique per store and
+/// repeat-stable, where ids are random per ingest), each as `(id, strength, strength)`.
+///
+/// The relevance score orders the list and goes no further. Fusion reads the second slot as
+/// graph activation, for its graph bonus and the graph attribution that abstention and the
+/// learned leg weights read, and the third as the Layer 5 graph value. Both carry the
+/// episode's graph strength, its activation over the pool's largest, so a memory the leg
+/// ranks high for its cosine alone earns no graph credit.
+fn graph_leg_for_fusion<T>(
+    mut ranked: Vec<(MemoryId, f32, f32, T)>,
+    cap: usize,
+    content: impl Fn(&T) -> &str,
+) -> Vec<(MemoryId, f32, f32)> {
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| content(&a.3).cmp(content(&b.3)))
+    });
+    ranked.truncate(cap);
+    ranked
+        .into_iter()
+        .map(|(id, _, strength, _)| (id, strength, strength))
+        .collect()
+}
+
 /// The graph leg's seeds, each once: the entities the query's nouns resolved to, at their
 /// words' information content, then at a noun's the FilePath entities its path-shaped words
 /// name and the entities the caller's NER names resolve to strictly.
@@ -6613,9 +6629,30 @@ mod competition_floor_tests {
 
 #[cfg(test)]
 mod score_tie_order_tests {
-    use super::order_score_ties_by_content;
+    use super::{graph_leg_for_fusion, order_score_ties_by_content};
     use crate::memory::types::MemoryId;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_graph_leg_is_ordered_by_relevance_and_credits_only_graph_strength() {
+        let [cosine_only, graph_strong, tied] = [(); 3].map(|_| MemoryId(uuid::Uuid::new_v4()));
+        let ranked = vec![
+            (graph_strong.clone(), 0.31, 1.0, "graph strong"),
+            (
+                cosine_only.clone(),
+                0.33,
+                0.02,
+                "cosine 0.62, no graph mass",
+            ),
+            (tied.clone(), 0.31, 0.5, "a tie, by content"),
+        ];
+        let fused = graph_leg_for_fusion(ranked, 2, |content| content);
+        assert_eq!(
+            fused,
+            vec![(cosine_only, 0.02, 0.02), (tied, 0.5, 0.5)],
+            "relevance orders and the cap cuts; graph strength fills both slots"
+        );
+    }
 
     #[test]
     fn equal_scores_are_ordered_by_content_and_the_rest_is_untouched() {
