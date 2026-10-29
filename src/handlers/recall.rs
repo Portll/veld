@@ -119,12 +119,25 @@ mod c31_injection_tests {
 /// below were each added while the Zenoh transport carried its own copy of this projection, and
 /// that copy stopped compiling instead of gaining them.
 ///
-/// `rank` is the zero-based position in a result list of `total` memories; the score blends
-/// rank position (70%) with access-weighted salience (30%).
-pub(crate) fn recall_memory_view(m: &Memory, rank: usize, total: usize) -> RecallMemory {
-    let rank_score = 1.0 - (rank as f32 / total.max(1) as f32);
-    let salience = m.salience_score_with_access();
-    let score = rank_score * 0.7 + salience * 0.3;
+/// `rank` is the zero-based position in a result list of `total` memories and `top_score` the
+/// pipeline score of its first entry. The exposed score is the memory's pipeline score over the
+/// top, so the first result reads 1.0 and the rest fall by their real gaps; until 2026-10-24 it
+/// was 70% rank position and 30% salience, which threw the pipeline's ranking evidence away and
+/// read the same for every query. Without pipeline scores it falls back to that blend.
+pub(crate) fn recall_memory_view(
+    m: &Memory,
+    rank: usize,
+    total: usize,
+    top_score: Option<f32>,
+) -> RecallMemory {
+    let raw_score = m.score;
+    let score = match (raw_score, top_score) {
+        (Some(s), Some(top)) if top > 0.0 && s.is_finite() => (s / top).clamp(0.0, 1.0),
+        _ => {
+            let rank_score = 1.0 - (rank as f32 / total.max(1) as f32);
+            rank_score * 0.7 + m.salience_score_with_access() * 0.3
+        }
+    };
     // C3: User/File/System sources are trusted; anything else is data, never instructions.
     // `None` when the engram carries no rich context.
     let source_trusted = m.experience.context.as_ref().map(|c| {
@@ -145,6 +158,7 @@ pub(crate) fn recall_memory_view(m: &Memory, rank: usize, total: usize) -> Recal
         importance: m.importance(),
         created_at: m.created_at.to_rfc3339(),
         score,
+        raw_score,
         tier: format!("{:?}", m.tier),
         competition_conflict: m
             .experience
@@ -214,7 +228,7 @@ mod recall_memory_view_tests {
 
     #[test]
     fn untrusted_source_with_a_directive_is_flagged() {
-        let view = recall_memory_view(&memory_from(INJECTION, Some(SourceType::Web)), 0, 1);
+        let view = recall_memory_view(&memory_from(INJECTION, Some(SourceType::Web)), 0, 1, None);
         assert_eq!(view.source_type.as_deref(), Some("Web"));
         assert_eq!(view.source_trusted, Some(false));
         assert_eq!(view.injection_suspected, Some(true));
@@ -223,14 +237,14 @@ mod recall_memory_view_tests {
 
     #[test]
     fn trusted_source_is_never_flagged() {
-        let view = recall_memory_view(&memory_from(INJECTION, Some(SourceType::User)), 0, 1);
+        let view = recall_memory_view(&memory_from(INJECTION, Some(SourceType::User)), 0, 1, None);
         assert_eq!(view.source_trusted, Some(true));
         assert_eq!(view.injection_suspected, None);
     }
 
     #[test]
     fn no_rich_context_counts_as_untrusted_for_the_flag_only() {
-        let view = recall_memory_view(&memory_from(INJECTION, None), 0, 1);
+        let view = recall_memory_view(&memory_from(INJECTION, None), 0, 1, None);
         assert_eq!(view.source_type, None);
         assert_eq!(view.source_trusted, None);
         assert_eq!(view.binding_strength, None);
@@ -239,13 +253,37 @@ mod recall_memory_view_tests {
     }
 
     #[test]
-    fn a_lower_rank_scores_lower_for_the_same_memory() {
+    fn without_pipeline_scores_a_lower_rank_scores_lower_for_the_same_memory() {
         let memory = memory_from("benign content", Some(SourceType::User));
-        let first = recall_memory_view(&memory, 0, 2);
-        let second = recall_memory_view(&memory, 1, 2);
+        let first = recall_memory_view(&memory, 0, 2, None);
+        let second = recall_memory_view(&memory, 1, 2, None);
         assert!(first.score > second.score);
+        assert_eq!(first.raw_score, None);
         assert_eq!(first.injection_suspected, None);
         assert_eq!(first.id, memory.id.0.to_string());
+    }
+
+    #[test]
+    fn the_exposed_score_is_the_pipeline_score_over_the_top_and_the_raw_one_rides_along() {
+        let mut top = memory_from("benign content", Some(SourceType::User));
+        top.set_score(0.84);
+        let mut next = memory_from("other benign content", Some(SourceType::User));
+        next.set_score(0.21);
+        let first = recall_memory_view(&top, 0, 2, Some(0.84));
+        let second = recall_memory_view(&next, 1, 2, Some(0.84));
+        assert!((first.score - 1.0).abs() < 1e-6);
+        assert!((second.score - 0.25).abs() < 1e-6);
+        assert_eq!(first.raw_score, Some(0.84));
+        assert_eq!(second.raw_score, Some(0.21));
+    }
+
+    #[test]
+    fn a_score_above_the_top_or_a_zero_top_never_leaves_the_unit_range() {
+        let mut memory = memory_from("benign content", Some(SourceType::User));
+        memory.set_score(1.3);
+        assert!((recall_memory_view(&memory, 1, 2, Some(0.84)).score - 1.0).abs() < 1e-6);
+        let fallback = recall_memory_view(&memory, 0, 1, Some(0.0));
+        assert!(fallback.score > 0.0 && fallback.score <= 1.0);
     }
 }
 
@@ -765,10 +803,11 @@ pub async fn recall(
 
     // Convert to response format
     let total = memories.len();
+    let top_score = memories.first().and_then(|m| m.score);
     let recall_memories: Vec<RecallMemory> = memories
         .iter()
         .enumerate()
-        .map(|(rank, m)| recall_memory_view(m, rank, total))
+        .map(|(rank, m)| recall_memory_view(m, rank, total, top_score))
         .collect();
 
     // Search todos semantically using the embedding already computed for recall
@@ -2821,10 +2860,11 @@ pub async fn recall_tracked(
 
     // Convert to response format
     let total = memories.len();
+    let top_score = memories.first().and_then(|m| m.score);
     let recall_memories: Vec<RecallMemory> = memories
         .into_iter()
         .enumerate()
-        .map(|(rank, m)| recall_memory_view(&m, rank, total))
+        .map(|(rank, m)| recall_memory_view(&m, rank, total, top_score))
         .collect();
 
     let count = recall_memories.len();

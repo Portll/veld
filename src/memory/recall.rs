@@ -3516,6 +3516,15 @@ impl super::MemorySystem {
             }
         }
 
+        // Layer 5.32: rank on the unified score. The cross-encoder takes its window from the
+        // fused order on purpose: the recall gate of 2026-10-29 (run 40812556433) lost five gold
+        // documents when the window was chosen by the unified score instead. When the
+        // reranker ran it already sorted the list; when it was skipped, the layers that do not
+        // re-sort (5.7, 5.8, the final cut while 5.35 and 5.36 stay quiet) used to run on an
+        // order the Layer 5 signals had never touched. Stable, so fused ties keep their
+        // content-ordered tie-break.
+        memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+
         // =====================================================================
         // LAYER 5.35: FRAGMENT DEMOTION (FIX-R2)
         // =====================================================================
