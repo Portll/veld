@@ -525,6 +525,14 @@ impl EntityLabel {
     }
 }
 
+/// The salience multiplier an entity earns from `mentions` mentions: `1 + 0.1 × ln(mentions)`,
+/// which reaches [`crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST`] at about twenty
+/// mentions and stays there. One mention earns none.
+fn mention_frequency_boost(mentions: usize) -> f32 {
+    (1.0 + 0.1 * (mentions.max(1) as f32).ln())
+        .min(crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST)
+}
+
 /// Selectivity of an entity from the Forman-Ricci curvatures of its incident edges: their
 /// sample standard deviation divided by their count, or 1.0 under two edges, where there is
 /// no spread to measure (upstream #214).
@@ -2988,8 +2996,10 @@ impl GraphMemory {
     }
 
     /// Add or update an entity node
-    /// Salience is updated using the formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
-    /// This means frequently mentioned entities grow in salience (gravitational wells get heavier)
+    /// Salience is updated using the formula: salience = base_salience * (1 + 0.1 * ln(mention_count)),
+    /// the boost capped at `ENTITY_SALIENCE_MAX_FREQUENCY_BOOST` and the result at 1.0, where
+    /// base_salience is the first mention's. Frequently mentioned entities grow in salience
+    /// (gravitational wells get heavier)
     ///
     /// BUG-002 FIX: Handles crash recovery for orphaned entities/stale indices
     pub fn add_entity(&self, mut entity: EntityNode) -> Result<Uuid> {
@@ -3077,11 +3087,14 @@ impl GraphMemory {
                     entity.name_embedding = existing.name_embedding;
                 }
 
-                // Update salience with frequency boost
-                // Formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
-                // This caps at about 1.3x boost at 20 mentions
-                let frequency_boost = 1.0 + 0.1 * (entity.mention_count as f32).ln();
-                entity.salience = (existing.salience * frequency_boost).min(1.0);
+                // salience = base × mention_frequency_boost(mentions), at most 1.0, base being
+                // the first mention's salience. The stored value already carries the boost for
+                // the previous count, so it is rescaled by the ratio of the two boosts.
+                // Multiplying it by the whole boost compounded on every mention.
+                entity.salience = (existing.salience
+                    * mention_frequency_boost(entity.mention_count)
+                    / mention_frequency_boost(existing.mention_count))
+                .min(1.0);
                 is_new_entity = false;
             } else {
                 // BUG-002 FIX: Stale index entry - entity in index but not in DB
@@ -11403,6 +11416,35 @@ mod tests {
         for leaf in &leaves {
             assert_eq!(graph.entity_selectivity(leaf), Some(1.0));
         }
+    }
+
+    /// Salience after n mentions is the first mention's salience times one boost for n, capped
+    /// at 1.3x: under the compounding formula a 0.5 entity reached 1.0 on its seventh mention.
+    #[test]
+    fn repeat_mentions_boost_salience_once_and_cap_the_boost() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let mut node = named_entity("Pottery");
+        node.salience = 0.5;
+        let id = graph.add_entity(node.clone()).unwrap();
+        for _ in 1..7 {
+            graph.add_entity(node.clone()).unwrap();
+        }
+        let seventh = graph.get_entity(&id).unwrap().unwrap();
+        assert_eq!(seventh.mention_count, 7);
+        let expected = 0.5 * (1.0 + 0.1 * 7f32.ln());
+        assert!(
+            (seventh.salience - expected).abs() < 1e-4,
+            "{} != {expected}",
+            seventh.salience
+        );
+
+        for _ in 7..100 {
+            graph.add_entity(node.clone()).unwrap();
+        }
+        let capped = graph.get_entity(&id).unwrap().unwrap().salience;
+        let ceiling = 0.5 * crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST;
+        assert!((capped - ceiling).abs() < 1e-4, "{capped} != {ceiling}");
     }
 
     #[test]
