@@ -57,7 +57,7 @@ impl TimeOfDay {
 
 /// Temporal context for a session
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemporalContext {
+pub struct SessionTimeContext {
     /// Time of day when session started
     pub time_of_day: TimeOfDay,
     /// Day of week (Monday=0, Sunday=6)
@@ -76,7 +76,7 @@ pub struct TemporalContext {
     pub relative: String,
 }
 
-impl TemporalContext {
+impl SessionTimeContext {
     /// Create temporal context from a datetime
     pub fn from_datetime(dt: DateTime<Utc>) -> Self {
         let local = dt.with_timezone(&Local);
@@ -368,7 +368,7 @@ pub struct Session {
     /// Session duration in seconds
     pub duration_secs: Option<i64>,
     /// Temporal context (time of day, relative date, etc.)
-    pub temporal: TemporalContext,
+    pub temporal: SessionTimeContext,
     /// Session statistics
     pub stats: SessionStats,
     /// Timeline of events
@@ -389,7 +389,7 @@ impl Session {
             started_at: now,
             ended_at: None,
             duration_secs: None,
-            temporal: TemporalContext::from_datetime(now),
+            temporal: SessionTimeContext::from_datetime(now),
             stats: SessionStats::default(),
             timeline: vec![SessionEvent::SessionStart { timestamp: now }],
             label: None,
@@ -406,7 +406,7 @@ impl Session {
             started_at: now,
             ended_at: None,
             duration_secs: None,
-            temporal: TemporalContext::from_datetime(now),
+            temporal: SessionTimeContext::from_datetime(now),
             stats: SessionStats::default(),
             timeline: vec![SessionEvent::SessionStart { timestamp: now }],
             label: None,
@@ -513,7 +513,7 @@ pub struct SessionSummary {
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_secs: i64,
     /// Temporal context with human-readable labels
-    pub temporal: TemporalContext,
+    pub temporal: SessionTimeContext,
     /// User-provided label
     pub label: Option<String>,
     pub stats: SessionStats,
@@ -863,7 +863,7 @@ mod tests {
 
         // Test temporal context creation
         let now = Utc::now();
-        let ctx = TemporalContext::from_datetime(now);
+        let ctx = SessionTimeContext::from_datetime(now);
 
         // Should have valid data
         assert!(!ctx.day_name.is_empty());

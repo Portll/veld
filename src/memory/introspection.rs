@@ -438,7 +438,7 @@ pub struct ConsolidationReport {
 
     // SHO-106: Interference events
     /// Interference events detected
-    pub interference_events: Vec<InterferenceEvent>,
+    pub interference_events: Vec<ConsolidationInterference>,
 
     /// Memories weakened due to interference
     pub weakened_memories: Vec<MemoryChange>,
@@ -461,7 +461,7 @@ pub struct ReplayEvent {
 
 /// Interference event details (SHO-106)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InterferenceEvent {
+pub struct ConsolidationInterference {
     pub new_memory_id: String,
     pub old_memory_id: String,
     pub similarity: f32,
@@ -883,7 +883,7 @@ impl ConsolidationEventBuffer {
                     interference_type,
                     timestamp,
                 } => {
-                    report.interference_events.push(InterferenceEvent {
+                    report.interference_events.push(ConsolidationInterference {
                         new_memory_id: new_memory_id.clone(),
                         old_memory_id: old_memory_id.clone(),
                         similarity: *similarity,
@@ -1240,7 +1240,7 @@ impl ConsolidationEventBuffer {
                     interference_type,
                     timestamp,
                 } => {
-                    report.interference_events.push(InterferenceEvent {
+                    report.interference_events.push(ConsolidationInterference {
                         new_memory_id: new_memory_id.clone(),
                         old_memory_id: old_memory_id.clone(),
                         similarity: *similarity,

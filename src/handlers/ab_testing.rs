@@ -32,9 +32,9 @@ pub struct CreateABTestRequest {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub control_weights: Option<relevance::LearnedWeights>,
+    pub control_weights: Option<relevance::LearnedSignalWeights>,
     #[serde(default)]
-    pub treatment_weights: Option<relevance::LearnedWeights>,
+    pub treatment_weights: Option<relevance::LearnedSignalWeights>,
     #[serde(default = "default_traffic_split")]
     pub traffic_split: f32,
     #[serde(default = "default_min_impressions")]

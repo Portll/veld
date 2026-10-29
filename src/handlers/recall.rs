@@ -13,6 +13,7 @@ use tracing::info;
 
 use super::state::MultiUserMemoryManager;
 use super::temporal_derivation::derive_answer_for_user_query;
+use super::todos::ReminderItem;
 use super::types::{
     MemoryEvent, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory, RecallRequest,
     RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
@@ -485,22 +486,6 @@ pub struct ProactiveTodoItem {
     /// Semantic similarity score (0.0 - 1.0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub similarity_score: Option<f32>,
-}
-
-/// Individual reminder in response
-#[derive(Debug, Serialize)]
-pub struct ReminderItem {
-    pub id: String,
-    pub content: String,
-    pub trigger_type: String,
-    pub status: String,
-    pub due_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub triggered_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub dismissed_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub priority: u8,
-    pub tags: Vec<String>,
-    pub overdue_seconds: Option<i64>,
 }
 
 /// Consolidated fact surfaced in proactive context

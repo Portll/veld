@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::facets::CausalRelation;
+use super::facets::CausalKind;
 pub use super::facets::{
     validate_agent_id, AgentRef, AgentRole, AgentSession, CausalLink, ContentKind, EngramBinding,
     GoalRef, Orientation, Place, Prediction, RecordKind, WhatFacet, WhenFacet, WhereFacet,
@@ -1378,7 +1378,7 @@ impl Experience {
     /// - `terrain_type` → `Place::Named { label: "terrain:<t>" }`
     /// - `robot_id` → `WhoFacet.agents` with `AgentRole::SelfAgent`
     /// - `mission_id` → `WhyFacet.goal_stack` first entry
-    /// - `causal_chain` → `WhyFacet.causes` (each as `CausalRelation::Caused`)
+    /// - `causal_chain` → `WhyFacet.causes` (each as `CausalKind::Caused`)
     /// - `predicted_outcome` / `prediction_accurate` → `WhyFacet.prediction`
     ///
     /// Fields with no clean 5-W mapping (action_type, decision_context,
@@ -1492,7 +1492,7 @@ impl Experience {
             if !already {
                 ctx.why.causes.push(CausalLink {
                     other: cause_id.clone(),
-                    relation: CausalRelation::Caused,
+                    relation: CausalKind::Caused,
                     confidence: 1.0,
                     inferred: false,
                 });
@@ -1643,7 +1643,7 @@ mod w3_migration_tests {
         assert_eq!(pred.accurate, Some(true));
         assert_eq!(ctx.why.causes.len(), 1);
         assert_eq!(ctx.why.causes[0].other, cause);
-        assert_eq!(ctx.why.causes[0].relation, CausalRelation::Caused);
+        assert_eq!(ctx.why.causes[0].relation, CausalKind::Caused);
     }
 
     #[test]

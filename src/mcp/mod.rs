@@ -8,6 +8,8 @@
 //! Both modes use the same core memory functionality, ready for future MCP push.
 
 pub mod client;
+#[cfg(test)]
+mod schema_conformance;
 pub mod tools;
 pub mod types;
 
