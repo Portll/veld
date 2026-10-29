@@ -7086,7 +7086,10 @@ impl GraphMemory {
                 .entry(edge.from_entity)
                 .or_default()
                 .push(curvature);
-            curvatures.entry(edge.to_entity).or_default().push(curvature);
+            curvatures
+                .entry(edge.to_entity)
+                .or_default()
+                .push(curvature);
         }
         let scores: HashMap<Uuid, f32> = curvatures
             .into_iter()

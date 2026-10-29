@@ -5157,7 +5157,10 @@ impl MultiUserMemoryManager {
                     && declared_strength.is_none()
                     && !fragment_of_comention[i]
                     && !fragment_of_comention[j]
-                    && matches!(relation_type, RelationType::RelatedTo | RelationType::CoOccurs)
+                    && matches!(
+                        relation_type,
+                        RelationType::RelatedTo | RelationType::CoOccurs
+                    )
                 {
                     let df = mentions[i].max(1) as f32 * mentions[j].max(1) as f32;
                     if (total_episodes / df).log2() < admission.pmi_gate_min {
@@ -6291,8 +6294,15 @@ mod graph_admission_tests {
         let mgr = manager(home.path());
         let (experience, _) = tagged_turn();
         let id = MemoryId(uuid::Uuid::new_v4());
-        mgr.build_experience_graph(USER, &experience, &id, &[], None, GraphAdmission::from_env())
-            .unwrap();
+        mgr.build_experience_graph(
+            USER,
+            &experience,
+            &id,
+            &[],
+            None,
+            GraphAdmission::from_env(),
+        )
+        .unwrap();
 
         assert_eq!(labels(&mgr, "kestrel"), None);
         assert_eq!(labels(&mgr, "rocksdb"), Some(vec![EntityLabel::Database]));
