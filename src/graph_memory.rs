@@ -7100,6 +7100,11 @@ impl GraphMemory {
         })
     }
 
+    /// Episodes in the graph: the N of the PMI gate at edge birth. O(1).
+    pub fn total_episode_count(&self) -> usize {
+        self.episode_count.load(Ordering::Relaxed)
+    }
+
     /// Get graph statistics - O(1) using atomic counters
     pub fn get_stats(&self) -> Result<GraphStats> {
         Ok(GraphStats {

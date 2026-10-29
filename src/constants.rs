@@ -365,6 +365,21 @@ pub const GRAPH_HUB_DEGREE_MAX: usize = 300;
 /// Env var overriding [`GRAPH_HUB_DEGREE_MAX`].
 pub const GRAPH_HUB_DEGREE_MAX_ENV: &str = "SHODH_HUB_DEGREE_MAX";
 
+/// PMI floor below which a generic co-occurrence edge is not born (upstream #336, on by
+/// default since #364). At birth a pair has co-occurred once, so its pointwise mutual
+/// information is `log2(N / (df_a × df_b))`: N the user's graph episodes, df an entity's
+/// mention count, both kept by the graph store on either engine. At 0.0 an edge is born only
+/// when `N ≥ df_a × df_b`, which prunes the pairs of two entities each named in many memories.
+/// Typed edges, fragment bridges and edges to a declared entity are never gated. Upstream's
+/// A/B: 97.4% fewer edges, recall unchanged.
+pub const GRAPH_PMI_GATE_MIN: f32 = 0.0;
+
+/// Env switch for the PMI gate: `0` or `false` turns it off. On by default.
+pub const GRAPH_PMI_GATE_ENV: &str = "SHODH_GRAPH_PMI_GATE";
+
+/// Env var overriding [`GRAPH_PMI_GATE_MIN`].
+pub const GRAPH_PMI_GATE_MIN_ENV: &str = "SHODH_GRAPH_PMI_GATE_MIN";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay
