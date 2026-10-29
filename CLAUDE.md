@@ -218,7 +218,7 @@ Cross-embedder alignment, now on a **v2 engine**: whitened-Procrustes + CSLS (be
   | Tier | What | When |
   |---|---|---|
   | 0 | `cargo check`, `cargo clippy`, `cargo fmt --check`, `cargo test --no-run`, `cargo bench --no-run` | any time |
-  | 1 | `scripts/test-local.sh <selectors>`: the unit tests of the modules a change touches, plus `--test handler_tests` | before every commit |
+  | 1 | `scripts/test-local.sh <selectors>`: the unit tests of the modules a change touches, plus `--test handler_tests`, as separate calls (a test-name filter applies to every target in the call) | before every commit |
   | 2 | `scripts/ci-local.sh`: CI's version and ledger checks, then `scripts/test-local.sh --full`: fmt, clippy (default, redb-only, zenoh), and on default, redb-only and rocksdb-only `cargo nextest run --profile ci`, the doctests and a bench build | push gate only; one at a time per machine |
 
   Run tests through [scripts/test-local.sh](scripts/test-local.sh), not bare `cargo test`. It runs them niced with `RUST_TEST_THREADS=4` and a private target dir. It gives them a throwaway `HOME`, sharing only the model cache, and strips every inherited `VELD_*`/`SHODH_*` variable, so a test that forgets its own storage path cannot reach a live tenant. Tier 2 holds a machine-wide lock: full matrices run side by side pushed the load to 37 on 2026-10-21 and made tests flake. Tier 2 skips only the tests listed in [scripts/test-local.known-red](scripts/test-local.known-red), each with an owner and a task.

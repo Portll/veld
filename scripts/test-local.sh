@@ -37,8 +37,10 @@ usage() {
 usage: scripts/test-local.sh <cargo test selectors and flags>
        scripts/test-local.sh --full
 
-Tier 1 needs at least one selector, for example:
-  scripts/test-local.sh --lib write_gate --test handler_tests
+Tier 1 needs at least one selector. A test-name filter applies to every target it is given
+with, so run the touched module's tests and the whole handler suite as separate calls:
+  scripts/test-local.sh --lib write_gate
+  scripts/test-local.sh --test handler_tests
   scripts/test-local.sh --no-default-features --features storage-redb --test handler_tests
 Tier 2 runs what CI runs: fmt, clippy, then per feature leg nextest (ci profile), the
 doctests and a bench build, skipping the tests listed in scripts/test-local.known-red.
