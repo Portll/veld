@@ -197,7 +197,7 @@ impl super::MemorySystem {
                     .as_deref()
                     .unwrap_or(crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE);
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().apply_reinforcement(
+                match graph.read_recursive().apply_reinforcement(
                     retrieval_id,
                     source,
                     &memory_uuids[0],
@@ -593,6 +593,10 @@ impl super::MemorySystem {
         // Query words resolved to graph entities once, for the ontology density gate below
         // and Layer 2. Only the nouns and path-shaped words seed Layer 2's walk; adjectives
         // and verbs count toward the density that weighs the graph leg in fusion.
+        //
+        // Every graph read on the recall path is recursive: `/api/relevant` and
+        // `/api/stream` call recall while holding this graph's read guard, and a plain read
+        // would queue behind a waiting writer that the outer guard keeps waiting.
         let resolved_entities: Option<ResolvedQueryEntities> = self
             .graph_memory
             .as_ref()
@@ -620,7 +624,12 @@ impl super::MemorySystem {
                             .map(|r| r.stem.as_str()),
                     )
                     .collect();
-                resolve_query_entities(&graph.read(), &focal_words, &other_words, query_text)
+                resolve_query_entities(
+                    &graph.read_recursive(),
+                    &focal_words,
+                    &other_words,
+                    query_text,
+                )
             });
 
         // Compute graph density for ontological gating (consistent with Layer 2 in graph_retrieval.rs).
@@ -629,7 +638,7 @@ impl super::MemorySystem {
         let (graph_density_for_rerank, use_ontology_rerank) = if !onto_confident {
             (None, false)
         } else if let Some(graph) = self.graph_memory.as_ref() {
-            let g = graph.read();
+            let g = graph.read_recursive();
             let seed_uuids: &[uuid::Uuid] = resolved_entities
                 .as_ref()
                 .map(|r| r.focal.as_slice())
@@ -1106,7 +1115,7 @@ impl super::MemorySystem {
                 // The graph guard covers the walk and the episode reads only; the candidate
                 // records are read after it is released.
                 let (d, leg_weights, pool, seed_count) = {
-                    let g = graph.read();
+                    let g = graph.read_recursive();
                     // Calculate PER-ENTITY density (not global graph density)
                     // Sparse entities = trust graph, Dense entities = trust vector
                     let d = if !query_entities.is_empty() {
@@ -2493,7 +2502,7 @@ impl super::MemorySystem {
 
             if use_ontology_rerank && !onto_intent.expected_labels.is_empty() {
                 if let Some(graph) = self.graph_memory.as_ref() {
-                    let g = graph.read();
+                    let g = graph.read_recursive();
                     let mut boosted_count = 0usize;
                     let mut penalized_count = 0usize;
                     for (_mem_id, fused_score) in res.iter_mut().take(rerank_budget) {
@@ -4472,7 +4481,7 @@ impl super::MemorySystem {
                     .as_deref()
                     .unwrap_or(crate::constants::HEBBIAN_UNATTRIBUTED_SOURCE);
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().apply_reinforcement(
+                match graph.read_recursive().apply_reinforcement(
                     retrieval_id,
                     source,
                     &memory_uuids[0],
@@ -4804,7 +4813,7 @@ impl super::MemorySystem {
         let graph = self.graph_memory.as_ref().ok_or_else(|| {
             anyhow::anyhow!("SpreadingActivation mode requires a knowledge graph")
         })?;
-        let graph_guard = graph.read();
+        let graph_guard = graph.read_recursive();
 
         // Compute graph density for weight selection
         let stats = graph_guard.get_stats().unwrap_or_default();
@@ -7244,5 +7253,74 @@ mod query_entity_resolution_tests {
         let as_focal = resolve_query_entities(&graph, &["Vornak"], &[], "vornak");
         assert_eq!(as_focal.focal, vec![reactor]);
         assert_eq!(as_focal.all, vec![reactor]);
+    }
+}
+
+#[cfg(test)]
+mod recursive_graph_read_tests {
+    use crate::graph_memory::GraphMemory;
+    use crate::memory::types::{Experience, Query};
+    use crate::memory::{MemoryConfig, MemorySystem};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// `/api/relevant` and `/api/stream` hold the graph's read guard around recall. A writer
+    /// queued behind that guard must not stop recall's own graph reads, or neither finishes.
+    #[test]
+    fn recall_inside_an_outer_graph_read_does_not_wait_for_a_queued_writer() {
+        let store = TempDir::new().expect("store dir");
+        let mut sys = MemorySystem::new(
+            MemoryConfig {
+                storage_path: store.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        let graph_dir = TempDir::new().expect("graph dir");
+        let graph = Arc::new(parking_lot::RwLock::new(
+            GraphMemory::new(graph_dir.path(), None).expect("graph"),
+        ));
+        sys.set_graph_memory(Arc::clone(&graph));
+        sys.remember(
+            Experience {
+                content: "Caroline went to the LGBTQ support group on Tuesday".to_string(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("remember");
+        let sys = Arc::new(sys);
+
+        let outer = graph.read();
+        let writer = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || drop(graph.write()))
+        };
+        // Queued, the writer turns away a plain new reader.
+        while graph.try_read().is_some() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (done, recalled) = std::sync::mpsc::channel();
+        let reader = {
+            let sys = Arc::clone(&sys);
+            std::thread::spawn(move || {
+                let query = Query {
+                    query_text: Some("Where did Caroline go on Tuesday?".to_string()),
+                    ..Default::default()
+                };
+                let _ = done.send(sys.recall(&query).map(|found| found.len()));
+            })
+        };
+        let outcome = recalled.recv_timeout(Duration::from_secs(120));
+        drop(outer);
+        writer.join().expect("writer");
+        reader.join().expect("reader");
+        assert!(
+            outcome.is_ok(),
+            "recall blocked behind a writer queued on the outer guard"
+        );
+        assert!(outcome.unwrap().is_ok());
     }
 }
