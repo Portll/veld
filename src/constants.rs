@@ -208,6 +208,11 @@ pub const ENTITY_CONCEPT_MERGE_THRESHOLD: f32 = 0.85;
 /// deployment while covering the vast majority of active entity vocabularies.
 pub const ENTITY_EMBEDDING_CACHE_MAX: usize = 10_000;
 
+/// Largest multiplier an entity's salience takes from repeat mentions. The boost is
+/// `1 + 0.1 × ln(mentions)` on the first mention's salience, which reaches 1.3 at about twenty
+/// mentions; past that, being mentioned again says nothing new about how salient it is.
+pub const ENTITY_SALIENCE_MAX_FREQUENCY_BOOST: f32 = 1.3;
+
 /// Floor multiplier for semantic edge weighting.
 ///
 /// Initial edge weight = L1_INITIAL_WEIGHT × (floor + (1 − floor) × cosine_sim).
