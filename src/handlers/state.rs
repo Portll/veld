@@ -4958,6 +4958,17 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
+        // Semantic relation typing (upstream relation_typer, on by default since 9f632af5):
+        // each pair's sentence, template-normalised, against embedded exemplars. The encodes
+        // run here, before the graph lock. The memory system is only try-read: a writer
+        // holding it skips typing for this memory rather than wait on it.
+        let semantic_pairs: HashMap<(String, String), (RelationType, bool)> =
+            if admission.semantic_relations && all_entities.len() >= 2 {
+                self.semantic_relation_pairs(user_id, &experience.content, &all_entities, admission)
+            } else {
+                HashMap::new()
+            };
+
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
         // Only fast I/O operations happen here.
@@ -5167,12 +5178,24 @@ impl MultiUserMemoryManager {
                 } else {
                     None
                 };
-                // Typing chain, upstream's order: the sentence's cue, then the label pair
-                // (upstream #259/#260). A fragment of a co-mentioned name is never typed.
+                // Typing chain, upstream's order: the sentence's cue, the semantic typer, then
+                // the label pair (upstream #259/#260). A fragment of a co-mentioned name is
+                // never typed, and a causal type needs two causal candidates, as a cue does.
+                let fragment = fragment_of_comention[i] || fragment_of_comention[j];
+                let semantic_hit = if cue_hit.is_none() && !fragment {
+                    semantic_pairs
+                        .get(&(entity_uuids[i].0.clone(), entity_uuids[j].0.clone()))
+                        .filter(|(rt, _)| {
+                            !rt.is_causal() || (causal_candidate[i] && causal_candidate[j])
+                        })
+                        .cloned()
+                } else {
+                    None
+                };
                 let label_hit = if cue_hit.is_none()
+                    && semantic_hit.is_none()
                     && admission.label_pair_typing
-                    && !fragment_of_comention[i]
-                    && !fragment_of_comention[j]
+                    && !fragment
                 {
                     crate::graph_memory::infer_relation_type_for_pair(
                         &primary_label[i],
@@ -5182,7 +5205,7 @@ impl MultiUserMemoryManager {
                 } else {
                     None
                 };
-                let relation_type = match cue_hit.or(label_hit) {
+                let relation_type = match cue_hit.or(semantic_hit).or(label_hit) {
                     Some((rt, a_is_source)) => {
                         if !a_is_source {
                             std::mem::swap(&mut from_entity, &mut to_entity);
@@ -5272,6 +5295,63 @@ impl MultiUserMemoryManager {
         // Lock released here
 
         Ok(())
+    }
+
+    /// The semantic typer's relation for each entity pair of a memory, keyed by the pair's
+    /// names in `entities` order. Fragments of a co-mentioned name are not typed and spend no
+    /// encode, and at most `SEMANTIC_RELATION_MAX_PAIRS` pairs are encoded. Empty when the
+    /// user's memory system is held by a writer.
+    fn semantic_relation_pairs(
+        &self,
+        user_id: &str,
+        content: &str,
+        entities: &[(String, EntityNode)],
+        admission: GraphAdmission,
+    ) -> HashMap<(String, String), (RelationType, bool)> {
+        let mut typed = HashMap::new();
+        let Ok(system) = self.get_user_memory(user_id) else {
+            return typed;
+        };
+        let Some(system) = system.try_read() else {
+            tracing::debug!("semantic relation typing skipped: user system busy");
+            return typed;
+        };
+        let embedder = system.get_embedder();
+        let lowered: Vec<String> = entities.iter().map(|(n, _)| n.to_lowercase()).collect();
+        let fragment: Vec<bool> = (0..lowered.len())
+            .map(|k| {
+                lowered.iter().enumerate().any(|(m, other)| {
+                    m != k && other.len() > lowered[k].len() && other.contains(&lowered[k])
+                })
+            })
+            .collect();
+        let mut budget = crate::constants::SEMANTIC_RELATION_MAX_PAIRS;
+        'pairs: for i in 0..entities.len() {
+            for j in (i + 1)..entities.len() {
+                if fragment[i] || fragment[j] {
+                    continue;
+                }
+                if budget == 0 {
+                    break 'pairs;
+                }
+                budget -= 1;
+                if let Some((rt, a_is_source, _)) =
+                    crate::embeddings::relation_typer::RELATION_TYPER.type_relation(
+                        embedder,
+                        content,
+                        &entities[i].0,
+                        &entities[j].0,
+                        admission.semantic_min_cosine,
+                    )
+                {
+                    typed.insert(
+                        (entities[i].0.clone(), entities[j].0.clone()),
+                        (rt, a_is_source),
+                    );
+                }
+            }
+        }
+        typed
     }
 }
 
@@ -6028,6 +6108,9 @@ struct GraphAdmission {
     label_pair_typing: bool,
     /// Two people are typed `Knows` (off: upstream).
     person_person_knows: bool,
+    /// The semantic typer types a pair whose nearest exemplar reaches `semantic_min_cosine`.
+    semantic_relations: bool,
+    semantic_min_cosine: f32,
 }
 
 impl GraphAdmission {
@@ -6044,6 +6127,11 @@ impl GraphAdmission {
             selectivity_skip: env_switch(c::GRAPH_SELECTIVITY_SKIP_ENV, true),
             label_pair_typing: env_switch(c::GRAPH_LABEL_PAIR_TYPING_ENV, true),
             person_person_knows: env_switch(c::GRAPH_PERSON_PERSON_KNOWS_ENV, false),
+            semantic_relations: env_switch(c::SEMANTIC_RELATIONS_ENV, true),
+            semantic_min_cosine: env_number(
+                c::SEMANTIC_RELATION_MIN_COSINE_ENV,
+                c::SEMANTIC_RELATION_MIN_COSINE,
+            ),
         }
     }
 }
@@ -6285,6 +6373,7 @@ mod graph_admission_tests {
         admission.pmi_gate = false;
         admission.selectivity_skip = false;
         admission.label_pair_typing = false;
+        admission.semantic_relations = false;
         admission
     }
 
@@ -6501,6 +6590,7 @@ mod graph_admission_tests {
         ] {
             let mut admission = GraphAdmission::from_env();
             admission.label_pair_typing = typing;
+            admission.semantic_relations = false;
             let home = tempfile::tempdir().unwrap();
             let mgr = manager(home.path());
             let experience = Experience {
