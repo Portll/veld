@@ -551,6 +551,10 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize>;
     /// Whether any memory or fact still cites `target`: the merge GC's guard.
     fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool>;
+    /// Every memory whose references (`related_memories`, `causal_chain`, `parent_id`,
+    /// causal links) name `target`, from the inbound-reference index both engines keep.
+    /// Forget reads it to find the write-time facts that cite a forgotten turn.
+    fn citing_memories(&self, target: &MemoryId) -> Result<Vec<MemoryId>>;
 
     /// Every MEMORY key under `prefix` — the 16-byte ids `get_all_ids` enumerates —
     /// values not loaded. Implementations MUST return only matching keys.

@@ -102,12 +102,17 @@ pub trait LlmConsolidator: Send + Sync {
 /// Configure via either explicit constructor or [`HttpLlmConsolidator::from_env`].
 /// Env vars (read at `from_env` call time, not lazily):
 ///   - `VELD_LLM_ENDPOINT` — e.g. `https://api.openai.com/v1/chat/completions`
+///   - `VELD_LLM_HOST` — instead of an endpoint, a host declared in
+///     `manifests/llm-hosts.json` (`lmstudio`, `llama.cpp`, ...), reached at its
+///     `VELD_LLM_URL_<ID>` override when one is set
 ///   - `VELD_LLM_API_KEY` — bearer token
 ///   - `VELD_LLM_MODEL` — e.g. `gpt-4o-mini`, `claude-sonnet-4-6`, `llama3.1`
+///   - `VELD_LLM_TIMEOUT_SECS` — how long one call may take, 60 when unset
 pub struct HttpLlmConsolidator {
     endpoint: String,
     api_key: String,
     model: String,
+    timeout: Duration,
     /// Built on the first call. reqwest's blocking client runs its own runtime and
     /// panics when built inside a tokio context, and the server constructs this
     /// type on a runtime thread while every call is made from a plain thread.
@@ -118,6 +123,9 @@ impl HttpLlmConsolidator {
     /// Model used when `VELD_LLM_MODEL` is unset.
     pub const DEFAULT_MODEL: &'static str = "gpt-4o-mini";
 
+    /// How long one call may take when `VELD_LLM_TIMEOUT_SECS` is unset.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// Build a consolidator with explicit configuration. No connection is made
     /// until the first call.
     pub fn new(endpoint: String, api_key: String, model: String) -> Result<Self> {
@@ -125,22 +133,82 @@ impl HttpLlmConsolidator {
             endpoint,
             api_key,
             model,
+            timeout: Self::DEFAULT_TIMEOUT,
             client: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The same consolidator with calls allowed `timeout`. A local model that reasons
+    /// before it answers can need minutes for one window.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Build from `VELD_LLM_*` env vars. Returns `Ok(None)` (not Err) when
     /// the endpoint isn't configured — callers should treat that as a
     /// signal to skip remote consolidation entirely, not as an error.
+    ///
+    /// The endpoint is `VELD_LLM_ENDPOINT`, a full chat-completions URL, or else
+    /// the chat-completions path of the host `VELD_LLM_HOST` names. A named host
+    /// needs `VELD_LLM_MODEL`: a local server answers for the models loaded into
+    /// it, so no default name can be assumed to be one of them. An unknown host
+    /// is an error, not a fallback, so a typo cannot look like a configuration.
     pub fn from_env() -> Result<Option<Self>> {
-        let endpoint = match std::env::var("VELD_LLM_ENDPOINT") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => return Ok(None),
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::from_env`] with the environment injected, so it is tested without
+    /// mutating the process environment that parallel tests share.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let set = |key: &str| lookup(key).filter(|v| !v.trim().is_empty());
+        let model = set("VELD_LLM_MODEL");
+        let (endpoint, model) = if let Some(endpoint) = set("VELD_LLM_ENDPOINT") {
+            (
+                endpoint,
+                model.unwrap_or_else(|| Self::DEFAULT_MODEL.to_string()),
+            )
+        } else if let Some(id) = set("VELD_LLM_HOST") {
+            let id = id.trim();
+            let declared = crate::llm_hosts::declaration();
+            let host = crate::llm_hosts::host(id).ok_or_else(|| {
+                let ids: Vec<&str> = declared.hosts.iter().map(|h| h.id.as_str()).collect();
+                anyhow!(
+                    "VELD_LLM_HOST={id} names no host in manifests/llm-hosts.json; declared: {}",
+                    ids.join(", ")
+                )
+            })?;
+            if !host.serves("chat") {
+                return Err(anyhow!(
+                    "VELD_LLM_HOST={id} does not serve chat completions"
+                ));
+            }
+            let model = model.ok_or_else(|| {
+                anyhow!("VELD_LLM_HOST={id} needs VELD_LLM_MODEL, the model id the server lists")
+            })?;
+            let base = host.base_url_with(&lookup);
+            (
+                format!("{}/v1/chat/completions", base.trim_end_matches('/')),
+                model,
+            )
+        } else {
+            return Ok(None);
         };
-        let api_key = std::env::var("VELD_LLM_API_KEY").unwrap_or_default();
-        let model =
-            std::env::var("VELD_LLM_MODEL").unwrap_or_else(|_| Self::DEFAULT_MODEL.to_string());
-        Ok(Some(Self::new(endpoint, api_key, model)?))
+        let api_key = lookup("VELD_LLM_API_KEY").unwrap_or_default();
+        let timeout = match set("VELD_LLM_TIMEOUT_SECS") {
+            Some(secs) => match secs.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => Duration::from_secs(secs),
+                _ => {
+                    return Err(anyhow!(
+                        "VELD_LLM_TIMEOUT_SECS={secs} is not a positive number of seconds"
+                    ))
+                }
+            },
+            None => Self::DEFAULT_TIMEOUT,
+        };
+        Ok(Some(
+            Self::new(endpoint, api_key, model)?.with_timeout(timeout),
+        ))
     }
 
     /// The configured model name, as sent in each request.
@@ -154,7 +222,7 @@ impl HttpLlmConsolidator {
         }
         let built = reqwest::blocking::Client::builder()
             .user_agent("veld-llm/1.0")
-            .timeout(Duration::from_secs(60))
+            .timeout(self.timeout)
             .build()?;
         // Two first calls may race to build; the loser's client is dropped.
         Ok(self.client.get_or_init(|| built))
@@ -342,6 +410,112 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("VELD_LLM_ENDPOINT", v);
         }
+    }
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn nothing_configured_is_no_consolidator() {
+        assert!(HttpLlmConsolidator::from_lookup(lookup(&[]))
+            .unwrap()
+            .is_none());
+        assert!(
+            HttpLlmConsolidator::from_lookup(lookup(&[("VELD_LLM_MODEL", "qwen")]))
+                .unwrap()
+                .is_none(),
+            "a model with nowhere to send it configures nothing"
+        );
+    }
+
+    #[test]
+    fn a_declared_host_is_reached_at_its_chat_completions_path() {
+        let llm = HttpLlmConsolidator::from_lookup(lookup(&[
+            ("VELD_LLM_HOST", "lmstudio"),
+            ("VELD_LLM_MODEL", "qwen3-8b"),
+        ]))
+        .unwrap()
+        .expect("configured");
+        let declared = crate::llm_hosts::host("lmstudio").unwrap().base_url.clone();
+        assert_eq!(llm.endpoint, format!("{declared}/v1/chat/completions"));
+        assert_eq!(llm.model(), "qwen3-8b");
+
+        // The host's own override applies, as it does for every other consumer.
+        let tunnelled = HttpLlmConsolidator::from_lookup(lookup(&[
+            ("VELD_LLM_HOST", "lmstudio"),
+            ("VELD_LLM_URL_LMSTUDIO", "http://127.0.0.1:11234/"),
+            ("VELD_LLM_MODEL", "qwen3-8b"),
+            ("VELD_LLM_API_KEY", "k"),
+        ]))
+        .unwrap()
+        .expect("configured");
+        assert_eq!(
+            tunnelled.endpoint,
+            "http://127.0.0.1:11234/v1/chat/completions"
+        );
+        assert_eq!(tunnelled.api_key, "k");
+        assert_eq!(tunnelled.timeout, HttpLlmConsolidator::DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn the_call_timeout_is_configurable_and_must_be_positive() {
+        let slow = HttpLlmConsolidator::from_lookup(lookup(&[
+            (
+                "VELD_LLM_ENDPOINT",
+                "http://127.0.0.1:1234/v1/chat/completions",
+            ),
+            ("VELD_LLM_TIMEOUT_SECS", "300"),
+        ]))
+        .unwrap()
+        .expect("configured");
+        assert_eq!(slow.timeout, Duration::from_secs(300));
+        for bad in ["0", "soon"] {
+            assert!(HttpLlmConsolidator::from_lookup(lookup(&[
+                (
+                    "VELD_LLM_ENDPOINT",
+                    "http://127.0.0.1:1234/v1/chat/completions"
+                ),
+                ("VELD_LLM_TIMEOUT_SECS", bad),
+            ]))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn an_explicit_endpoint_wins_over_a_host() {
+        let llm = HttpLlmConsolidator::from_lookup(lookup(&[
+            (
+                "VELD_LLM_ENDPOINT",
+                "http://10.0.0.2:9000/v1/chat/completions",
+            ),
+            ("VELD_LLM_HOST", "lmstudio"),
+        ]))
+        .unwrap()
+        .expect("configured");
+        assert_eq!(llm.endpoint, "http://10.0.0.2:9000/v1/chat/completions");
+        assert_eq!(llm.model(), HttpLlmConsolidator::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn an_unknown_host_or_a_host_without_a_model_is_refused() {
+        let unknown = HttpLlmConsolidator::from_lookup(lookup(&[
+            ("VELD_LLM_HOST", "ollama"),
+            ("VELD_LLM_MODEL", "llama3.1"),
+        ]));
+        let err = unknown.err().expect("refused").to_string();
+        assert!(err.contains("ollama") && err.contains("lmstudio"), "{err}");
+
+        let modelless = HttpLlmConsolidator::from_lookup(lookup(&[("VELD_LLM_HOST", "llama.cpp")]));
+        assert!(modelless
+            .err()
+            .expect("refused")
+            .to_string()
+            .contains("VELD_LLM_MODEL"));
     }
 
     #[test]

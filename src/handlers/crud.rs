@@ -786,7 +786,7 @@ pub async fn delete_memory(
     let resolved_id = shared_memory.id.clone();
     let resolved_id_str = resolved_id.0.to_string();
 
-    memory_guard
+    let (_, derived) = memory_guard
         .forget_journaled(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
     drop(memory_guard);
@@ -808,6 +808,8 @@ pub async fn delete_memory(
             "intent-log journal_and_apply (Forget) failed (RocksDB delete already durable)",
         );
     }
+    // The write-time facts that cited it went with it.
+    journal_bulk_forget(&state, &user_id, derived);
 
     state.log_event(&user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
@@ -857,7 +859,7 @@ pub async fn forget_by_id(
     let resolved_id = shared_memory.id.clone();
     let resolved_id_str = resolved_id.0.to_string();
 
-    memory_guard
+    let (_, derived) = memory_guard
         .forget_journaled(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
     drop(memory_guard);
@@ -876,6 +878,8 @@ pub async fn forget_by_id(
             "intent-log journal_and_apply (Forget) failed (RocksDB delete already durable)",
         );
     }
+    // The write-time facts that cited it went with it.
+    journal_bulk_forget(&state, &req.user_id, derived);
 
     state.log_event(&req.user_id, "DELETE", &resolved_id_str, "Memory deleted");
 

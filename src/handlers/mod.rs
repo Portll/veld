@@ -9,6 +9,7 @@ pub mod replication;
 pub mod router;
 pub mod state;
 pub mod types;
+pub mod write_time_facts;
 
 // Health and utilities
 pub mod health;

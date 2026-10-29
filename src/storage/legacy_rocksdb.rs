@@ -391,6 +391,9 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool> {
         self.inner.has_any_inbound_refs(target, user_id)
     }
+    fn citing_memories(&self, target: &MemoryId) -> Result<Vec<MemoryId>> {
+        self.inner.inbound_refs(target)
+    }
 
     fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.inner.scan_prefix_keys(prefix)

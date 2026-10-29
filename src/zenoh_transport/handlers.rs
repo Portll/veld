@@ -1061,10 +1061,14 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
     let journal = Arc::clone(&manager);
     let journal_user_id = user_id.clone();
     match tokio::task::spawn_blocking(move || {
-        let count = user_mem
+        let (count, derived) = user_mem
             .read()
             .forget_journaled(ForgetCriteria::ById(mid.clone()))?;
-        journal_bulk_forget(&journal, &journal_user_id, [mid]);
+        journal_bulk_forget(
+            &journal,
+            &journal_user_id,
+            std::iter::once(mid).chain(derived),
+        );
         anyhow::Ok(count)
     })
     .await

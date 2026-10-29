@@ -1899,6 +1899,22 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         }
         crate::memory::merge::fact_cites_memory(self, target, user_id)
     }
+    fn citing_memories(&self, target: &MemoryId) -> Result<Vec<MemoryId>> {
+        let txn = self.database.begin_read()?;
+        let memories = txn.open_table(MEMORIES_TABLE)?;
+        let prefix = self.blinded_term_key(&target.0.to_string());
+        let mut holders = Vec::new();
+        for holder in ids_with_prefix(&txn, IndexKind::InboundRef, &prefix)? {
+            let key = holder.0.as_bytes();
+            if let Some(bytes) = memories.get(key.as_slice())? {
+                let memory = self.open_record(key, bytes.value())?;
+                if memory.forward_ref_targets().contains(target) && !holders.contains(&holder) {
+                    holders.push(holder);
+                }
+            }
+        }
+        Ok(holders)
+    }
 
     fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         // Ordered range scan over the memories table, stopping at the first key
@@ -3524,6 +3540,11 @@ mod redb_domain_tests {
         assert!(store.has_any_inbound_refs(&parent.id, "u").unwrap());
         assert!(!store.has_any_inbound_refs(&holder.id, "u").unwrap());
         assert_eq!(
+            store.citing_memories(&target.id).unwrap(),
+            vec![holder.id.clone()]
+        );
+        assert!(store.citing_memories(&holder.id).unwrap().is_empty());
+        assert_eq!(
             store
                 .find_by_external_id("linear:SHO-1")
                 .unwrap()
@@ -3552,6 +3573,7 @@ mod redb_domain_tests {
 
         assert!(!store.has_any_inbound_refs(&target.id, "u").unwrap());
         assert!(!store.has_any_inbound_refs(&parent.id, "u").unwrap());
+        assert!(store.citing_memories(&target.id).unwrap().is_empty());
         assert!(store.find_by_external_id("linear:SHO-1").unwrap().is_none());
         assert_eq!(
             store

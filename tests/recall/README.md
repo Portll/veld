@@ -82,17 +82,18 @@ model files other than the ones it was recorded from.
 Write-time fact extraction (`src/memory/write_time_facts.rs`) calls an LLM, which CI does not
 have. The tape records those calls too, keyed by the exact chat-completions request body, and
 names the model in its header. A replay answers them from the tape without an endpoint, using the
-model the tape names, so a tape recorded on a laptop against LM Studio or Ollama replays on a
+model the tape names, so a tape recorded on a laptop against LM Studio or llama.cpp replays on a
 runner. The harness drains the extractor after ingest and before the first query, on its own
 thread and in queue order, and scores a fact that ranks as the turns it came from.
 
-Recording is local, because the model is. With a model loaded in LM Studio and its server
-started (Ollama: `http://localhost:11434/v1/chat/completions`, model as `ollama list` names it),
-from the repository root:
+Recording is local, because the model is. With a model loaded in a host declared in
+`manifests/llm-hosts.json` and its server started (another port through
+`VELD_LLM_URL_<ID>`, or any chat-completions URL through `VELD_LLM_ENDPOINT`), from the
+repository root:
 
 ```bash
 ./scripts/cargo-dev.sh build --release --bin recall-eval
-VELD_LLM_ENDPOINT=http://localhost:1234/v1/chat/completions \
+VELD_LLM_HOST=lmstudio \
 VELD_LLM_MODEL=qwen2.5-7b-instruct \
 VELD_DIALS_WRITE_TIME_FACTS=1 \
 VELD_MODEL_TAPE_RECORD=model-tape-rocksdb.jsonl.gz \

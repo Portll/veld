@@ -354,6 +354,7 @@ async fn async_main(file_limit: FileLimit) -> Result<()> {
         replication_shutdown.clone(),
     ));
     start_embedding_backlog_drainer(Arc::clone(&manager));
+    start_write_time_fact_worker(Arc::clone(&manager));
 
     // Start backup scheduler if enabled
     if server_config.backup_enabled && server_config.backup_interval_secs > 0 {
@@ -1445,6 +1446,57 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} bytes", bytes)
     }
+}
+
+/// Drains the write-time fact queues off the write path, one pass every
+/// `WRITE_TIME_FACT_TICK` while the queues hold work, and journals what each pass writes
+/// (`handlers::write_time_facts`). Not started when no LLM is configured, which is the
+/// default: `remember` then queues nothing and nothing here would run. Each pass is
+/// tracked, so the shutdown drain waits for the job in progress, and it stops between jobs
+/// once tenant writes are closed.
+fn start_write_time_fact_worker(manager: AppState) {
+    const WRITE_TIME_FACT_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+    let Some(llm) = manager.write_time_fact_llm() else {
+        return;
+    };
+    info!(
+        model = %llm.llm_version(),
+        "Write-time fact worker started; the write_time_facts dial turns extraction on per user"
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(WRITE_TIME_FACT_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if shutting_down() {
+                break;
+            }
+            let manager_clone = Arc::clone(&manager);
+            let pass = manager.task_tracker.spawn_blocking(move || {
+                manager_clone
+                    .drain_write_time_facts(crate::handlers::write_time_facts::JOBS_PER_TENANT_PASS)
+            });
+            match pass.await {
+                Ok(reports) => {
+                    for (user, report) in reports {
+                        tracing::debug!(
+                            user = %user,
+                            jobs = report.jobs,
+                            created = report.created,
+                            updated = report.updated,
+                            removed = report.removed,
+                            superseded = report.superseded,
+                            failures = report.failures,
+                            retried = report.retried,
+                            screened = report.screened,
+                            "Write-time fact pass"
+                        );
+                    }
+                }
+                Err(e) => error!("Write-time fact pass panicked: {e}"),
+            }
+        }
+    });
 }
 
 /// Gives backlogged memories their vectors once the embedder answers again. Interval from

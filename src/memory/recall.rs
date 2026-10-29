@@ -2736,7 +2736,7 @@ impl super::MemorySystem {
                     &mut res,
                     rerank_budget,
                     super::write_time_facts::MAX_EXPANSION,
-                    |id| self.write_time_fact_sources(id),
+                    |id| self.write_time_fact_sources(id, query.as_of),
                 );
                 crate::memory::gold_funnel::record("fact", expansion.leg.iter());
                 if expansion.injected > 0 {

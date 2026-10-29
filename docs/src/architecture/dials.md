@@ -34,9 +34,32 @@ diff two runs that overrode them differently.
 
 Three dials drive the write-time fact extractor
 ([src/memory/write_time_facts.rs](https://github.com/Portll/veld/blob/main/src/memory/write_time_facts.rs)).
-Nothing they enable runs unless an LLM is configured (`VELD_LLM_ENDPOINT`, with
-`VELD_LLM_MODEL` and `VELD_LLM_API_KEY`), or a model tape that holds LLM outputs
-is replayed, so the offline default is unchanged whatever they are set to.
+Nothing they enable runs unless an LLM is configured, or a model tape that holds LLM
+outputs is replayed, so the offline default is unchanged whatever they are set to. The
+LLM is any OpenAI-compatible chat-completions server, read once at startup:
+
+- `VELD_LLM_HOST` names a host declared in `manifests/llm-hosts.json` (`lmstudio`,
+  `llama.cpp`, `llamafile`, `mlx-lm`, `localai`, `vllm`, `sglang`), reached at its
+  declared URL or its `VELD_LLM_URL_<ID>` override, with `VELD_LLM_MODEL` naming a model
+  the server lists. Or `VELD_LLM_ENDPOINT` gives a full chat-completions URL.
+- `VELD_LLM_API_KEY` is sent as a bearer token when set.
+
+With a model configured the server starts a background worker that drains each tenant's
+queue every two seconds and journals every fact it writes, rewrites or removes. A failed
+call leaves the stored turn and any earlier facts as they are and is tried twice more,
+30 s and 120 s later. The dial is then turned on per user with `PUT /api/dials`, sending the user's dials
+as `GET /api/dials` returns them with `write_time_facts` set to `true` (the body replaces
+every dial), or for every user without persisted dials with
+`VELD_DIALS_WRITE_TIME_FACTS=1`.
+
+A fact carries the least credible source type of the turns its model read, so a fact
+from web or API content is recalled as untrusted; a turn from an untrusted source that
+reads as an injected instruction is never sent to the model. A fact that gives the
+current value of something (where someone lives) names its subject and attribute, and a
+later fact with the same pair closes its validity window, so current-state recall
+returns the later one and an `as_of` recall still finds the earlier. Forgetting a turn
+removes the facts that cite it. `POST /api/recall` returns each fact's source turns with
+it, as `fact_sources`, within `fact_source_tokens` (default 400, `0` for none).
 
 | Dial | Env var | Default | Range | Effect |
 |---|---|---|---|---|

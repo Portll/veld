@@ -14,9 +14,9 @@ use tracing::info;
 use super::state::MultiUserMemoryManager;
 use super::temporal_derivation::derive_answer_for_user_query;
 use super::types::{
-    MemoryEvent, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory, RecallRequest,
-    RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
-    TrackedRetrieveResponse,
+    MemoryEvent, RecallExperience, RecallFact, RecallFactSource, RecallLineageEdge, RecallMemory,
+    RecallRequest, RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse,
+    TrackedRetrieveRequest, TrackedRetrieveResponse,
 };
 use super::utils::{is_bare_question, is_boilerplate_response, strip_system_noise};
 use crate::errors::{AppError, ValidationErrorExt};
@@ -64,7 +64,7 @@ pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 /// untrusted text more aggressively. Stored content is never mutated. The
 /// pattern set is deliberately narrow (specific imperative phrases) to keep
 /// false positives low; callers gate it on a non-trusted source first.
-fn looks_like_prompt_injection(content: &str) -> bool {
+pub(crate) fn looks_like_prompt_injection(content: &str) -> bool {
     const NEEDLES: &[&str] = &[
         "ignore previous instructions",
         "ignore all previous instructions",
@@ -126,14 +126,11 @@ pub(crate) fn recall_memory_view(m: &Memory, rank: usize, total: usize) -> Recal
     let score = rank_score * 0.7 + salience * 0.3;
     // C3: User/File/System sources are trusted; anything else is data, never instructions.
     // `None` when the engram carries no rich context.
-    let source_trusted = m.experience.context.as_ref().map(|c| {
-        matches!(
-            c.source.source_type,
-            crate::memory::types::SourceType::User
-                | crate::memory::types::SourceType::File
-                | crate::memory::types::SourceType::System
-        )
-    });
+    let source_trusted = m
+        .experience
+        .context
+        .as_ref()
+        .map(|c| c.source.source_type.is_trusted());
     RecallMemory {
         id: m.id.0.to_string(),
         experience: RecallExperience {
@@ -171,13 +168,37 @@ pub(crate) fn recall_memory_view(m: &Memory, rank: usize, total: usize) -> Recal
         // C3.1 (W-006): flag only non-trusted-source content that matches
         // injection-style directives. A memory with no rich context counts as
         // untrusted. `None` (the common case) is skipped on the wire.
-        injection_suspected: if !source_trusted.unwrap_or(false)
-            && looks_like_prompt_injection(&m.experience.content)
-        {
-            Some(true)
-        } else {
-            None
-        },
+        injection_suspected: injection_suspected(m, source_trusted),
+        fact_sources: None,
+    }
+}
+
+/// C3.1 (W-006): `Some(true)` for non-trusted-source content that matches
+/// injection-style directives; `None` otherwise, which is skipped on the wire.
+fn injection_suspected(m: &Memory, source_trusted: Option<bool>) -> Option<bool> {
+    (!source_trusted.unwrap_or(false) && looks_like_prompt_injection(&m.experience.content))
+        .then_some(true)
+}
+
+/// A source turn returned with the write-time fact that cites it, carrying its own
+/// source-trust marking: the fact's marking covers the fact's text, not the turn's.
+pub(crate) fn fact_source_view(m: &Memory) -> RecallFactSource {
+    let source_trusted = m
+        .experience
+        .context
+        .as_ref()
+        .map(|c| c.source.source_type.is_trusted());
+    RecallFactSource {
+        id: m.id.0.to_string(),
+        content: m.experience.content.clone(),
+        created_at: m.created_at.to_rfc3339(),
+        source_type: m
+            .experience
+            .context
+            .as_ref()
+            .map(|c| format!("{:?}", c.source.source_type)),
+        source_trusted,
+        injection_suspected: injection_suspected(m, source_trusted),
     }
 }
 
@@ -634,6 +655,10 @@ pub async fn recall(
     let mode = req.mode.clone();
     let retrieval_mode_for_recall = parse_retrieval_mode(&mode);
     let rrf_k_for_recall = req.rrf_k.map(|k| k.clamp(1.0, 200.0));
+    let fact_source_tokens = req
+        .fact_source_tokens
+        .unwrap_or(crate::memory::write_time_facts::DEFAULT_SOURCE_TOKEN_BUDGET)
+        .min(crate::memory::write_time_facts::MAX_SOURCE_TOKEN_BUDGET);
     let layers_for_recall = match req.layers.as_deref() {
         None | Some("") => None,
         Some(s) => Some(parse_layer_mode(s).ok_or_else(|| AppError::InvalidInput {
@@ -659,7 +684,7 @@ pub async fn recall(
         .get_or_create_session(&req.user_id)
         .to_string();
 
-    let (memories, triggered_reminders, _prospective_signals, query_embedding_opt) =
+    let (memories, fact_sources, triggered_reminders, _prospective_signals, query_embedding_opt) =
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_for_recall.read();
 
@@ -754,8 +779,16 @@ pub async fn recall(
             // an unreadable store or a decode error all presented as a confident
             // negative answer. Propagate; an error is the honest response.
             let memories = memory_guard.recall(&query)?;
+            let fact_sources =
+                memory_guard.write_time_fact_sources_within(&memories, fact_source_tokens);
 
-            Ok::<_, anyhow::Error>((memories, reminders, prospective_signals, query_embedding_opt))
+            Ok::<_, anyhow::Error>((
+                memories,
+                fact_sources,
+                reminders,
+                prospective_signals,
+                query_embedding_opt,
+            ))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -775,7 +808,13 @@ pub async fn recall(
     let recall_memories: Vec<RecallMemory> = memories
         .iter()
         .enumerate()
-        .map(|(rank, m)| recall_memory_view(m, rank, total))
+        .map(|(rank, m)| {
+            let mut view = recall_memory_view(m, rank, total);
+            view.fact_sources = fact_sources
+                .get(&m.id)
+                .map(|turns| turns.iter().map(fact_source_view).collect());
+            view
+        })
         .collect();
 
     // Search todos semantically using the embedding already computed for recall

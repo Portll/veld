@@ -177,6 +177,11 @@ pub struct RecallRequest {
     /// "+rerank", "+facts" or "full". Omitted means full, the production pipeline.
     #[serde(default)]
     pub layers: Option<String>,
+    /// Estimated tokens to spend on the source turns returned with each write-time fact
+    /// in the results (`fact_sources`). Omitted means 400; `0` returns none; capped at
+    /// 8192.
+    #[serde(default)]
+    pub fact_source_tokens: Option<usize>,
 }
 
 pub fn default_recall_limit() -> usize {
@@ -247,6 +252,9 @@ impl RecallResponse {
             chars += mem.id.len();
             for tag in &mem.experience.tags {
                 chars += tag.len() + 1;
+            }
+            for source in mem.fact_sources.iter().flatten() {
+                chars += source.content.len() + source.id.len();
             }
         }
         for fact in &self.facts {
@@ -353,6 +361,26 @@ pub struct RecallMemory {
     /// Best-effort defense-in-depth — a consumer should fence such content
     /// as data, never instructions. Absent when there is no suspicion (the
     /// common case), so it adds nothing to the wire for clean recalls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injection_suspected: Option<bool>,
+    /// For a write-time fact (a statement a model extracted from conversation turns), the
+    /// turns it was extracted from, in conversation order, within the request's
+    /// `fact_source_tokens`. Absent for every other memory and when none fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fact_sources: Option<Vec<RecallFactSource>>,
+}
+
+/// A conversation turn returned with the write-time fact that cites it. Its trust
+/// fields describe the turn itself, as [`RecallMemory`]'s do.
+#[derive(Serialize)]
+pub struct RecallFactSource {
+    pub id: String,
+    pub content: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trusted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub injection_suspected: Option<bool>,
 }

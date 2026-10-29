@@ -400,7 +400,8 @@ pub struct MultiUserMemoryManager {
     /// journal purge (kept only while the purge is on).
     feed_floors: parking_lot::Mutex<crate::replication::FeedFloors>,
     /// The model every user's write-time fact extractor uses, read from `VELD_LLM_*` once
-    /// at startup. `None` (the default: no endpoint) leaves extraction off for everyone.
+    /// at startup. `None` (the default: no endpoint) leaves extraction off for everyone,
+    /// and the server then starts no write-time fact worker.
     write_time_fact_llm: Option<Arc<dyn crate::memory::llm::LlmConsolidator>>,
 }
 
@@ -1621,7 +1622,6 @@ impl MultiUserMemoryManager {
         user_mem.set_write_time_fact_llm(self.write_time_fact_llm.clone());
 
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
-        crate::memory::write_time_facts::start_worker(&memory_arc);
 
         self.user_memories
             .insert(user_id.to_string(), memory_arc.clone());
@@ -1871,6 +1871,16 @@ impl MultiUserMemoryManager {
     }
 
     /// Flush all RocksDB databases
+    /// Whether [`Self::close_all_writes`] has run.
+    pub fn writes_closed(&self) -> bool {
+        self.writes_closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The model the write-time fact extractor uses; `None` when none is configured.
+    pub fn write_time_fact_llm(&self) -> Option<Arc<dyn crate::memory::llm::LlmConsolidator>> {
+        self.write_time_fact_llm.clone()
+    }
+
     /// Close every tenant's write gate, waiting for the write in progress in each. Queued
     /// and later creates and upserts fail with `WritesClosed` (503 to HTTP callers)
     /// instead of running past the flush. Blocking: call it from the blocking pool.

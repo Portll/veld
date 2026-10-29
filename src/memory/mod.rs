@@ -3780,7 +3780,8 @@ impl MemorySystem {
     ) -> Result<(usize, Vec<MemoryId>)> {
         use std::collections::HashSet;
         let before: HashSet<MemoryId> = self.long_term_memory.get_all_ids()?.into_iter().collect();
-        let count = self.forget_with(criteria, Bm25Sync::Journaled)?;
+        // The write-time facts the forget removed with their sources are in the difference.
+        let (count, _) = self.forget_with(criteria, Bm25Sync::Journaled)?;
         let after: HashSet<MemoryId> = self.long_term_memory.get_all_ids()?.into_iter().collect();
         let removed: Vec<MemoryId> = before.difference(&after).cloned().collect();
         Ok((count, removed))
@@ -3790,17 +3791,37 @@ impl MemorySystem {
     /// Thread-safe: uses interior mutability for all internal state
     pub fn forget(&self, criteria: ForgetCriteria) -> Result<usize> {
         self.forget_with(criteria, Bm25Sync::Direct)
+            .map(|(count, _)| count)
     }
 
     /// [`Self::forget`] for a caller that journals an `IntentPayload::Forget`
     /// for every memory hard-deleted from the store (for `ById`, the id
-    /// itself); the BM25 projection removes those. Soft forgets, which only
-    /// flag a record and are not journaled, are still removed from BM25 here.
-    pub fn forget_journaled(&self, criteria: ForgetCriteria) -> Result<usize> {
+    /// itself, and each id in the returned list: the write-time facts removed
+    /// because they cite a forgotten memory); the BM25 projection removes those.
+    /// Soft forgets, which only flag a record and are not journaled, are still
+    /// removed from BM25 here.
+    pub fn forget_journaled(&self, criteria: ForgetCriteria) -> Result<(usize, Vec<MemoryId>)> {
         self.forget_with(criteria, Bm25Sync::Journaled)
     }
 
-    fn forget_with(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
+    /// Forget by `criteria`, then remove the write-time facts left citing a memory it
+    /// removed or flagged, and return the count and those facts' ids.
+    fn forget_with(
+        &self,
+        criteria: ForgetCriteria,
+        bm25: Bm25Sync,
+    ) -> Result<(usize, Vec<MemoryId>)> {
+        let by_id = match &criteria {
+            ForgetCriteria::ById(id) => Some(id.clone()),
+            _ => None,
+        };
+        let count = self.forget_by_criteria(criteria, bm25)?;
+        let derived = self.forget_derived_facts(by_id.as_ref(), bm25);
+        Ok((count, derived))
+    }
+
+    /// The forget itself, without the write-time facts that cite what it removes.
+    fn forget_by_criteria(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
         let forgotten_count = match criteria {
             ForgetCriteria::ById(memory_id) => {
                 // Delete a single memory by ID from all tiers, tracking which tiers had it
@@ -6820,6 +6841,13 @@ impl MemorySystem {
             if !experience.tags.is_empty() {
                 existing.experience.tags = experience.tags;
             }
+
+            // A derived record's links to what it was derived from, if provided, and its
+            // metadata entries, written over the stored ones.
+            if !experience.related_memories.is_empty() {
+                existing.experience.related_memories = experience.related_memories;
+            }
+            existing.experience.metadata.extend(experience.metadata);
 
             // Regenerate embeddings for new content: the vector computed before the lock
             // when it was computed from this content, otherwise encoded here. Unchanged

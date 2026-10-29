@@ -792,6 +792,14 @@ pub enum SourceType {
     Unknown,
 }
 
+impl SourceType {
+    /// C3 injection trust boundary: user, file and system content may be read as
+    /// instructions; anything else is data.
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, Self::User | Self::File | Self::System)
+    }
+}
+
 /// Episode context - groups memories into coherent episodes
 ///
 /// Research: Episodic memory organizes experiences into bounded events.

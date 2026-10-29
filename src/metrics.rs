@@ -1032,7 +1032,8 @@ pub static SUPPRESSOR_DETECTIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| 
 // Write-time fact metrics (src/memory/write_time_facts.rs)
 // ============================================================================
 
-/// Conversation turns waiting for the write-time fact extractor, across users.
+/// Conversation turns waiting for the write-time fact extractor, across users, retries
+/// waiting out their delay included.
 pub static WRITE_TIME_FACT_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
         "veld_write_time_fact_queue_depth",
@@ -1041,7 +1042,8 @@ pub static WRITE_TIME_FACT_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("WRITE_TIME_FACT_QUEUE_DEPTH metric must be valid at compile time")
 });
 
-/// Derived facts stored, by outcome: created, updated, unchanged, removed.
+/// Derived facts stored, by outcome: created, updated, unchanged, removed (a
+/// re-extraction no longer returned it), forgotten (a source turn was forgotten).
 pub static WRITE_TIME_FACTS_WRITTEN_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -1053,8 +1055,11 @@ pub static WRITE_TIME_FACTS_WRITTEN_TOTAL: LazyLock<IntCounterVec> = LazyLock::n
     .expect("WRITE_TIME_FACTS_WRITTEN_TOTAL metric must be valid at compile time")
 });
 
-/// Extraction failures, by reason: llm (the call or its payload), invalid (an element
-/// that broke the schema), store (the write).
+/// Extraction failures and skips, by reason: llm (the call or its payload; retried),
+/// exhausted (the last attempt failed), invalid (an element that broke the schema), store
+/// (a read or write), queue_full (a turn not queued), dropped (queued turns lost when a
+/// tenant closed), screened (a turn kept from the model as a suspected injection), forget
+/// (a fact a forget should have removed).
 pub static WRITE_TIME_FACT_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
