@@ -2176,7 +2176,7 @@ impl super::MemorySystem {
                 let mut raw: Vec<(&MemoryId, f32)> = fused.iter().map(|(id, s)| (id, *s)).collect();
                 // `fused` is a hash map; ordering by id first keeps the trace's tie order
                 // repeatable across runs.
-                raw.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+                raw.sort_by_key(|(id, _)| id.0);
                 crate::memory::gold_funnel::record_by_score("rrf", raw.into_iter());
             }
 
