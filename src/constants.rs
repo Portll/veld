@@ -2730,39 +2730,23 @@ pub const RECENTLY_FLOOR_MULTIPLIER: f32 = 0.5;
 /// Cross-encoder share of the Layer 5.3 blend, by query shape
 /// ([`crate::memory::query_parser::RerankShape`]). The fused score keeps `1 - share`.
 ///
-/// The share is lowered where the reranker has nothing to add and can only re-sort what a
-/// better-informed layer ordered, and raised where the lexical and vector legs disagree and
-/// the question needs query-to-passage reasoning.
-///
-/// - Identifier: the reranker tokenises `admin/serve.mjs` into fragments; BM25 exact match
-///   is the truth.
-/// - Ordinal ("first", "latest", "last"): Layer 5.9 pins the answer by time and the blend
-///   can only re-sort it back down. On the recall gate (2026-10-19) this gained a gold
-///   document.
-/// - Keyword (under three content words): a cross-encoder needs a question to read.
-/// - Temporal and People stay at the exploratory share. Both were lowered to 0.10 and
-///   measured: a date in a content question filters rather than answers, so the reranker
-///   still matches the content (the gate lost a gold document on "what filling did she use
-///   in the cake she made recently"), and a small reranker is what a who-question has until
-///   a person-density signal exists (LOCOMO-20 Q20 lost a top-5 answer). They remain
-///   separate dials so they can be tuned without touching everything else.
-/// - Attribute: entity-to-value matching is what the reranker is trained on; the gate
-///   gained rank on "what is Nate's favorite genre".
-/// - Relational ("how did X fix Y", "why"): under nomic-embed on LOCOMO-20 the
-///   EU-migration answer sat at rank 10 because the vector leg saw topic overlap and the
-///   lexical leg saw stems; only the reranker reads that one passage answers the other.
-/// - Abstract (decomposed): the 0.45 these queries already had.
+/// Every shape but Abstract takes 0.40, the share that measured best out of sample: on the
+/// 1,166-question LoCoMo hold-out (2026-10-22), it raised p@1 by +0.023 [+0.014, +0.033] and
+/// recall@10 by +0.008 [+0.002, +0.015] over shape-specific shares that had been tuned on the
+/// recall gate's own conversation, and the smoke suite's code and entity lookups held.
+/// Abstract (decomposed) queries keep 0.45. The shapes stay separate constants and dials so
+/// one can be tuned on hold-out evidence without moving the rest.
 ///
 /// The `ce_blend` dial overrides every shape except Abstract, which takes the larger of it and
 /// its own share; the per-shape dials override one shape each.
-pub const CE_BLEND_IDENTIFIER: f32 = 0.0;
-pub const CE_BLEND_ORDINAL: f32 = 0.05;
-pub const CE_BLEND_KEYWORD: f32 = 0.10;
-pub const CE_BLEND_TEMPORAL: f32 = 0.18;
-pub const CE_BLEND_PEOPLE: f32 = 0.18;
-pub const CE_BLEND_EXPLORATORY: f32 = 0.18;
-pub const CE_BLEND_ATTRIBUTE: f32 = 0.30;
-pub const CE_BLEND_RELATIONAL: f32 = 0.35;
+pub const CE_BLEND_IDENTIFIER: f32 = 0.40;
+pub const CE_BLEND_ORDINAL: f32 = 0.40;
+pub const CE_BLEND_KEYWORD: f32 = 0.40;
+pub const CE_BLEND_TEMPORAL: f32 = 0.40;
+pub const CE_BLEND_PEOPLE: f32 = 0.40;
+pub const CE_BLEND_EXPLORATORY: f32 = 0.40;
+pub const CE_BLEND_ATTRIBUTE: f32 = 0.40;
+pub const CE_BLEND_RELATIONAL: f32 = 0.40;
 pub const CE_BLEND_ABSTRACT: f32 = 0.45;
 
 /// Below this share the reranker is not called at all: at scale it is the dominant
