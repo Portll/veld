@@ -70,11 +70,13 @@ fn note_poll(
 }
 
 /// Both roles in one reply: `users` is what this instance can feed, `followers` who
-/// polled it lately, `following` what it tails.
+/// polled it lately, `following` what it tails. A follower's poll, which names
+/// itself, gets no `followers`: it reads none of them, and asks every interval.
 pub async fn status(State(state): State<AppState>, headers: HeaderMap, peer: Peer) -> Response {
     if let Err(refusal) = require_admin_key(&headers) {
         return refusal;
     }
+    let follower_poll = headers.contains_key(replication::INSTANCE_ID_HEADER);
     note_poll(&state, &headers, peer, None);
     let users = {
         let state = state.clone();
@@ -85,16 +87,16 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap, peer: Pee
         Err(e) => return failed(anyhow::anyhow!("listing logs: {e}")),
     };
     let following = state.replication.status();
-    respond(
-        StatusCode::OK,
-        json!({
-            "base_url": own_base_url(&state),
-            "instance_id": replication::instance_id(),
-            "users": users,
-            "followers": state.replication.followers(),
-            "following": following.target.is_some().then_some(following),
-        }),
-    )
+    let mut body = json!({
+        "base_url": own_base_url(&state),
+        "instance_id": replication::instance_id(),
+        "users": users,
+        "following": following.target.is_some().then_some(following),
+    });
+    if !follower_poll {
+        body["followers"] = json!(state.replication.followers());
+    }
+    respond(StatusCode::OK, body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,7 +145,11 @@ pub async fn records(
             .await
     };
     let lag = match &page {
-        Ok(Ok(page)) => Some(replication::FollowerTenant::new(after_lsn, page.head_lsn)),
+        Ok(Ok(page)) => Some(replication::FollowerTenant::new(
+            after_lsn,
+            page.head_lsn,
+            page.records.len() as u64,
+        )),
         _ => None,
     };
     note_poll(

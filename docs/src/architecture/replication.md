@@ -20,7 +20,7 @@ reach.
 
 | Route | Role | Purpose |
 |---|---|---|
-| `GET status` | both | `instance_id`, this process's id, new at every start; `users: [{user_id, log_bytes}]` this instance can feed; `followers` that polled it in the last 10 minutes; `following` when it tails a leader |
+| `GET status` | both | `instance_id`, this process's id, new at every start; `users: [{user_id, log_bytes}]` this instance can feed; `followers` that polled it in the last 10 minutes, left out of the reply to a follower's own poll (one that sends `X-Veld-Instance-Id`); `following` when it tails a leader |
 | `GET records?user_id&after_lsn&limit` | leader | Frames after `after_lsn`, decrypted, base64, with `head_lsn`, `more` and `log_created`. 404 for a tenant with no log; it never creates one |
 | `POST follow {source, admin_key, api_key?}` | follower | Start tailing; refused when the source is this instance (any loopback name with this port, or a source whose status reports this process's `instance_id`) or already follows it. A leader whose status carries no `instance_id` (an older build) is followed |
 | `POST unfollow` | follower | Stop; a poll in progress stops at its next page; the cursor is kept |
@@ -176,12 +176,14 @@ followers: [{instance_id, url?, remote_addr, first_seen, last_poll,
 - `requested_lsn` is the first LSN the follower asked for. Its `after_lsn` is its cursor,
   the last frame it applied, so it asks for `after_lsn + 1`, or 0 when it has applied
   nothing.
-- `lag_frames = leader_head_lsn - requested_lsn` (0 when it asks from the head or past
-  it): the frames the leader held at or above `requested_lsn`, which is what that request
-  is served with no page limit. It is measured at the request and includes the frames
-  the reply carried, and a follower does not ask again for a tenant whose log is
-  unchanged, so a caught-up tenant shows its last page's size until its next change.
-  The follower's own `lag` (`leader_head_lsn - 1 - applied_lsn`) is the same count.
+- `lag_frames = leader_head_lsn - (requested_lsn + served)`, 0 at least, where `served`
+  is the number of frames the reply carried: what the leader held that the follower had
+  still not been sent when the reply left. The feed serves contiguous LSNs from
+  `requested_lsn`, so a reply that carried everything up to the head records 0, and a
+  page the limit cut short records what remains. A follower does not ask again for a
+  tenant whose log is unchanged, so the value stands until that tenant's next change.
+  Once the follower has applied the reply, its own `lag`
+  (`leader_head_lsn - 1 - applied_lsn`) is the same count.
 
 ## Limits, stated
 

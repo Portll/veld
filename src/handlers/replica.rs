@@ -1206,19 +1206,37 @@ mod tests {
             request
         };
 
-        let (status, _, page) = call(
-            &harness,
+        let records = |query: &str| {
             admin_get(
-                &format!("/api/admin/replication/records?user_id={USER}&after_lsn=0"),
+                &format!("/api/admin/replication/records?user_id={USER}&{query}"),
                 true,
-            ),
-        )
-        .await;
+            )
+        };
+        let (status, _, page) = call(&harness, records("limit=1")).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         let head = page["head_lsn"].as_u64().unwrap();
         assert!(head >= 2, "two remembers journaled: {page}");
-        let (status, _, _) = call(&harness, admin_get("/api/admin/replication/status", true)).await;
+        assert_eq!(page["more"], true, "{page}");
+        let (status, _, body) =
+            call(&harness, admin_get("/api/admin/replication/status", false)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["followers"][0]["users"][USER],
+            json!({"requested_lsn": 0, "leader_head_lsn": head, "lag_frames": head - 1}),
+            "a page the limit cut to one frame leaves the rest unsent"
+        );
+
+        let (status, _, page) = call(&harness, records("after_lsn=0")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["more"], false, "{page}");
+        let head = page["head_lsn"].as_u64().unwrap();
+        let (status, _, polled) =
+            call(&harness, admin_get("/api/admin/replication/status", true)).await;
         assert_eq!(status, StatusCode::OK);
+        assert!(
+            polled.get("followers").is_none(),
+            "a follower's own poll is not sent the table: {polled}"
+        );
 
         let (status, _, body) =
             call(&harness, admin_get("/api/admin/replication/status", false)).await;
@@ -1240,8 +1258,8 @@ mod tests {
         );
         assert_eq!(
             one["users"][USER],
-            json!({"requested_lsn": 1, "leader_head_lsn": head, "lag_frames": head - 1}),
-            "it asked from lsn 1, after the frame at 0"
+            json!({"requested_lsn": 1, "leader_head_lsn": head, "lag_frames": 0}),
+            "it asked from lsn 1, after the frame at 0, and the reply carried the rest"
         );
 
         let (status, _, role) = call(&harness, get("/api/replication/role")).await;
@@ -1252,7 +1270,7 @@ mod tests {
                 "role": "leader",
                 "instance_id": crate::replication::instance_id(),
                 "followers_count": 1,
-                "max_lag_frames": head - 1,
+                "max_lag_frames": 0,
             })
         );
     }

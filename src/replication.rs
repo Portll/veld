@@ -414,20 +414,22 @@ pub struct FollowerTenant {
     pub requested_lsn: u64,
     /// The LSN the leader assigns next, as the feed read it for that reply.
     pub leader_head_lsn: u64,
-    /// Frames the leader held at or above `requested_lsn`:
-    /// `leader_head_lsn - requested_lsn`, or 0 when the follower asked from the head
-    /// or past it. LSNs below the head are contiguous, so this counts the frames from
-    /// the one asked for to the last one written, including those the reply carried.
+    /// Frames the leader held that the follower had still not been sent when the reply
+    /// left: `leader_head_lsn - (requested_lsn + served)`, floored at 0. The feed serves
+    /// contiguous LSNs from `requested_lsn`, so a reply that carried everything up to
+    /// the head leaves 0 and a page the limit cut short leaves the rest.
     pub lag_frames: u64,
 }
 
 impl FollowerTenant {
-    pub fn new(after_lsn: Option<u64>, leader_head_lsn: u64) -> Self {
+    /// A feed request from `after_lsn`, answered with `served` frames while the
+    /// leader's head was `leader_head_lsn`.
+    pub fn new(after_lsn: Option<u64>, leader_head_lsn: u64, served: u64) -> Self {
         let requested_lsn = after_lsn.map_or(0, |applied| applied.saturating_add(1));
         Self {
             requested_lsn,
             leader_head_lsn,
-            lag_frames: leader_head_lsn.saturating_sub(requested_lsn),
+            lag_frames: leader_head_lsn.saturating_sub(requested_lsn.saturating_add(served)),
         }
     }
 }
@@ -2396,20 +2398,27 @@ mod tests {
     }
 
     /// `after_lsn` is the follower's cursor, the last frame it applied; the feed
-    /// serves from one past it. The lag must count exactly the frames that request
-    /// would be served if nothing capped the page.
+    /// serves from one past it. The lag the leader records is what the reply left
+    /// unsent, so it is 0 for a reply that carried everything, and the follower's own
+    /// lag once it has applied the reply.
     #[test]
-    fn a_followers_lag_counts_the_frames_at_or_above_what_it_asked_for() {
+    fn a_followers_lag_is_what_the_reply_left_unsent() {
         let cases = [
-            (None, 0, 0, 0),
-            (None, 5, 0, 5),
-            (Some(0), 5, 1, 4),
-            (Some(3), 5, 4, 1),
-            (Some(4), 5, 5, 0),
-            (Some(9), 5, 10, 0),
+            (None, 0, usize::MAX, 0, 0),
+            (None, 5, usize::MAX, 0, 0),
+            (None, 5, 2, 0, 3),
+            (Some(0), 5, usize::MAX, 1, 0),
+            (Some(0), 5, 3, 1, 1),
+            (Some(3), 5, usize::MAX, 4, 0),
+            (Some(4), 5, usize::MAX, 5, 0),
+            (Some(9), 5, usize::MAX, 10, 0),
         ];
-        for (after_lsn, head, requested, lag) in cases {
-            let tenant = FollowerTenant::new(after_lsn, head);
+        for (after_lsn, head, limit, requested, lag) in cases {
+            let floor = after_lsn.map_or(0, |applied| applied + 1);
+            let (served, more) =
+                page_below_head((0..head).map(record), floor, head, limit).unwrap();
+            let tenant = FollowerTenant::new(after_lsn, head, served.len() as u64);
+            let case = format!("after_lsn {after_lsn:?}, head {head}, limit {limit}");
             assert_eq!(
                 (
                     tenant.requested_lsn,
@@ -2417,24 +2426,12 @@ mod tests {
                     tenant.lag_frames
                 ),
                 (requested, head, lag),
-                "after_lsn {after_lsn:?}, head {head}"
+                "{case}"
             );
-            let (served, more) = page_below_head(
-                (0..head).map(record),
-                tenant.requested_lsn,
-                head,
-                usize::MAX,
-            )
-            .unwrap();
-            assert!(!more);
-            assert_eq!(
-                served.len() as u64,
-                tenant.lag_frames,
-                "{after_lsn:?}/{head}"
-            );
+            assert_eq!(more, lag > 0, "the feed's `more` agrees: {case}");
 
             let mut follower_side = UserProgress {
-                applied_lsn: after_lsn,
+                applied_lsn: served.last().map(|r| r.lsn).or(after_lsn),
                 leader_head_lsn: Some(head),
                 ..UserProgress::default()
             };
@@ -2443,7 +2440,7 @@ mod tests {
                 assert_eq!(
                     follower_side.lag,
                     Some(tenant.lag_frames),
-                    "the follower and its leader agree on the lag"
+                    "the follower, having applied the reply, and its leader agree: {case}"
                 );
             }
         }
@@ -2466,14 +2463,14 @@ mod tests {
         table.record(
             identity(1, Some("https://replica.example:3443/")),
             Some(peer),
-            Some(("alice", FollowerTenant::new(Some(9), 30))),
+            Some(("alice", FollowerTenant::new(Some(9), 30, 5))),
             t0,
         );
         table.record(identity(1, None), None, None, mins(4));
         table.record(
             identity(1, None),
             None,
-            Some(("bob", FollowerTenant::new(None, 2))),
+            Some(("bob", FollowerTenant::new(None, 4, 1))),
             mins(5),
         );
         let followers = table.followers(mins(5));
@@ -2487,9 +2484,10 @@ mod tests {
             "a poll without a url keeps the one already given"
         );
         assert_eq!(one.remote_addr.as_deref(), Some("10.0.0.7:51234"));
-        assert_eq!(one.users["alice"], FollowerTenant::new(Some(9), 30));
-        assert_eq!(one.users["bob"].lag_frames, 2);
-        assert_eq!(one.lag_frames(), 22);
+        assert_eq!(one.users["alice"], FollowerTenant::new(Some(9), 30, 5));
+        assert_eq!(one.users["alice"].lag_frames, 15, "30 - (10 + 5)");
+        assert_eq!(one.users["bob"].lag_frames, 3);
+        assert_eq!(one.lag_frames(), 18);
 
         assert_eq!(
             table
@@ -2579,19 +2577,19 @@ mod tests {
             table.record(
                 identity(1, None),
                 None,
-                Some(("a", FollowerTenant::new(Some(4), 10))),
+                Some(("a", FollowerTenant::new(Some(4), 10, 2))),
                 now,
             );
             table.record(
                 identity(1, None),
                 None,
-                Some(("b", FollowerTenant::new(None, 1))),
+                Some(("b", FollowerTenant::new(None, 1, 0))),
                 now,
             );
             table.record(
                 identity(2, None),
                 None,
-                Some(("a", FollowerTenant::new(Some(1), 10))),
+                Some(("a", FollowerTenant::new(Some(1), 10, 3))),
                 now,
             );
         }
@@ -2600,8 +2598,8 @@ mod tests {
         assert_eq!(role.followers_count, Some(2));
         assert_eq!(
             role.max_lag_frames,
-            Some(8),
-            "follower 1 lags 5 + 1, follower 2 lags 10 - 2"
+            Some(5),
+            "follower 1 lags (10 - 5 - 2) + 1, follower 2 lags 10 - 2 - 3"
         );
         let later = replication.role_at(now + chrono::Duration::from_std(FOLLOWER_TTL).unwrap());
         assert_eq!(later.role, Role::Standalone, "its followers went quiet");
