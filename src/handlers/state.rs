@@ -36,8 +36,8 @@ use crate::embeddings::{
 #[cfg(feature = "multi-tenant")]
 use crate::extensions::maintenance;
 use crate::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
-    LtpStatus, RelationType, RelationshipEdge,
+    recognised_tag_label, EdgeTier, EntityExtractor, EntityLabel, EntityNode, EpisodeSource,
+    EpisodicNode, GraphMemory, GraphStats, LtpStatus, RelationType, RelationshipEdge,
 };
 use crate::memory::tag_sources::{TagSource, TagSources};
 use crate::memory::{
@@ -2459,9 +2459,12 @@ impl MultiUserMemoryManager {
 
         // Third projection: BM25 inverted index.
         let bm25_index = self.get_user_bm25_index(user_id)?;
-        // An in-memory index starts empty every time, so its projection replays
-        // the whole log rather than resuming from the checkpoint a past index wrote.
-        let mut bm25_projection = if bm25_index.is_in_memory() {
+        // An in-memory index starts empty every time, and an on-disk index that
+        // `BM25Index::new` recreated after a schema change is empty too, so both
+        // replay the whole log rather than resuming from the checkpoint a past
+        // index wrote. The marker stays until this replay has committed.
+        let bm25_rebuilding = bm25_index.rebuild_pending();
+        let mut bm25_projection = if bm25_index.is_in_memory() || bm25_rebuilding {
             crate::memory::Bm25Projection::new_from_start(
                 bm25_index.clone(),
                 checkpoint_store.clone(),
@@ -2520,9 +2523,14 @@ impl MultiUserMemoryManager {
         let wiki_name = wiki_projection
             .as_ref()
             .map(|wp| crate::intent_log::ReplayTarget::target_name(wp).to_string());
+        let bm25_name = crate::intent_log::ReplayTarget::target_name(&bm25_projection).to_string();
+        let mut bm25_rebuilt = None;
         let mut first_failure = None;
         for (name, result) in replay_results {
             match result {
+                Ok(applied) if bm25_rebuilding && name == bm25_name => {
+                    bm25_rebuilt = Some(applied);
+                }
                 Ok(applied) if applied > 0 => tracing::info!(
                     user_id = %user_id,
                     projection = %name,
@@ -2552,6 +2560,16 @@ impl MultiUserMemoryManager {
         if let Some(e) = first_failure {
             return Err(
                 anyhow::Error::new(e).context(format!("replay intent log for user {user_id}"))
+            );
+        }
+        if let Some(applied) = bm25_rebuilt {
+            bm25_index.finish_rebuild().with_context(|| {
+                format!("clear the BM25 rebuild marker after replay for user {user_id}")
+            })?;
+            tracing::info!(
+                user_id = %user_id,
+                applied,
+                "BM25 index rebuilt from the intent log after a schema change",
             );
         }
 
@@ -3404,6 +3422,29 @@ impl MultiUserMemoryManager {
                         }
                         Err(e) => {
                             tracing::debug!("Full graph decay failed for user {}: {}", user_id, e);
+                        }
+                    }
+                }
+            }
+
+            // Selectivity for the edge-birth skip, scored on the post-decay graph as upstream
+            // scores its curvature. Held in memory by the graph, replaced whole each pass.
+            if is_heavy && env_switch(crate::constants::GRAPH_SELECTIVITY_SKIP_ENV, true) {
+                if let Ok(graph) = self.get_user_graph(&user_id) {
+                    let graph_guard = graph.read();
+                    let edges = graph_guard.get_stats().map_or(0, |s| s.relationship_count);
+                    if edges >= crate::constants::CURVATURE_MIN_EDGES {
+                        match graph_guard.compute_entity_selectivity() {
+                            Ok(scored) => tracing::debug!(
+                                user_id = %user_id,
+                                scored,
+                                "Entity selectivity scored"
+                            ),
+                            Err(e) => tracing::debug!(
+                                "Entity selectivity failed for user {}: {}",
+                                user_id,
+                                e
+                            ),
                         }
                     }
                 }
@@ -4467,8 +4508,7 @@ impl MultiUserMemoryManager {
     /// one observation, not ten.
     ///
     /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
-    /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
-    /// cap, every new edge only bought a prune of an older one.
+    /// derived entity past `GRAPH_HUB_DEGREE_MAX` gets no new edges from this memory.
     ///
     /// `tag_sources` is the ledger row for the stored tags (see `crate::memory::tag_sources`).
     /// With it, a causal edge forms only between names the writer or NER named: a caller tag, a
@@ -4482,6 +4522,27 @@ impl MultiUserMemoryManager {
         memory_id: &MemoryId,
         declared: &[DeclaredEntity],
         tag_sources: Option<&TagSources>,
+    ) -> Result<()> {
+        self.build_experience_graph(
+            user_id,
+            experience,
+            memory_id,
+            declared,
+            tag_sources,
+            GraphAdmission::from_env(),
+        )
+    }
+
+    /// [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared)
+    /// under the given gate switches.
+    pub(crate) fn build_experience_graph(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
+        admission: GraphAdmission,
     ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
@@ -4510,9 +4571,11 @@ impl MultiUserMemoryManager {
             declared.iter().map(|d| d.name.to_lowercase()).collect();
 
         // The middle branch below reads `experience.entities`, which lists every tag, derived
-        // keywords included, so only the other two branches hold names NER produced.
-        let extracted_by_ner =
-            !experience.ner_entities.is_empty() || experience.entities.is_empty();
+        // keywords included, so only the other two branches hold names NER produced. Under the
+        // tag-admission gate the middle branch yields nothing.
+        let extracted_by_ner = admission.tag_admission
+            || !experience.ner_entities.is_empty()
+            || experience.entities.is_empty();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -4537,6 +4600,12 @@ impl MultiUserMemoryManager {
                     end: record.end_char.unwrap_or(record.text.len()),
                 })
                 .collect()
+        } else if !experience.entities.is_empty() && admission.tag_admission {
+            // The writer's NER pass ran and kept no span. `entities` holds its tags, YAKE
+            // keyphrases included, and a tag is not a span (upstream #509 removed this
+            // branch). Re-running NER here would restore the PER/LOC spans
+            // `drop_person_location_in_code` removed from code.
+            Vec::new()
         } else if !experience.entities.is_empty() {
             tracing::debug!(
                 "Using {} pre-extracted entity names (no NER types available)",
@@ -4598,23 +4667,7 @@ impl MultiUserMemoryManager {
         let filtered_entities: Vec<_> = extracted_entities
             .into_iter()
             .filter(|e| {
-                let name = e.text.trim();
-                if name.len() < 3 {
-                    return false;
-                }
-                if !name.chars().any(|c| c.is_uppercase()) && e.confidence < 0.7 {
-                    return false;
-                }
-                if stop_words.contains(name.to_lowercase().as_str()) {
-                    return false;
-                }
-                if name.len() < 5 && e.confidence < 0.8 {
-                    return false;
-                }
-                if declared_names.contains(&name.to_lowercase()) {
-                    return false;
-                }
-                true
+                ner_span_becomes_node(e, &stop_words, &declared_names, admission.ner_noise_gate)
             })
             .collect();
 
@@ -4657,37 +4710,75 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
-        // Build tag entity nodes
+        // Tag nodes. A node is a claim that its name denotes a thing, and a tag is the
+        // memory's search metadata: caller tags, every NER surface and up to ten YAKE
+        // keyphrases. Upstream #509 admits a tag only on an authority, and so does this gate:
+        // the writer named it (a caller tag or declared entity in the provenance ledger), or a
+        // curated naming convention recognises it (`recognised_tag_label`). A surface NER
+        // typed is skipped outright: the NER node is that entity, and its twin would add an
+        // unfiltered Technology guess under the same name. Without a ledger row a tag's
+        // authorship is undetermined, so only the naming conventions admit it. A tag no
+        // authority recognises stays a keyword for BM25 and `recall_by_tags`.
+        let ner_claimed: std::collections::HashSet<String> = ner_entities
+            .iter()
+            .map(|(name, _)| name.trim().to_lowercase())
+            .collect();
+        let writer_named: std::collections::HashSet<String> = tag_sources
+            .map(|sources| {
+                sources
+                    .tags
+                    .iter()
+                    .filter(|t| {
+                        !t.redacted && matches!(t.source, TagSource::Caller | TagSource::Declared)
+                    })
+                    .map(|t| t.tag.trim().to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
         let tag_entities: Vec<(String, EntityNode)> = experience
             .tags
             .iter()
             .filter_map(|tag| {
                 let tag_name = tag.trim();
                 let lower = tag_name.to_lowercase();
-                if tag_name.len() >= 2
-                    && !stop_words.contains(lower.as_str())
-                    && !declared_names.contains(&lower)
+                if tag_name.len() < 2
+                    || stop_words.contains(lower.as_str())
+                    || declared_names.contains(&lower)
                 {
-                    Some((
-                        tag_name.to_string(),
-                        EntityNode {
-                            uuid: uuid::Uuid::new_v4(),
-                            name: tag_name.to_string(),
-                            labels: vec![EntityLabel::Technology],
-                            created_at: now,
-                            last_seen_at: now,
-                            mention_count: 1,
-                            summary: String::new(),
-                            attributes: HashMap::new(),
-                            name_embedding: None,
-                            salience: 0.6,
-                            is_proper_noun: false,
-                            pii_classification: Default::default(),
-                        },
-                    ))
-                } else {
-                    None
+                    return None;
                 }
+                let (label, salience) = if admission.tag_admission {
+                    if ner_claimed.contains(&lower) {
+                        return None;
+                    }
+                    let label = match recognised_tag_label(tag_name) {
+                        Some(label) => label,
+                        // Asserted to exist, of no recognised type.
+                        None if writer_named.contains(&lower) => EntityLabel::Concept,
+                        None => return None,
+                    };
+                    let salience = EntityExtractor::calculate_base_salience(&label, false);
+                    (label, salience)
+                } else {
+                    (EntityLabel::Technology, 0.6)
+                };
+                Some((
+                    tag_name.to_string(),
+                    EntityNode {
+                        uuid: uuid::Uuid::new_v4(),
+                        name: tag_name.to_string(),
+                        labels: vec![label],
+                        created_at: now,
+                        last_seen_at: now,
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: HashMap::new(),
+                        name_embedding: None,
+                        salience,
+                        is_proper_noun: false,
+                        pii_classification: Default::default(),
+                    },
+                ))
             })
             .collect();
 
@@ -4763,10 +4854,15 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
-        // Extract verbs for multi-hop reasoning
-        let analysis = query_parser::analyze_query(&experience.content);
+        // Verb nodes, off unless switched on (upstream #260 dropped them): each took a slot
+        // of the per-memory cap and joined every memory that used the same verb.
+        let relational_context = if admission.verb_entities {
+            query_parser::analyze_query(&experience.content).relational_context
+        } else {
+            Vec::new()
+        };
         let mut verb_entities: Vec<(String, EntityNode)> = Vec::new();
-        for verb in &analysis.relational_context {
+        for verb in &relational_context {
             let verb_text = verb.text.as_str();
             let verb_stem = verb.stem.as_str();
 
@@ -4850,6 +4946,17 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
+        // Semantic relation typing (upstream relation_typer, on by default since 9f632af5):
+        // each pair's sentence, template-normalised, against embedded exemplars. The encodes
+        // run here, before the graph lock. The memory system is only try-read: a writer
+        // holding it skips typing for this memory rather than wait on it.
+        let semantic_pairs: HashMap<(String, String), (RelationType, bool)> =
+            if admission.semantic_relations && all_entities.len() >= 2 {
+                self.semantic_relation_pairs(user_id, &experience.content, &all_entities, admission)
+            } else {
+                HashMap::new()
+            };
+
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
         // Only fast I/O operations happen here.
@@ -4862,31 +4969,64 @@ impl MultiUserMemoryManager {
         let mut declared_weight: Vec<Option<f32>> = Vec::new();
         // Per entry: a derived entity already at the degree cap takes no new edges.
         let mut at_cap: Vec<bool> = Vec::new();
+        // Per entry: the episodes that have mentioned the entity, this one included (the
+        // document frequency of the PMI gate). Declared entries are exempt and hold 1.
+        let mut mentions: Vec<usize> = Vec::new();
+        // Per entry: selectivity from the last heavy maintenance cycle, None when unscored.
+        // Declared entries are exempt and hold None.
+        let mut selectivity: Vec<Option<f32>> = Vec::new();
+        // Per entry: the label this memory gave the entity, which types its edges by label
+        // pair. The stored node may carry more, merged from other memories.
+        let mut primary_label: Vec<EntityLabel> = Vec::new();
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
+            let label = entity
+                .labels
+                .first()
+                .cloned()
+                .unwrap_or(EntityLabel::Concept);
             match graph_guard.add_entity(entity) {
                 Ok(uuid) => {
                     let hub = match graph_guard.entity_degree(&uuid) {
-                        Ok(degree) => degree >= crate::constants::MAX_ENTITY_DEGREE,
+                        Ok(degree) => degree > admission.hub_degree_max,
                         Err(e) => {
                             tracing::debug!("Degree read failed for {}: {}", name, e);
                             false
                         }
                     };
+                    let mention_count = match graph_guard.get_entity(&uuid) {
+                        Ok(Some(node)) => node.mention_count,
+                        Ok(None) => 1,
+                        Err(e) => {
+                            tracing::debug!("Mention count read failed for {}: {}", name, e);
+                            1
+                        }
+                    };
+                    selectivity.push(graph_guard.entity_selectivity(&uuid));
                     entity_uuids.push((name, uuid));
                     declared_weight.push(None);
                     at_cap.push(hub);
+                    mentions.push(mention_count);
+                    primary_label.push(label);
                 }
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
             }
         }
         for (name, entity, weight) in declared_nodes {
+            let label = entity
+                .labels
+                .first()
+                .cloned()
+                .unwrap_or(EntityLabel::Concept);
             match graph_guard.add_entity(entity) {
                 Ok(uuid) => {
                     entity_uuids.push((name, uuid));
                     declared_weight.push(Some(weight));
                     at_cap.push(false);
+                    mentions.push(1);
+                    selectivity.push(None);
+                    primary_label.push(label);
                 }
                 Err(e) => tracing::debug!("Failed to add declared entity {}: {}", name, e),
             }
@@ -4926,6 +5066,8 @@ impl MultiUserMemoryManager {
                 tracing::warn!("Failed to add episode: {}", e);
             }
         }
+        // N of the PMI gate: the user's episodes, this one included.
+        let total_episodes = graph_guard.total_episode_count().max(1) as f32;
 
         // Create relationships between co-occurring entities
         // Pre-compute truncated context once (avoids re-allocating per edge)
@@ -4981,11 +5123,30 @@ impl MultiUserMemoryManager {
             .collect();
 
         let mut hub_edges_skipped = 0u64;
+        let mut pmi_gated = 0usize;
+        let mut selectivity_skipped = 0usize;
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
+                // Two names `add_entity` resolved to one node (a case, stem or concept merge)
+                // are one entity, and an edge from it to itself relates nothing.
+                if entity_uuids[i].1 == entity_uuids[j].1 {
+                    continue;
+                }
                 if at_cap[i] || at_cap[j] {
                     hub_edges_skipped += 1;
                     continue;
+                }
+                // Selectivity skip (upstream #214): two entities that each spread their edges
+                // evenly over the graph co-occur out of habit, not association.
+                if admission.selectivity_skip {
+                    if let (Some(si), Some(sj)) = (selectivity[i], selectivity[j]) {
+                        if si < crate::constants::GRAPH_LOW_SELECTIVITY
+                            && sj < crate::constants::GRAPH_LOW_SELECTIVITY
+                        {
+                            selectivity_skipped += 1;
+                            continue;
+                        }
+                    }
                 }
                 let declared_strength = match (declared_weight[i], declared_weight[j]) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -5005,7 +5166,34 @@ impl MultiUserMemoryManager {
                 } else {
                     None
                 };
-                let relation_type = match cue_hit {
+                // Typing chain, upstream's order: the sentence's cue, the semantic typer, then
+                // the label pair (upstream #260). A fragment of a co-mentioned name is
+                // never typed, and a causal type needs two causal candidates, as a cue does.
+                let fragment = fragment_of_comention[i] || fragment_of_comention[j];
+                let semantic_hit = if cue_hit.is_none() && !fragment {
+                    semantic_pairs
+                        .get(&(entity_uuids[i].0.clone(), entity_uuids[j].0.clone()))
+                        .filter(|(rt, _)| {
+                            !rt.is_causal() || (causal_candidate[i] && causal_candidate[j])
+                        })
+                        .cloned()
+                } else {
+                    None
+                };
+                let label_hit = if cue_hit.is_none()
+                    && semantic_hit.is_none()
+                    && admission.label_pair_typing
+                    && !fragment
+                {
+                    crate::graph_memory::infer_relation_type_for_pair(
+                        &primary_label[i],
+                        &primary_label[j],
+                        admission.person_person_knows,
+                    )
+                } else {
+                    None
+                };
+                let relation_type = match cue_hit.or(semantic_hit).or(label_hit) {
                     Some((rt, a_is_source)) => {
                         if !a_is_source {
                             std::mem::swap(&mut from_entity, &mut to_entity);
@@ -5014,6 +5202,25 @@ impl MultiUserMemoryManager {
                     }
                     None => RelationType::RelatedTo,
                 };
+                // PMI gate (upstream #336/#364): a generic edge whose pair co-occurs no more
+                // than chance is never born. At birth the pair has co-occurred once, so
+                // PMI = log2(N / (df_i * df_j)). A typed edge, a fragment bridge and an edge to
+                // a declared entity carry grounding the statistic lacks and are kept.
+                if admission.pmi_gate
+                    && declared_strength.is_none()
+                    && !fragment_of_comention[i]
+                    && !fragment_of_comention[j]
+                    && matches!(
+                        relation_type,
+                        RelationType::RelatedTo | RelationType::CoOccurs
+                    )
+                {
+                    let df = mentions[i].max(1) as f32 * mentions[j].max(1) as f32;
+                    if (total_episodes / df).log2() < admission.pmi_gate_min {
+                        pmi_gated += 1;
+                        continue;
+                    }
+                }
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
                     from_entity,
@@ -5065,9 +5272,74 @@ impl MultiUserMemoryManager {
                 "Skipped co-occurrence edges on entities already at the degree cap"
             );
         }
+        if pmi_gated + selectivity_skipped > 0 {
+            tracing::debug!(
+                memory_id = %memory_id.0,
+                pmi_gated,
+                selectivity_skipped,
+                "Co-occurrence edges not born: chance co-occurrence, or two low-selectivity hubs"
+            );
+        }
         // Lock released here
 
         Ok(())
+    }
+
+    /// The semantic typer's relation for each entity pair of a memory, keyed by the pair's
+    /// names in `entities` order. Fragments of a co-mentioned name are not typed and spend no
+    /// encode, and at most `SEMANTIC_RELATION_MAX_PAIRS` pairs are encoded. Empty when the
+    /// user's memory system is held by a writer.
+    fn semantic_relation_pairs(
+        &self,
+        user_id: &str,
+        content: &str,
+        entities: &[(String, EntityNode)],
+        admission: GraphAdmission,
+    ) -> HashMap<(String, String), (RelationType, bool)> {
+        let mut typed = HashMap::new();
+        let Ok(system) = self.get_user_memory(user_id) else {
+            return typed;
+        };
+        let Some(system) = system.try_read() else {
+            tracing::debug!("semantic relation typing skipped: user system busy");
+            return typed;
+        };
+        let embedder = system.get_embedder();
+        let lowered: Vec<String> = entities.iter().map(|(n, _)| n.to_lowercase()).collect();
+        let fragment: Vec<bool> = (0..lowered.len())
+            .map(|k| {
+                lowered.iter().enumerate().any(|(m, other)| {
+                    m != k && other.len() > lowered[k].len() && other.contains(&lowered[k])
+                })
+            })
+            .collect();
+        let mut budget = crate::constants::SEMANTIC_RELATION_MAX_PAIRS;
+        'pairs: for i in 0..entities.len() {
+            for j in (i + 1)..entities.len() {
+                if fragment[i] || fragment[j] {
+                    continue;
+                }
+                if budget == 0 {
+                    break 'pairs;
+                }
+                budget -= 1;
+                if let Some((rt, a_is_source, _)) =
+                    crate::embeddings::relation_typer::RELATION_TYPER.type_relation(
+                        embedder,
+                        content,
+                        &entities[i].0,
+                        &entities[j].0,
+                        admission.semantic_min_cosine,
+                    )
+                {
+                    typed.insert(
+                        (entities[i].0.clone(), entities[j].0.clone()),
+                        (rt, a_is_source),
+                    );
+                }
+            }
+        }
+        typed
     }
 }
 
@@ -5780,6 +6052,656 @@ mod shared_store_bootstrap_tests {
     }
 }
 
+/// `default`, unless `name` is set to `0`/`false` (off) or `1`/`true` (on).
+fn env_switch(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => match v.trim() {
+            "0" => false,
+            "1" => true,
+            v if v.eq_ignore_ascii_case("false") => false,
+            v if v.eq_ignore_ascii_case("true") => true,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+/// `name` parsed as `T`, or `default` when it is unset or does not parse.
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// The graph-admission switches (the GRAPH ADMISSION section of [`crate::constants`]), read
+/// once per graph write so a harness arm can set them after start-up.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphAdmission {
+    /// The NER confidence floor and verb-noise list at graph insertion.
+    pub(crate) ner_noise_gate: bool,
+    /// A tag becomes a node only on an authority, and never beside the NER node it twins.
+    pub(crate) tag_admission: bool,
+    /// Relational verbs and their stems become nodes (off: upstream #260).
+    pub(crate) verb_entities: bool,
+    /// A derived entity of higher degree accretes no new edge. Held under
+    /// [`crate::constants::MAX_ENTITY_DEGREE`], where every new edge only buys a prune.
+    pub(crate) hub_degree_max: usize,
+    /// A generic edge is born only when its pair's PMI reaches `pmi_gate_min`.
+    pub(crate) pmi_gate: bool,
+    pub(crate) pmi_gate_min: f32,
+    /// No edge between two entities a heavy cycle scored as low-selectivity hubs.
+    pub(crate) selectivity_skip: bool,
+    /// An edge the sentence does not type takes the type its label pair implies.
+    pub(crate) label_pair_typing: bool,
+    /// Two people are typed `Knows` (off: upstream).
+    pub(crate) person_person_knows: bool,
+    /// The semantic typer types a pair whose nearest exemplar reaches `semantic_min_cosine`.
+    pub(crate) semantic_relations: bool,
+    pub(crate) semantic_min_cosine: f32,
+}
+
+impl GraphAdmission {
+    pub(crate) fn from_env() -> Self {
+        use crate::constants as c;
+        Self {
+            ner_noise_gate: env_switch(c::NER_GRAPH_NOISE_GATE_ENV, true),
+            tag_admission: env_switch(c::GRAPH_TAG_ADMISSION_ENV, true),
+            verb_entities: env_switch(c::GRAPH_VERB_ENTITIES_ENV, false),
+            hub_degree_max: env_number(c::GRAPH_HUB_DEGREE_MAX_ENV, c::GRAPH_HUB_DEGREE_MAX)
+                .min(c::MAX_ENTITY_DEGREE - 1),
+            pmi_gate: env_switch(c::GRAPH_PMI_GATE_ENV, true),
+            pmi_gate_min: env_number(c::GRAPH_PMI_GATE_MIN_ENV, c::GRAPH_PMI_GATE_MIN),
+            selectivity_skip: env_switch(c::GRAPH_SELECTIVITY_SKIP_ENV, true),
+            label_pair_typing: env_switch(c::GRAPH_LABEL_PAIR_TYPING_ENV, true),
+            person_person_knows: env_switch(c::GRAPH_PERSON_PERSON_KNOWS_ENV, false),
+            semantic_relations: env_switch(c::SEMANTIC_RELATIONS_ENV, true),
+            semantic_min_cosine: env_number(
+                c::SEMANTIC_RELATION_MIN_COSINE_ENV,
+                c::SEMANTIC_RELATION_MIN_COSINE,
+            ),
+        }
+    }
+}
+
+/// Whether a NER span becomes a graph node.
+///
+/// Port of upstream shodh-memory #573 (902daf83), adapted to veld's typer.
+/// Upstream found that a confidence floor calibrated for BERT-tiny's per-token
+/// softmax, where real names score 0.9+, rejected 88–95% of the spans GLiNER's
+/// per-span sigmoid commits (every PER span on the first 50 LoCoMo gate turns),
+/// and redefined the floor as the typer's own commit threshold. veld's two
+/// confidence rules here were written against the same BERT-tiny distribution:
+/// a lowercase span needed 0.7 and a span under five characters needed 0.8.
+/// The rule-based fallback typer scales salience into 0.54–0.81, so a
+/// four-letter name it typed `PER` ("Nate") failed the short-span rule and
+/// never became a node while a six-letter one ("Joanna") did, and GLiNER's
+/// PER spans fail both rules.
+///
+/// A PER, ORG or LOC label is the typer's claim that the span denotes a person,
+/// organisation or place; that claim is the authority for a node, and a
+/// confidence number from a differently scaled model must not overrule it.
+/// Both confidence rules therefore apply only to `MISC`, the label the typers
+/// give to spans they could not place and the fallback NER gives to generic
+/// nouns, where a confidence floor still earns its keep against verb noise.
+///
+/// The absolute floor of upstream #261 ([`crate::constants::NER_GRAPH_CONFIDENCE_FLOOR`])
+/// binds `MISC` too, and only `MISC`. Upstream applies it to every label, but there it
+/// equals GLiNER's commit threshold, so it never rejects a span the typer committed;
+/// veld's floor is the fallback's 0.5, which would reject the GLiNER-scaled PER spans
+/// above. It catches stored records a rebuild replays from before the fallback had a
+/// floor.
+///
+/// The length, stop-word, verb-noise and declared-name rules apply to every label: a
+/// declared name is already the declared entity, and a stop word or a verb names
+/// nothing whatever label it carries. `noise_gate` off
+/// ([`crate::constants::NER_GRAPH_NOISE_GATE_ENV`]) drops the floor and the verb list.
+fn ner_span_becomes_node(
+    span: &crate::embeddings::ner::NerEntity,
+    stop_words: &std::collections::HashSet<&str>,
+    declared_names: &std::collections::HashSet<String>,
+    noise_gate: bool,
+) -> bool {
+    let name = span.text.trim();
+    if name.len() < crate::constants::NER_ENTITY_MIN_LENGTH {
+        return false;
+    }
+    let lower = name.to_lowercase();
+    if stop_words.contains(lower.as_str()) || declared_names.contains(&lower) {
+        return false;
+    }
+    if noise_gate && crate::constants::NER_VERB_NOISE.contains(&lower.as_str()) {
+        return false;
+    }
+    if matches!(span.entity_type, NerEntityType::Misc) {
+        if noise_gate && span.confidence < crate::constants::NER_GRAPH_CONFIDENCE_FLOOR {
+            return false;
+        }
+        if !name.chars().any(|c| c.is_uppercase()) && span.confidence < 0.7 {
+            return false;
+        }
+        if name.len() < 5 && span.confidence < 0.8 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod ner_span_admission_tests {
+    use super::*;
+    use crate::embeddings::ner::NerEntity;
+
+    fn span(text: &str, entity_type: NerEntityType, confidence: f32) -> NerEntity {
+        NerEntity {
+            text: text.to_string(),
+            entity_type,
+            confidence,
+            start: 0,
+            end: text.len(),
+        }
+    }
+
+    fn admitted_with(span: &NerEntity, noise_gate: bool) -> bool {
+        let stop_words: std::collections::HashSet<&str> = ["the", "team"].into_iter().collect();
+        let declared: std::collections::HashSet<String> = ["joanna".to_string()].into();
+        ner_span_becomes_node(span, &stop_words, &declared, noise_gate)
+    }
+
+    fn admitted(span: &NerEntity) -> bool {
+        admitted_with(span, true)
+    }
+
+    /// A four-letter PER span at the fallback typer's confidence was the exact
+    /// shape the short-span rule rejected: "Nate" at 0.72 never became a node.
+    #[test]
+    fn a_short_typed_person_span_is_admitted_at_fallback_confidence() {
+        assert!(admitted(&span("Nate", NerEntityType::Person, 0.72)));
+    }
+
+    /// GLiNER commits PER spans in the 0.3–0.6 band; the label is the authority.
+    #[test]
+    fn typed_spans_are_admitted_regardless_of_confidence() {
+        for ty in [
+            NerEntityType::Person,
+            NerEntityType::Organization,
+            NerEntityType::Location,
+        ] {
+            assert!(admitted(&span("Nate", ty, 0.31)), "{ty:?}");
+            assert!(admitted(&span("nate", ty, 0.31)));
+        }
+    }
+
+    /// MISC keeps both confidence rules: it is where verb noise lands.
+    #[test]
+    fn misc_spans_still_need_confidence() {
+        assert!(!admitted(&span("pottery", NerEntityType::Misc, 0.65)));
+        assert!(admitted(&span("pottery", NerEntityType::Misc, 0.7)));
+        assert!(!admitted(&span("Oslo", NerEntityType::Misc, 0.79)));
+        assert!(admitted(&span("Oslo", NerEntityType::Misc, 0.8)));
+        assert!(admitted(&span("Covid", NerEntityType::Misc, 0.5)));
+    }
+
+    /// Length, stop-word and declared-name rules bind every label.
+    #[test]
+    fn structural_rules_apply_to_typed_spans_too() {
+        assert!(!admitted(&span("Al", NerEntityType::Person, 0.99)));
+        assert!(!admitted(&span("Team", NerEntityType::Organization, 0.99)));
+        assert!(!admitted(&span("Joanna", NerEntityType::Person, 0.99)));
+    }
+
+    /// A MISC span a typer would no longer commit stays out, whatever its shape, and a
+    /// listed verb or adjective is never a node under any label. Both go with the switch.
+    #[test]
+    fn misc_spans_under_the_floor_and_verb_noise_are_not_nodes() {
+        let floor = crate::constants::NER_GRAPH_CONFIDENCE_FLOOR;
+        let sub_floor = span("Pottery Class", NerEntityType::Misc, floor - 0.07);
+        assert!(!admitted(&sub_floor));
+        assert!(admitted_with(&sub_floor, false));
+        assert!(admitted(&span("Pottery Class", NerEntityType::Misc, floor)));
+
+        for (noise, ty) in [
+            ("Decided", NerEntityType::Misc),
+            ("Running", NerEntityType::Organization),
+            ("Important", NerEntityType::Person),
+        ] {
+            let noise = span(noise, ty, 0.95);
+            assert!(!admitted(&noise), "{noise:?}");
+            assert!(admitted_with(&noise, false), "{noise:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_admission_tests {
+    use super::*;
+    use crate::memory::tag_sources::{SourcedTag, TAG_SOURCES_SCHEMA};
+    use crate::memory::types::NerEntityRecord;
+
+    const USER: &str = "graph-admission";
+
+    fn manager(base: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: base.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(base.to_path_buf(), config).expect("manager")
+    }
+
+    fn person(name: &str) -> NerEntityRecord {
+        NerEntityRecord {
+            text: name.to_string(),
+            entity_type: "PER".to_string(),
+            confidence: 0.8,
+            start_char: None,
+            end_char: None,
+        }
+    }
+
+    fn ledger(tags: &[(&str, TagSource)]) -> TagSources {
+        TagSources {
+            v: TAG_SOURCES_SCHEMA,
+            tags: tags
+                .iter()
+                .map(|(tag, source)| SourcedTag {
+                    tag: tag.to_string(),
+                    source: *source,
+                    redacted: false,
+                })
+                .collect(),
+            redacted: Default::default(),
+        }
+    }
+
+    /// One memory naming `people`, with no tags, built into the graph.
+    fn write_people(mgr: &MultiUserMemoryManager, people: &[&str], admission: GraphAdmission) {
+        let experience = Experience {
+            content: format!("{} met.", people.join(" and ")),
+            ner_entities: people.iter().map(|p| person(p)).collect(),
+            ..Default::default()
+        };
+        mgr.build_experience_graph(
+            USER,
+            &experience,
+            &MemoryId(uuid::Uuid::new_v4()),
+            &[],
+            None,
+            admission,
+        )
+        .expect("graph write");
+    }
+
+    fn joined(mgr: &MultiUserMemoryManager, a: &str, b: &str) -> bool {
+        let graph = mgr.get_user_graph(USER).expect("graph");
+        let graph = graph.read();
+        let id = |name: &str| {
+            graph
+                .find_entity_by_name_strict(name)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{name} is not a node"))
+                .uuid
+        };
+        let (a, b) = (id(a), id(b));
+        graph
+            .get_all_relationships()
+            .expect("edges")
+            .iter()
+            .any(|e| e.joins(&a, &b))
+    }
+
+    /// Every gate off, so a test can switch on the one it measures.
+    fn legacy() -> GraphAdmission {
+        let mut admission = GraphAdmission::from_env();
+        admission.ner_noise_gate = false;
+        admission.tag_admission = false;
+        // Except verb nodes: they would join every memory through "met".
+        admission.verb_entities = false;
+        admission.hub_degree_max = crate::constants::MAX_ENTITY_DEGREE - 1;
+        admission.pmi_gate = false;
+        admission.selectivity_skip = false;
+        admission.label_pair_typing = false;
+        admission.semantic_relations = false;
+        admission
+    }
+
+    fn tagged_turn() -> (Experience, TagSources) {
+        let tags = ["kestrel", "rocksdb", "support group", "Caroline"];
+        let experience = Experience {
+            content: "Caroline told the kestrel club about rocksdb at the support group.".into(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            entities: tags.iter().map(|t| t.to_string()).collect(),
+            ner_entities: vec![person("Caroline")],
+            ..Default::default()
+        };
+        let sources = ledger(&[
+            ("kestrel", TagSource::Caller),
+            ("rocksdb", TagSource::Yake),
+            ("support group", TagSource::Yake),
+            ("Caroline", TagSource::Ner),
+        ]);
+        (experience, sources)
+    }
+
+    fn labels(mgr: &MultiUserMemoryManager, name: &str) -> Option<Vec<EntityLabel>> {
+        let graph = mgr.get_user_graph(USER).expect("graph");
+        let graph = graph.read();
+        graph
+            .find_entity_by_name_strict(name)
+            .expect("lookup")
+            .map(|e| e.labels)
+    }
+
+    #[test]
+    fn a_tag_becomes_a_node_only_on_an_authority_and_never_beside_its_ner_twin() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let (experience, sources) = tagged_turn();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(
+            USER,
+            &experience,
+            &id,
+            &[],
+            Some(&sources),
+            GraphAdmission::from_env(),
+        )
+        .unwrap();
+
+        assert_eq!(labels(&mgr, "kestrel"), Some(vec![EntityLabel::Concept]));
+        assert_eq!(labels(&mgr, "rocksdb"), Some(vec![EntityLabel::Database]));
+        assert_eq!(labels(&mgr, "support group"), None, "a YAKE keyphrase");
+        assert_eq!(labels(&mgr, "Caroline"), Some(vec![EntityLabel::Person]));
+    }
+
+    #[test]
+    fn without_a_ledger_row_only_a_naming_convention_admits_a_tag() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let (experience, _) = tagged_turn();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(
+            USER,
+            &experience,
+            &id,
+            &[],
+            None,
+            GraphAdmission::from_env(),
+        )
+        .unwrap();
+
+        assert_eq!(labels(&mgr, "kestrel"), None);
+        assert_eq!(labels(&mgr, "rocksdb"), Some(vec![EntityLabel::Database]));
+    }
+
+    #[test]
+    fn with_tag_admission_off_every_tag_is_a_technology_node() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let (experience, sources) = tagged_turn();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(USER, &experience, &id, &[], Some(&sources), legacy())
+            .unwrap();
+
+        assert_eq!(
+            labels(&mgr, "support group"),
+            Some(vec![EntityLabel::Technology])
+        );
+        let caroline = labels(&mgr, "Caroline").expect("node");
+        assert!(caroline.contains(&EntityLabel::Technology), "{caroline:?}");
+    }
+
+    /// The NER span and its tag twin resolve to one node; the pair loop used to join it to
+    /// itself.
+    #[test]
+    fn two_names_for_one_node_make_no_self_loop() {
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let experience = Experience {
+            content: "Caroline painted a lake.".into(),
+            tags: vec!["Caroline".into()],
+            entities: vec!["Caroline".into()],
+            ner_entities: vec![person("Caroline")],
+            ..Default::default()
+        };
+        let id = MemoryId(uuid::Uuid::new_v4());
+        mgr.build_experience_graph(USER, &experience, &id, &[], None, legacy())
+            .unwrap();
+
+        let graph = mgr.get_user_graph(USER).unwrap();
+        let edges = graph.read().get_all_relationships().unwrap();
+        assert!(
+            edges.iter().all(|e| e.from_entity != e.to_entity),
+            "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn verbs_become_nodes_only_when_switched_on() {
+        let verb_nodes = |admission: GraphAdmission| {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            let experience = Experience {
+                content: "Caroline wanted a kestrel and tried painting one.".into(),
+                ner_entities: vec![person("Caroline")],
+                ..Default::default()
+            };
+            let id = MemoryId(uuid::Uuid::new_v4());
+            mgr.build_experience_graph(USER, &experience, &id, &[], None, admission)
+                .unwrap();
+            let graph = mgr.get_user_graph(USER).unwrap();
+            let entities = graph.read().get_all_entities().unwrap();
+            entities
+                .iter()
+                .filter(|e| e.labels.contains(&EntityLabel::Other("Verb".into())))
+                .count()
+        };
+        let mut verbs_on = GraphAdmission::from_env();
+        verbs_on.verb_entities = true;
+        assert_eq!(verb_nodes(GraphAdmission::from_env()), 0);
+        assert!(verb_nodes(verbs_on) > 0);
+    }
+
+    #[test]
+    fn an_entity_past_the_hub_cap_takes_no_new_edge() {
+        let mut capped = legacy();
+        capped.hub_degree_max = 2;
+        for (admission, joined_after) in [(capped, false), (legacy(), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            write_people(&mgr, &["Hubert", "Alma", "Boris", "Celia"], admission);
+            write_people(&mgr, &["Hubert", "Delphine"], admission);
+            assert_eq!(joined(&mgr, "Hubert", "Delphine"), joined_after);
+            assert!(joined(&mgr, "Hubert", "Celia"), "edges below the cap stay");
+        }
+    }
+
+    /// Xavier and Yusuf are each in three of five episodes: together they are likelier by
+    /// chance than not, so no edge is born. Each still joins the newcomer Zelda.
+    #[test]
+    fn a_pair_that_cooccurs_no_more_than_chance_is_not_joined() {
+        let mut gated = legacy();
+        gated.pmi_gate = true;
+        for (admission, pair_joined) in [(gated, false), (legacy(), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            for people in [
+                ["Xavier", "Abel"],
+                ["Xavier", "Amos"],
+                ["Yusuf", "Bruno"],
+                ["Yusuf", "Boris"],
+            ] {
+                write_people(&mgr, &people, admission);
+            }
+            write_people(&mgr, &["Xavier", "Yusuf", "Zelda"], admission);
+            assert_eq!(joined(&mgr, "Xavier", "Yusuf"), pair_joined);
+            assert!(joined(&mgr, "Xavier", "Zelda"));
+            assert!(joined(&mgr, "Yusuf", "Zelda"));
+        }
+    }
+
+    /// Two star hubs, each joined to three one-edge leaves, score selectivity 0 once a
+    /// maintenance pass has scored the graph; an edge between them is not born.
+    #[test]
+    fn two_low_selectivity_hubs_are_not_joined() {
+        let mut skipping = legacy();
+        skipping.selectivity_skip = true;
+        for (admission, hubs_joined) in [(skipping, false), (legacy(), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            for leaf in ["Alma", "Amos", "Abel"] {
+                write_people(&mgr, &["Hubert", leaf], admission);
+            }
+            for leaf in ["Boris", "Bruno", "Bodil"] {
+                write_people(&mgr, &["Horace", leaf], admission);
+            }
+            let graph = mgr.get_user_graph(USER).unwrap();
+            assert_eq!(graph.read().compute_entity_selectivity().unwrap(), 8);
+            write_people(&mgr, &["Hubert", "Horace"], admission);
+            assert_eq!(joined(&mgr, "Hubert", "Horace"), hubs_joined);
+        }
+    }
+
+    /// The place is listed first; the edge still points from the person.
+    #[test]
+    fn an_untyped_pair_takes_the_relation_its_labels_imply() {
+        let place = NerEntityRecord {
+            text: "Boston".to_string(),
+            entity_type: "LOC".to_string(),
+            confidence: 0.8,
+            start_char: None,
+            end_char: None,
+        };
+        for (typing, expected) in [
+            (true, RelationType::LocatedIn),
+            (false, RelationType::RelatedTo),
+        ] {
+            let mut admission = GraphAdmission::from_env();
+            admission.label_pair_typing = typing;
+            admission.semantic_relations = false;
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            let experience = Experience {
+                content: "Boston is where Caroline lives now.".into(),
+                ner_entities: vec![place.clone(), person("Caroline")],
+                ..Default::default()
+            };
+            let id = MemoryId(uuid::Uuid::new_v4());
+            mgr.build_experience_graph(USER, &experience, &id, &[], None, admission)
+                .unwrap();
+
+            let graph = mgr.get_user_graph(USER).unwrap();
+            let graph = graph.read();
+            let caroline = graph
+                .find_entity_by_name_strict("Caroline")
+                .unwrap()
+                .unwrap()
+                .uuid;
+            let edges = graph.get_all_relationships().unwrap();
+            assert_eq!(edges.len(), 1, "{edges:?}");
+            assert_eq!(edges[0].relation_type, expected);
+            if typing {
+                assert_eq!(edges[0].from_entity, caroline);
+            }
+        }
+    }
+
+    /// `(edges, typed edges)` after a short conversation goes through the write path: the
+    /// fallback NER, `remember`'s tag assembly with its YAKE keywords and provenance ledger,
+    /// then the graph write under `admission`.
+    fn conversation_edges(admission: GraphAdmission) -> (usize, usize) {
+        const TURNS: [&str; 6] = [
+            "Caroline: I went to the LGBTQ support group yesterday and it was so powerful.",
+            "Melanie: That sounds amazing, Caroline. I painted a sunrise by the lake last week.",
+            "Caroline: I moved to Boston from Sweden four years ago with my mom.",
+            "Melanie: My kids and I went camping in the mountains near Seattle.",
+            "Caroline: I am researching adoption agencies because I want to be a mom.",
+            "Melanie: Pottery class is my favorite way to relax after work, Caroline.",
+        ];
+        let home = tempfile::tempdir().unwrap();
+        let mgr = manager(home.path());
+        let ner = NeuralNer::new_fallback(NerConfig::default());
+        let keywords = mgr.get_keyword_extractor();
+        for turn in TURNS {
+            let records: Vec<NerEntityRecord> = ner
+                .extract(turn)
+                .unwrap()
+                .into_iter()
+                .map(|e| NerEntityRecord {
+                    text: e.text,
+                    entity_type: e.entity_type.as_str().to_string(),
+                    confidence: e.confidence,
+                    start_char: Some(e.start),
+                    end_char: Some(e.end),
+                })
+                .collect();
+            let assembled = crate::handlers::remember::assemble_tags(
+                &mgr,
+                USER,
+                &mut Vec::new(),
+                crate::handlers::remember::TagInputs {
+                    content: turn,
+                    filename: None,
+                    tags: &[],
+                    intent_tags: &[],
+                    ingest_tags: &[],
+                    ner_entities: records,
+                    keywords: keywords.extract_texts(turn),
+                },
+            );
+            let experience = Experience {
+                content: turn.to_string(),
+                entities: assembled.entities.clone(),
+                tags: assembled.entities,
+                ner_entities: assembled.ner_entities,
+                ..Default::default()
+            };
+            let id = MemoryId(uuid::Uuid::new_v4());
+            mgr.build_experience_graph(
+                USER,
+                &experience,
+                &id,
+                &[],
+                Some(&assembled.labelled),
+                admission,
+            )
+            .unwrap();
+        }
+        let graph = mgr.get_user_graph(USER).unwrap();
+        let edges = graph.read().get_all_relationships().unwrap();
+        let typed = edges
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e.relation_type,
+                    RelationType::RelatedTo | RelationType::CoOccurs | RelationType::CoRetrieved
+                )
+            })
+            .count();
+        (edges.len(), typed)
+    }
+
+    /// The measurement behind this gate set, at test scale: on the LoCoMo gate veld wrote
+    /// 9,965 edges, none typed, where upstream wrote 615, 8.6% typed. The semantic typer is
+    /// off on both sides so the typed count does not depend on which embedder loads.
+    #[test]
+    fn a_short_conversation_yields_fewer_edges_and_typed_ones() {
+        let mut before = legacy();
+        before.verb_entities = true;
+        let mut after = GraphAdmission::from_env();
+        after.semantic_relations = false;
+
+        let (edges_before, typed_before) = conversation_edges(before);
+        let (edges_after, typed_after) = conversation_edges(after);
+        assert_eq!(typed_before, 0, "the old graph typed only causal cues");
+        assert!(
+            edges_after * 2 < edges_before,
+            "gated {edges_after} edges against {edges_before} ungated"
+        );
+        assert!(typed_after > 0, "{typed_after} of {edges_after} typed");
+    }
+}
+
 /// Annotate a query with NER-extracted entity names.
 ///
 /// Off with `VELD_QUERY_NER=0`. Entities below 0.5 confidence or shorter than
@@ -6234,6 +7156,94 @@ mod reserved_dir_tests {
         assert!(manager.get_user_memory("instances").is_err());
         assert!(!root.path().join("instances").exists());
         assert!(manager.user_dir("alice").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod bm25_rebuild_replay_tests {
+    use super::*;
+    use crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION;
+    use crate::intent_log::IntentPayload;
+    use crate::memory::types::Experience;
+
+    fn manager(root: &std::path::Path) -> MultiUserMemoryManager {
+        let config = ServerConfig {
+            storage_path: root.to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        MultiUserMemoryManager::new(root.to_path_buf(), config).unwrap()
+    }
+
+    fn lighthouse_hits(manager: &MultiUserMemoryManager) -> usize {
+        manager
+            .get_user_bm25_index("u")
+            .unwrap()
+            .search("lighthouse", 5)
+            .unwrap()
+            .len()
+    }
+
+    /// The BM25 checkpoint describes the index `BM25Index::new` discarded, so a writer open
+    /// that finds the rebuild marker must replay the log from its start, not resume.
+    #[test]
+    fn a_rebuilt_index_is_refilled_from_the_whole_log_and_its_marker_cleared() {
+        let root = tempfile::TempDir::new().unwrap();
+        {
+            let manager = manager(root.path());
+            let user_mem = manager.get_user_memory("u").unwrap();
+            let id = user_mem
+                .read()
+                .remember(
+                    Experience {
+                        content: "the lighthouse keeper writes letters every winter".into(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let mem = user_mem.read().get_memory(&id).unwrap();
+            let memory_bincode =
+                bincode::serde::encode_to_vec(&mem, bincode::config::standard()).unwrap();
+            manager
+                .journal_and_apply(
+                    "u",
+                    &IntentPayload::Remember {
+                        user_id: "u".into(),
+                        memory_id: id.0.to_string(),
+                        memory_bincode,
+                        schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+                    },
+                )
+                .unwrap();
+        }
+        let bm25_path = {
+            // This open's replay commits the index and persists a checkpoint past the record.
+            let manager = manager(root.path());
+            manager.get_user_journaled_writer("u").unwrap();
+            assert_eq!(lighthouse_hits(&manager), 1);
+            manager
+                .user_dir("u")
+                .unwrap()
+                .join(crate::memory::BM25_INDEX_DIR)
+        };
+
+        // A start that died after `BM25Index::new` recreated the index and before the replay
+        // committed: an empty index under the current schema, the marker still present.
+        std::fs::remove_dir_all(&bm25_path).unwrap();
+        crate::memory::BM25Index::new(&bm25_path).unwrap();
+        let marker =
+            bm25_path.with_file_name(format!("{}.rebuild-pending", crate::memory::BM25_INDEX_DIR));
+        std::fs::write(&marker, b"").unwrap();
+
+        let manager = manager(root.path());
+        manager.get_user_journaled_writer("u").unwrap();
+        assert_eq!(
+            lighthouse_hits(&manager),
+            1,
+            "resuming from the checkpoint would leave the rebuilt index empty"
+        );
+        assert!(!marker.exists(), "the marker outlived a committed replay");
     }
 }
 

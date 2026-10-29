@@ -525,6 +525,134 @@ impl EntityLabel {
     }
 }
 
+/// The salience multiplier an entity earns from `mentions` mentions: `1 + 0.1 × ln(mentions)`,
+/// which reaches [`crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST`] at about twenty
+/// mentions and stays there. One mention earns none.
+fn mention_frequency_boost(mentions: usize) -> f32 {
+    (1.0 + 0.1 * (mentions.max(1) as f32).ln())
+        .min(crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST)
+}
+
+/// Selectivity of an entity from the Forman-Ricci curvatures of its incident edges: their
+/// sample standard deviation divided by their count, or 1.0 under two edges, where there is
+/// no spread to measure (upstream #214).
+fn curvature_selectivity(incident: &[f32]) -> f32 {
+    let n = incident.len() as f32;
+    if incident.len() < 2 {
+        return 1.0;
+    }
+    let mean = incident.iter().sum::<f32>() / n;
+    let variance = incident.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / (n - 1.0);
+    variance.sqrt() / n
+}
+
+/// The ontological class a curated naming convention recognises in `tag`, or `None`.
+///
+/// Ported verbatim from upstream shodh-memory #509 (a292546f). Each rule recognises a
+/// convention only artifacts follow: a named product (`rocksdb`), a file (`config.toml`), a
+/// service (`auth-service`). A tag no rule recognises is a keyword: it describes the memory
+/// without naming anything, and it stays in `tags` for search and `recall_by_tags` without
+/// becoming a graph node (see `process_experience_into_graph_declared`).
+///
+/// Every rule matches a whole tag or a whole trailing token, never a bare substring:
+/// upstream's `contains("config")` once made the prose phrase "stobar configuration" a
+/// Configuration entity. Deployment-phase words ("production", "staging", "dev", "ci") are
+/// absent on purpose: they are English common nouns that denote no referent off a
+/// deployment log.
+pub fn recognised_tag_label(tag: &str) -> Option<EntityLabel> {
+    let lower = tag.to_lowercase();
+
+    /// Whether `lower` is `word`, or ends with `word` after a `-`, `_` or space
+    /// ("deploy-workflow" matches "workflow"; "workflows" does not).
+    fn is_trailing_token(lower: &str, word: &str) -> bool {
+        if lower == word {
+            return true;
+        }
+        lower
+            .strip_suffix(word)
+            .is_some_and(|prefix| prefix.ends_with(['-', '_', ' ']))
+    }
+
+    if matches!(
+        lower.as_str(),
+        "kubernetes" | "k8s" | "docker" | "aws" | "gcp" | "azure"
+    ) {
+        return Some(EntityLabel::Environment);
+    }
+
+    if is_trailing_token(&lower, "pipeline")
+        || is_trailing_token(&lower, "workflow")
+        || lower == "ci-cd"
+        || lower == "cicd"
+    {
+        return Some(EntityLabel::Pipeline);
+    }
+
+    if matches!(
+        lower.as_str(),
+        "rocksdb"
+            | "postgres"
+            | "postgresql"
+            | "redis"
+            | "sqlite"
+            | "mongodb"
+            | "mysql"
+            | "dynamodb"
+            | "s3"
+            | "cassandra"
+            | "elasticsearch"
+    ) || lower.ends_with("db")
+        || lower.ends_with("-db")
+        || lower.ends_with("_db")
+    {
+        return Some(EntityLabel::Database);
+    }
+
+    // Suffix-only, so "my-api-docs" is not a service.
+    if lower.ends_with("-service")
+        || lower.ends_with("_service")
+        || lower.ends_with("-api")
+        || lower.ends_with("_api")
+        || lower.ends_with("-server")
+        || lower.ends_with("_server")
+        || lower.ends_with("-daemon")
+    {
+        return Some(EntityLabel::Service);
+    }
+
+    // Before the module rules: README.md is a document, not a module.
+    if lower.ends_with(".md")
+        || is_trailing_token(&lower, "readme")
+        || is_trailing_token(&lower, "runbook")
+        || lower.ends_with("-rfc")
+        || lower.ends_with("-spec")
+    {
+        return Some(EntityLabel::Document);
+    }
+
+    if lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".env")
+        || lower.ends_with(".json")
+        || is_trailing_token(&lower, "config")
+    {
+        return Some(EntityLabel::Configuration);
+    }
+
+    if lower.ends_with(".rs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".js")
+        || lower.ends_with(".py")
+        || lower.ends_with("-lib")
+        || lower.ends_with("_lib")
+    {
+        return Some(EntityLabel::Module);
+    }
+
+    None
+}
+
 /// Memory tier for edge consolidation
 ///
 /// Based on hippocampal-cortical memory consolidation research:
@@ -2118,6 +2246,61 @@ pub fn extract_directed_predicate(
     ))
 }
 
+/// The relation the ontology implies between two co-mentioned entities by their labels alone,
+/// as `(relation, a_is_source)`, or `None` when no rule types the pair.
+///
+/// Ported from upstream shodh-memory #260 (`infer_relation_type_for_pair`), with two
+/// adaptations. Upstream matches only the pair in the order the memory listed it, so
+/// `(Organization, Person)` went untyped and `(Location, Person)` became a `LocatedIn` edge
+/// from the place; here the table is consulted in both orders and the edge points from the
+/// rule's first label. And where upstream falls back to `CoOccurs`, this returns `None`, so
+/// the caller keeps veld's generic `RelatedTo`: edges dedup by relation type, and a second
+/// generic type would fork every existing pair.
+///
+/// `(Person, Person)` is `Knows` only with `person_person_knows`, which upstream keeps off by
+/// default (`SHODH_PERSON_PERSON_KNOWS`): a typed edge is eligible for ontological penalties
+/// a generic one is not. Two technologies stay untyped: co-mention says nothing about
+/// substitutability.
+pub fn infer_relation_type_for_pair(
+    a: &EntityLabel,
+    b: &EntityLabel,
+    person_person_knows: bool,
+) -> Option<(RelationType, bool)> {
+    fn rule(from: &EntityLabel, to: &EntityLabel, knows: bool) -> Option<RelationType> {
+        use EntityLabel::*;
+        use RelationType::*;
+        Some(match (from, to) {
+            (Person, Person) if knows => Knows,
+            (Person, Organization) | (Person, Team) => WorksAt,
+            (Person, Technology) | (Person, Service) | (Person, Database) => Uses,
+            (Person, Skill) => Learned,
+            (Task, Person) | (Task, Team) => AssignedTo,
+            (Task, Technology) | (Task, Service) => Requires,
+            (Service, Database) => Uses,
+            (Module, Module) | (Service, Service) | (Module, Service) | (Service, Module) => {
+                DependsOn
+            }
+            (Pipeline, Service) | (Pipeline, Environment) => DeploysTo,
+            (Metric, Service) | (Metric, Pipeline) => Monitors,
+            (Configuration, Service) | (Configuration, Environment) => Configures,
+            (Document, Service)
+            | (Document, Module)
+            | (Document, Pipeline)
+            | (Document, Project) => Documents,
+            (Task, Project)
+            | (Document, Repository)
+            | (Repository, Project)
+            | (Module, Project)
+            | (Service, Project) => PartOf,
+            (_, Location) => LocatedIn,
+            _ => return None,
+        })
+    }
+    rule(a, b, person_person_knows)
+        .map(|rt| (rt, true))
+        .or_else(|| rule(b, a, person_person_knows).map(|rt| (rt, false)))
+}
+
 /// Episodic node representing a discrete experience/memory
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodicNode {
@@ -2241,6 +2424,11 @@ pub struct GraphMemory {
 
     /// Uuids of the entity and relationship rows written through `store`.
     change_log: Arc<GraphChangeLog>,
+
+    /// Entity selectivity from the last [`Self::compute_entity_selectivity`] pass. Held in
+    /// memory: empty until a heavy maintenance cycle scores the graph, and an entity it has
+    /// not scored reads as unknown, never as low.
+    entity_selectivity: parking_lot::RwLock<HashMap<Uuid, f32>>,
 }
 
 impl GraphMemory {
@@ -2458,6 +2646,7 @@ impl GraphMemory {
                 std::collections::VecDeque::new(),
             )),
             change_log,
+            entity_selectivity: parking_lot::RwLock::new(HashMap::new()),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
@@ -2862,8 +3051,10 @@ impl GraphMemory {
     }
 
     /// Add or update an entity node
-    /// Salience is updated using the formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
-    /// This means frequently mentioned entities grow in salience (gravitational wells get heavier)
+    /// Salience is updated using the formula: salience = base_salience * (1 + 0.1 * ln(mention_count)),
+    /// the boost capped at `ENTITY_SALIENCE_MAX_FREQUENCY_BOOST` and the result at 1.0, where
+    /// base_salience is the first mention's. Frequently mentioned entities grow in salience
+    /// (gravitational wells get heavier)
     ///
     /// BUG-002 FIX: Handles crash recovery for orphaned entities/stale indices
     pub fn add_entity(&self, mut entity: EntityNode) -> Result<Uuid> {
@@ -2951,11 +3142,14 @@ impl GraphMemory {
                     entity.name_embedding = existing.name_embedding;
                 }
 
-                // Update salience with frequency boost
-                // Formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
-                // This caps at about 1.3x boost at 20 mentions
-                let frequency_boost = 1.0 + 0.1 * (entity.mention_count as f32).ln();
-                entity.salience = (existing.salience * frequency_boost).min(1.0);
+                // salience = base × mention_frequency_boost(mentions), at most 1.0, base being
+                // the first mention's salience. The stored value already carries the boost for
+                // the previous count, so it is rescaled by the ratio of the two boosts.
+                // Multiplying it by the whole boost compounded on every mention.
+                entity.salience = (existing.salience
+                    * mention_frequency_boost(entity.mention_count)
+                    / mention_frequency_boost(existing.mention_count))
+                .min(1.0);
                 is_new_entity = false;
             } else {
                 // BUG-002 FIX: Stale index entry - entity in index but not in DB
@@ -4675,6 +4869,7 @@ impl GraphMemory {
         self.entity_lowercase_index.write().clear();
         self.entity_stemmed_index.write().clear();
         self.entity_path_suffix_index.write().clear();
+        self.entity_selectivity.write().clear();
 
         // Reset counters
         self.entity_count.store(0, Ordering::Relaxed);
@@ -6991,6 +7186,55 @@ impl GraphMemory {
             orphaned_entity_ids,
             orphaned_memory_ids: Vec::new(),
         })
+    }
+
+    /// Episodes in the graph: the N of the PMI gate at edge birth. O(1).
+    pub fn total_episode_count(&self) -> usize {
+        self.episode_count.load(Ordering::Relaxed)
+    }
+
+    /// Score every entity's selectivity from the Forman-Ricci curvature of its edges, and hold
+    /// the scores for [`Self::entity_selectivity`]. Returns how many entities were scored.
+    ///
+    /// Ported from upstream shodh-memory #214 (`compute_forman_ricci_curvature`). An edge's
+    /// curvature is `4 - deg(u) - deg(v)`, and an entity's selectivity is the standard
+    /// deviation of its incident curvatures divided by its degree. A hub joined to nodes of
+    /// every degree scores low once its degree is large; an entity with one edge scores 1.0.
+    /// Upstream writes the score onto each entity and the curvature onto each edge; veld's
+    /// records are positional bincode, so the scores live in memory and a heavy maintenance
+    /// cycle recomputes them.
+    pub fn compute_entity_selectivity(&self) -> Result<usize> {
+        let edges = self.get_all_relationships()?;
+        let mut degree: HashMap<Uuid, i32> = HashMap::new();
+        for edge in &edges {
+            *degree.entry(edge.from_entity).or_insert(0) += 1;
+            *degree.entry(edge.to_entity).or_insert(0) += 1;
+        }
+        let mut curvatures: HashMap<Uuid, Vec<f32>> = HashMap::new();
+        for edge in &edges {
+            let curvature = (4 - degree[&edge.from_entity] - degree[&edge.to_entity]) as f32;
+            curvatures
+                .entry(edge.from_entity)
+                .or_default()
+                .push(curvature);
+            curvatures
+                .entry(edge.to_entity)
+                .or_default()
+                .push(curvature);
+        }
+        let scores: HashMap<Uuid, f32> = curvatures
+            .into_iter()
+            .map(|(entity, incident)| (entity, curvature_selectivity(&incident)))
+            .collect();
+        let scored = scores.len();
+        *self.entity_selectivity.write() = scores;
+        Ok(scored)
+    }
+
+    /// The entity's selectivity from the last [`Self::compute_entity_selectivity`] pass, or
+    /// `None` when that pass has not scored it.
+    pub fn entity_selectivity(&self, entity: &Uuid) -> Option<f32> {
+        self.entity_selectivity.read().get(entity).copied()
     }
 
     /// Get graph statistics - O(1) using atomic counters
@@ -11164,6 +11408,149 @@ mod tests {
             extract_directed_predicate("Vornak did not cause Meslin.", "Vornak", "Meslin"),
             None
         );
+    }
+
+    #[test]
+    fn recognised_tag_label_maps_naming_conventions() {
+        assert_eq!(recognised_tag_label("rocksdb"), Some(EntityLabel::Database));
+        assert_eq!(
+            recognised_tag_label("metrics-service"),
+            Some(EntityLabel::Service)
+        );
+        assert_eq!(recognised_tag_label("README"), Some(EntityLabel::Document));
+        assert_eq!(
+            recognised_tag_label("config.toml"),
+            Some(EntityLabel::Configuration)
+        );
+        assert_eq!(recognised_tag_label("router.rs"), Some(EntityLabel::Module));
+        assert_eq!(recognised_tag_label("ci-cd"), Some(EntityLabel::Pipeline));
+        assert_eq!(
+            recognised_tag_label("kubernetes"),
+            Some(EntityLabel::Environment)
+        );
+    }
+
+    #[test]
+    fn recognised_tag_label_abstains_on_prose() {
+        for prose in [
+            "production",
+            "development",
+            "staging",
+            "container",
+            "stobar configuration",
+            "empty weight",
+            "support group",
+            "painting",
+            "workflows",
+            "62-kalyani-group.txt",
+        ] {
+            assert_eq!(recognised_tag_label(prose), None, "{prose:?}");
+        }
+    }
+
+    /// A star's hub sees the same curvature on every edge, the stop-word signature; a leaf
+    /// with one edge has no spread to measure and reads neutral.
+    #[test]
+    fn compute_entity_selectivity_scores_a_star_hub_low_and_its_leaves_neutral() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let hub = graph.add_entity(named_entity("Hub")).unwrap();
+        let leaves: Vec<Uuid> = (0..12)
+            .map(|k| graph.add_entity(named_entity(&format!("Leaf{k}"))).unwrap())
+            .collect();
+        for leaf in &leaves {
+            graph
+                .add_relationship(typed_edge(hub, *leaf, RelationType::RelatedTo, 0.5))
+                .unwrap();
+        }
+        assert_eq!(graph.entity_selectivity(&hub), None, "unscored is unknown");
+
+        assert_eq!(graph.compute_entity_selectivity().unwrap(), 13);
+        let hub_score = graph.entity_selectivity(&hub).unwrap();
+        assert!(
+            hub_score < crate::constants::GRAPH_LOW_SELECTIVITY,
+            "{hub_score}"
+        );
+        for leaf in &leaves {
+            assert_eq!(graph.entity_selectivity(leaf), Some(1.0));
+        }
+    }
+
+    /// Salience after n mentions is the first mention's salience times one boost for n, capped
+    /// at 1.3x: under the compounding formula a 0.5 entity reached 1.0 on its seventh mention.
+    #[test]
+    fn repeat_mentions_boost_salience_once_and_cap_the_boost() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let mut node = named_entity("Pottery");
+        node.salience = 0.5;
+        let id = graph.add_entity(node.clone()).unwrap();
+        for _ in 1..7 {
+            graph.add_entity(node.clone()).unwrap();
+        }
+        let seventh = graph.get_entity(&id).unwrap().unwrap();
+        assert_eq!(seventh.mention_count, 7);
+        let expected = 0.5 * (1.0 + 0.1 * 7f32.ln());
+        assert!(
+            (seventh.salience - expected).abs() < 1e-4,
+            "{} != {expected}",
+            seventh.salience
+        );
+
+        for _ in 7..100 {
+            graph.add_entity(node.clone()).unwrap();
+        }
+        let capped = graph.get_entity(&id).unwrap().unwrap().salience;
+        let ceiling = 0.5 * crate::constants::ENTITY_SALIENCE_MAX_FREQUENCY_BOOST;
+        assert!((capped - ceiling).abs() < 1e-4, "{capped} != {ceiling}");
+    }
+
+    #[test]
+    fn label_pairs_are_typed_in_either_order_from_the_rules_first_label() {
+        use EntityLabel::*;
+        assert_eq!(
+            infer_relation_type_for_pair(&Person, &Organization, false),
+            Some((RelationType::WorksAt, true))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Organization, &Person, false),
+            Some((RelationType::WorksAt, false))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Location, &Person, false),
+            Some((RelationType::LocatedIn, false))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Service, &Database, false),
+            Some((RelationType::Uses, true))
+        );
+    }
+
+    #[test]
+    fn label_pairs_with_no_rule_stay_untyped() {
+        use EntityLabel::*;
+        assert_eq!(infer_relation_type_for_pair(&Person, &Person, false), None);
+        assert_eq!(
+            infer_relation_type_for_pair(&Person, &Person, true),
+            Some((RelationType::Knows, true))
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Technology, &Technology, false),
+            None
+        );
+        assert_eq!(
+            infer_relation_type_for_pair(&Concept, &Other("MISC".into()), false),
+            None
+        );
+    }
+
+    #[test]
+    fn curvature_selectivity_is_spread_over_degree() {
+        assert_eq!(curvature_selectivity(&[-3.0]), 1.0);
+        assert_eq!(curvature_selectivity(&[-5.0, -5.0, -5.0]), 0.0);
+        // Sample deviation of {0, 2} is sqrt(2); over two edges.
+        let spread = curvature_selectivity(&[0.0, 2.0]);
+        assert!((spread - 2f32.sqrt() / 2.0).abs() < 1e-6, "{spread}");
     }
 
     #[test]

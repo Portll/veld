@@ -208,6 +208,11 @@ pub const ENTITY_CONCEPT_MERGE_THRESHOLD: f32 = 0.85;
 /// deployment while covering the vast majority of active entity vocabularies.
 pub const ENTITY_EMBEDDING_CACHE_MAX: usize = 10_000;
 
+/// Largest multiplier an entity's salience takes from repeat mentions. The boost is
+/// `1 + 0.1 × ln(mentions)` on the first mention's salience, which reaches 1.3 at about twenty
+/// mentions; past that, being mentioned again says nothing new about how salient it is.
+pub const ENTITY_SALIENCE_MAX_FREQUENCY_BOOST: f32 = 1.3;
+
 /// Floor multiplier for semantic edge weighting.
 ///
 /// Initial edge weight = L1_INITIAL_WEIGHT × (floor + (1 − floor) × cosine_sim).
@@ -236,6 +241,190 @@ pub const EDGE_SEMANTIC_WEIGHT_FLOOR: f32 = 0.2;
 ///
 /// Reference: Anderson & Reder (1999) "The fan effect: New results and new theories"
 pub const SPREADING_DEGREE_NORMALIZATION: bool = true;
+
+// =============================================================================
+// GRAPH ADMISSION: WHICH SPANS AND TAGS BECOME NODES, WHICH EDGES ARE BORN
+// Ported from upstream shodh-memory. Each switch is read on every graph write, so a
+// harness arm can set it after the process has started. The gates act at birth: an
+// existing store keeps the nodes and edges it already has.
+// =============================================================================
+
+/// Lowest confidence at which the rule-based fallback NER commits a span.
+///
+/// Upstream shodh-memory drops fallback spans under 0.5 (its `NerConfig` default). The
+/// fallback reads `EntityExtractor` salience as confidence (`0.9 × salience`, at most 0.85):
+/// typed PER/ORG/LOC spans land at 0.63–0.81 and pass; a content word lands at 0.45 (noun),
+/// 0.36 (verb) or 0.32 (adjective) and passes only when YAKE rates it discriminative; an
+/// unlisted multi-word capitalised run is typed Concept at 0.43 and is dropped. veld's
+/// neural floor (`VELD_NER_CONFIDENCE`, 0.7) is set on BERT-tiny's softmax, a different
+/// quantity, so the fallback has its own. [`NER_FALLBACK_CONFIDENCE_ENV`] overrides it.
+pub const NER_FALLBACK_CONFIDENCE_FLOOR: f32 = 0.5;
+
+/// Env var overriding [`NER_FALLBACK_CONFIDENCE_FLOOR`].
+pub const NER_FALLBACK_CONFIDENCE_ENV: &str = "VELD_NER_FALLBACK_CONFIDENCE";
+
+/// Minimum character length of an NER span that becomes a graph node (upstream #261): BPE
+/// misalignment leaves two-character fragments ("au", "th") at high confidence.
+pub const NER_ENTITY_MIN_LENGTH: usize = 3;
+
+/// Confidence floor for a MISC span at graph insertion (upstream #261, which #573 redefined as
+/// the typer's own commit threshold). veld's lowest commit threshold is the fallback's
+/// [`NER_FALLBACK_CONFIDENCE_FLOOR`]; BERT-tiny commits at `VELD_NER_CONFIDENCE` (0.7). The
+/// floor therefore rejects only a stored record, as a rebuild replays it, that scored below
+/// every typer's line. PER, ORG and LOC spans are exempt (see `ner_span_becomes_node`).
+pub const NER_GRAPH_CONFIDENCE_FLOOR: f32 = NER_FALLBACK_CONFIDENCE_FLOOR;
+
+/// Past-tense verbs, gerunds and adjectives an NER typer labels as entities (upstream #261).
+/// None names a thing, whatever label it carries, so none becomes a graph node.
+pub const NER_VERB_NOISE: &[&str] = &[
+    "decided",
+    "added",
+    "removed",
+    "changed",
+    "updated",
+    "created",
+    "deleted",
+    "fixed",
+    "moved",
+    "used",
+    "called",
+    "made",
+    "set",
+    "found",
+    "tried",
+    "started",
+    "finished",
+    "built",
+    "ran",
+    "got",
+    "switched",
+    "enabled",
+    "disabled",
+    "configured",
+    "deployed",
+    "merged",
+    "pushed",
+    "pulled",
+    "committed",
+    "resolved",
+    "closed",
+    "implemented",
+    "refactored",
+    "migrated",
+    "installed",
+    "upgraded",
+    "using",
+    "running",
+    "building",
+    "testing",
+    "working",
+    "making",
+    "getting",
+    "setting",
+    "adding",
+    "fixing",
+    "checking",
+    "looking",
+    "new",
+    "old",
+    "good",
+    "bad",
+    "first",
+    "last",
+    "next",
+    "other",
+    "same",
+    "different",
+    "important",
+    "available",
+    "possible",
+    "current",
+    "previous",
+    "following",
+    "existing",
+    "certain",
+];
+
+/// Env switch for [`NER_GRAPH_CONFIDENCE_FLOOR`] and [`NER_VERB_NOISE`]: `0` or `false` turns
+/// both off. On by default.
+pub const NER_GRAPH_NOISE_GATE_ENV: &str = "VELD_GRAPH_NER_NOISE_GATE";
+
+/// Env switch for the tag-admission gate (upstream #509): a tag becomes a graph node only when
+/// the writer named it or `recognised_tag_label` recognises it, and never when NER typed the
+/// same surface. `0` or `false` restores every tag as a Technology node. On by default.
+pub const GRAPH_TAG_ADMISSION_ENV: &str = "VELD_GRAPH_TAG_ADMISSION";
+
+/// Env switch for verb nodes: `1` or `true` makes each relational verb of a memory, and its
+/// stem, an `Other("Verb")` node. Off by default, as upstream #260 dropped them: they took two
+/// to four of the per-memory entity slots and joined every memory using the same verb. With
+/// them off, the query verbs `memory::recall` resolves against entity names match nothing.
+pub const GRAPH_VERB_ENTITIES_ENV: &str = "VELD_GRAPH_VERB_ENTITIES";
+
+/// Degree above which a derived entity takes no new co-occurrence edge (upstream's
+/// `SHODH_HUB_DEGREE_MAX`, default 300). A speaker named in every turn of a conversation
+/// reaches it first; past it, an edge to the speaker says only that the speaker spoke.
+/// Declared entities are exempt. The value is held below [`MAX_ENTITY_DEGREE`], the prune
+/// cap, where an edge only buys a prune of an older one.
+pub const GRAPH_HUB_DEGREE_MAX: usize = 300;
+
+/// Env var overriding [`GRAPH_HUB_DEGREE_MAX`].
+pub const GRAPH_HUB_DEGREE_MAX_ENV: &str = "SHODH_HUB_DEGREE_MAX";
+
+/// PMI floor below which a generic co-occurrence edge is not born (upstream #336, on by
+/// default since #364). At birth a pair has co-occurred once, so its pointwise mutual
+/// information is `log2(N / (df_a × df_b))`: N the user's graph episodes, df an entity's
+/// mention count, both kept by the graph store on either engine. At 0.0 an edge is born only
+/// when `N ≥ df_a × df_b`, which prunes the pairs of two entities each named in many memories.
+/// Typed edges, fragment bridges and edges to a declared entity are never gated. Upstream's
+/// A/B: 97.4% fewer edges, recall unchanged.
+pub const GRAPH_PMI_GATE_MIN: f32 = 0.0;
+
+/// Env switch for the PMI gate: `0` or `false` turns it off. On by default.
+pub const GRAPH_PMI_GATE_ENV: &str = "SHODH_GRAPH_PMI_GATE";
+
+/// Env var overriding [`GRAPH_PMI_GATE_MIN`].
+pub const GRAPH_PMI_GATE_MIN_ENV: &str = "SHODH_GRAPH_PMI_GATE_MIN";
+
+/// Selectivity under which an entity reads as a stop-word hub (upstream #214): its edges reach
+/// nodes of every degree at an even rate. No edge is born between two such entities. Scores
+/// come from a heavy maintenance cycle (`GraphMemory::compute_entity_selectivity`); until one
+/// has run, no entity is low and the skip is inert, as it is upstream before its first cycle.
+pub const GRAPH_LOW_SELECTIVITY: f32 = 0.2;
+
+/// Env switch for the selectivity skip and the scoring pass behind it: `0` or `false` turns
+/// both off. On by default.
+pub const GRAPH_SELECTIVITY_SKIP_ENV: &str = "VELD_GRAPH_SELECTIVITY_SKIP";
+
+/// Fewest edges a graph needs before its selectivity is scored (upstream's
+/// `CURVATURE_MIN_EDGES`): below it the degree distribution has no spread to read.
+pub const CURVATURE_MIN_EDGES: usize = 10;
+
+/// Env switch for label-pair typing (upstream #260): a co-occurrence edge the sentence does not
+/// type takes the relation its endpoints' labels imply (`Person`-`Location` is `LocatedIn`,
+/// `Person`-`Organization` is `WorksAt`; see `graph_memory::infer_relation_type_for_pair`).
+/// `0` or `false` leaves such edges `RelatedTo`. On by default.
+pub const GRAPH_LABEL_PAIR_TYPING_ENV: &str = "VELD_GRAPH_LABEL_PAIR_TYPING";
+
+/// Env switch typing two people `Knows` by label alone: `1` or `true` turns it on. Off by
+/// default, as upstream keeps it: a typed edge is eligible for the ontological penalties a
+/// generic one is spared, and conversational corpora are mostly person pairs.
+pub const GRAPH_PERSON_PERSON_KNOWS_ENV: &str = "SHODH_PERSON_PERSON_KNOWS";
+
+/// Lowest exemplar cosine, on the MiniLM reference scale, at which the semantic relation typer
+/// (`embeddings::relation_typer`) types a pair. Upstream's `SHODH_SEMREL_MIN` default: lower
+/// admits noise edges, higher reverts them to the label pair or `RelatedTo`.
+pub const SEMANTIC_RELATION_MIN_COSINE: f32 = 0.6;
+
+/// Env var overriding [`SEMANTIC_RELATION_MIN_COSINE`].
+pub const SEMANTIC_RELATION_MIN_COSINE_ENV: &str = "SHODH_SEMREL_MIN";
+
+/// Most entity pairs of one memory the semantic typer encodes. Each costs one embedding of the
+/// pair's sentence on the write path; upstream's budget.
+pub const SEMANTIC_RELATION_MAX_PAIRS: usize = 20;
+
+/// Env switch for the semantic relation typer: `0` or `false` turns it off. On by default, as
+/// upstream has run it since 9f632af5.
+pub const SEMANTIC_RELATIONS_ENV: &str = "SHODH_SEMANTIC_RELATIONS";
 
 // =============================================================================
 // COMPRESSION THRESHOLDS
