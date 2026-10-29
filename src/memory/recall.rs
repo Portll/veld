@@ -2172,6 +2172,14 @@ impl super::MemorySystem {
                 (leg.space, ranked)
             }));
 
+            if crate::memory::gold_funnel::is_armed() {
+                let mut raw: Vec<(&MemoryId, f32)> = fused.iter().map(|(id, s)| (id, *s)).collect();
+                // `fused` is a hash map; ordering by id first keeps the trace's tie order
+                // repeatable across runs.
+                raw.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+                crate::memory::gold_funnel::record_by_score("rrf", raw.into_iter());
+            }
+
             // Every boost from here to Layer 4.92 multiplies a candidate's fused score by
             // `1 + share`, so what it adds is a bounded share of that candidate's own score
             // (shodh-memory #174). An absolute boost outweighed every rank difference the
@@ -2744,6 +2752,7 @@ impl super::MemorySystem {
             let mut res: Vec<_> = fused.into_iter().collect();
             res.sort_by(|a, b| b.1.total_cmp(&a.1));
             order_score_ties_by_content(&mut res, &get_content);
+            crate::memory::gold_funnel::record("boosts", res.iter().map(|(id, _)| id));
             let rerank_budget = query.max_results * 2;
 
             if use_ontology_rerank && !onto_intent.expected_labels.is_empty() {
@@ -3582,6 +3591,11 @@ impl super::MemorySystem {
             }
         }
 
+        crate::memory::gold_funnel::record_by_score(
+            "unified",
+            memories.iter().map(|m| (&m.id, m.score.unwrap_or(0.0))),
+        );
+
         // =====================================================================
         // LAYER 5.3: CROSS-ENCODER RERANKING (BRIDGE-2)
         // =====================================================================
@@ -3753,6 +3767,7 @@ impl super::MemorySystem {
         // order the Layer 5 signals had never touched. Stable, so fused ties keep their
         // content-ordered tie-break.
         memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+        crate::memory::gold_funnel::record("cross_encoder", memories.iter().map(|m| &m.id));
 
         // =====================================================================
         // LAYER 5.35: FRAGMENT DEMOTION (FIX-R2)
@@ -3780,6 +3795,7 @@ impl super::MemorySystem {
                 tracing::debug!("Layer 5.35: Applied fragment demotion to retrieval scores");
             }
         }
+        crate::memory::gold_funnel::record("fragment_demotion", memories.iter().map(|m| &m.id));
 
         // =====================================================================
         // LAYER 5.36: QUERY-TERM COVERAGE  /  LAYER 5.37: PERSON DENSITY
@@ -3858,6 +3874,7 @@ impl super::MemorySystem {
                 "Layer 5.36/5.37: query-term coverage and person density"
             );
         }
+        crate::memory::gold_funnel::record("coverage_people", memories.iter().map(|m| &m.id));
 
         // =====================================================================
         // LAYER 5.38: NEAR-EXACT DUPLICATE DE-RANK
@@ -3931,6 +3948,7 @@ impl super::MemorySystem {
         }
 
         memories.truncate(query.max_results);
+        crate::memory::gold_funnel::record("derank_mmr", memories.iter().map(|m| &m.id));
 
         // =====================================================================
         // LAYER 5.8: ANSWER-TYPE SOFT FILTER
@@ -3988,6 +4006,10 @@ impl super::MemorySystem {
                 score_b.total_cmp(&score_a)
             });
         }
+        crate::memory::gold_funnel::record(
+            "answer_type_linguistic",
+            memories.iter().map(|m| &m.id),
+        );
 
         // =====================================================================
         // LAYER 5.87: TEMPORAL RANGE DEMOTION
@@ -4115,6 +4137,7 @@ impl super::MemorySystem {
                 }
             }
         }
+        crate::memory::gold_funnel::record("temporal_range", memories.iter().map(|m| &m.id));
 
         // =====================================================================
         // LAYER 5.9: ORDINAL RESOLUTION + CATEGORY ERROR DETECTION
@@ -4489,6 +4512,7 @@ impl super::MemorySystem {
                 );
             }
         }
+        crate::memory::gold_funnel::record("ordinal_abstention", memories.iter().map(|m| &m.id));
 
         // =====================================================================
         // LAYER 5.95: CONTENT SUFFICIENCY SIGNAL
@@ -4623,6 +4647,7 @@ impl super::MemorySystem {
                 }
             }
         }
+        crate::memory::gold_funnel::record("sufficiency", memories.iter().map(|m| &m.id));
 
         // Usage writes from here on (access counts, coactivation, retrieval counter) are
         // skipped under read-only recall — see `recall_readonly()`.
@@ -7301,12 +7326,12 @@ mod date_window_leg_tests {
             max_results: 5,
             ..Default::default()
         };
-        let stage = |funnel: &[(String, Option<usize>)], name: &str| -> Option<usize> {
+        let stage = |funnel: &[crate::memory::gold_funnel::FunnelStage], name: &str| {
             funnel
                 .iter()
-                .find(|(s, _)| s == name)
+                .find(|s| s.stage == name)
                 .unwrap_or_else(|| panic!("stage {name} not recorded in {funnel:?}"))
-                .1
+                .gold_rank
         };
 
         crate::memory::gold_funnel::begin(HashSet::from([gold.clone()]));
