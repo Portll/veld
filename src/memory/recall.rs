@@ -1730,7 +1730,8 @@ impl super::MemorySystem {
                 // enter as one more ranked list instead, at the strongest list's weight and
                 // the same k, so they interleave with the Vamana hits by rank.
                 let decomp_rrf_k: f32 = self.cognitive_dials.read().rrf_k_decomp.unwrap_or(20.0);
-                tier_candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                tier_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+                order_score_ties_by_content(&mut tier_candidates, &|id| candidates.content(id));
                 for (rank, (id, _)) in tier_candidates.into_iter().enumerate() {
                     vector_results.push((id, 1.0 / (decomp_rrf_k + (rank + 1) as f32)));
                     tier_hits += 1;
@@ -1741,8 +1742,10 @@ impl super::MemorySystem {
             }
 
             if tier_hits > 0 {
-                // Re-sort merged results by similarity descending
+                // Re-sort merged results by similarity descending. Tier hits arrive in the
+                // tiers' hash-map order, so equal scores are put in content order before the cut.
                 vector_results.sort_by(|a, b| b.1.total_cmp(&a.1));
+                order_score_ties_by_content(&mut vector_results, &|id| candidates.content(id));
                 vector_results.truncate(query.max_results * 8);
                 tracing::info!(
                     tier_hits,
@@ -2134,7 +2137,10 @@ impl super::MemorySystem {
             // the secondary ratio, the space's dial weight, and for a leg through a fitted map,
             // the map's confidence. The leg through the secondary-to-primary map searches the
             // primary index, so its hits count for the primary space.
-            let finished_legs = pending_legs.finish();
+            let mut finished_legs = pending_legs.finish();
+            for leg in &mut finished_legs {
+                self.retriever.order_ties_by_content(&mut leg.hits);
+            }
             self.retriever.observe_leg_scores(&finished_legs);
             let sec_ratio = self
                 .cognitive_dials
@@ -6465,11 +6471,13 @@ fn competition_similarity_floor(pool: &[SharedMemory]) -> f32 {
 
 /// Orders each run of exactly equal scores in a score-sorted list by content, then id.
 ///
-/// Fused scores tie often, and the map they come from iterates in a per-instance hash order.
-/// Content is unique per store (remember() dedups on a content hash), so this is a total
-/// order that two stores built from the same corpus agree on; ids are random per ingest.
+/// Fused scores tie often, and the map they come from iterates in a per-instance hash order;
+/// vector similarities tie too, and an id order is no better, since ids are random per ingest.
+/// Rank fusion turns a list position into score, so a tie's order decides fused scores and a
+/// list's cut decides membership. Content is unique per store (remember() dedups on a content
+/// hash), so this is a total order that two stores built from the same corpus agree on.
 /// Content is fetched only for members of a tied run.
-fn order_score_ties_by_content<F>(items: &mut [(MemoryId, f32)], content: &F)
+pub(crate) fn order_score_ties_by_content<F>(items: &mut [(MemoryId, f32)], content: &F)
 where
     F: Fn(&MemoryId) -> Option<String>,
 {
