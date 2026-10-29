@@ -412,6 +412,8 @@ const DIAL_RECALL = [
     desc: "how did X fix Y / why.", info: "Where the lexical and vector legs disagree and only passage reading settles it." },
   { key: "ce_blend_abstract", group: "Rerank", label: "CE share · abstract", def: 0.45, recLo: 0.3, recHi: 0.7, min: 0, max: 1, step: 0.05,
     desc: "Decomposed multi-cluster questions.", info: "The 55/45 blend decomposed queries already had." },
+  { key: "ce_top_margin", group: "Rerank", label: "CE orders the top three", def: 1.0, recLo: 0.2, recHi: 1, min: 0, max: 1, step: 0.05,
+    desc: "The cross-encoder orders the top three results whose score is within this fraction of rank 1's.", info: "1 = it orders all three · 0 leaves rank 1 alone. Ordinal (first / latest) questions keep their pin." },
   { key: "query_coverage_weight", group: "Weights", label: "Query-term coverage", def: 0.25, recLo: 0.1, recHi: 0.4, min: 0, max: 0.9, step: 0.05,
     desc: "Demotes results that mention few of the query's words, compared on word stems.", info: "0 disables. Needs two or more content words in the query." },
   { key: "people_boost_max", group: "Weights", label: "People-question boost", def: 0, recLo: 0.05, recHi: 0.3, min: 0, max: 1, step: 0.05,

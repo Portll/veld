@@ -119,7 +119,8 @@ for it.
   measures fit as well as generalisation.
 - `corpora/locomo-holdout.jsonl`, `locomo-holdout-cases.jsonl` — the same set without the gate's
   conversation (conv-42) and without the cases in `locomo-holdout-spent.txt`: 5,253 turns in nine
-  conversations, and 1,161 cases on 2026-11-15. Run ungated with `suite=locomo-holdout`. This is
+  conversations, and 1,132 cases on 2026-11-17 (1,166 before the cases spent on 2026-10-30 and
+  2026-11-15). Run ungated with `suite=locomo-holdout`. This is
   the number to report, with its interval.
 - `locomo-holdout-spent.txt` — hold-out cases whose individual results someone has examined.
 - `corpora/agent-episodes.jsonl`, `agent-episodes-cases.jsonl` — `suite=agent-episodes`: 187
