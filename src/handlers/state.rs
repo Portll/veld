@@ -4485,8 +4485,7 @@ impl MultiUserMemoryManager {
     /// one observation, not ten.
     ///
     /// Derived entities pass a stop list of words measured as hubs on a code-heavy store, and a
-    /// derived entity already at `MAX_ENTITY_DEGREE` gets no new edges from this memory: at the
-    /// cap, every new edge only bought a prune of an older one.
+    /// derived entity past `GRAPH_HUB_DEGREE_MAX` gets no new edges from this memory.
     ///
     /// `tag_sources` is the ledger row for the stored tags (see `crate::memory::tag_sources`).
     /// With it, a causal edge forms only between names the writer or NER named: a caller tag, a
@@ -4942,7 +4941,7 @@ impl MultiUserMemoryManager {
             match graph_guard.add_entity(entity) {
                 Ok(uuid) => {
                     let hub = match graph_guard.entity_degree(&uuid) {
-                        Ok(degree) => degree >= crate::constants::MAX_ENTITY_DEGREE,
+                        Ok(degree) => degree > admission.hub_degree_max,
                         Err(e) => {
                             tracing::debug!("Degree read failed for {}: {}", name, e);
                             false
@@ -5873,6 +5872,14 @@ fn env_switch(name: &str, default: bool) -> bool {
     }
 }
 
+/// `name` parsed as `T`, or `default` when it is unset or does not parse.
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 /// The graph-admission switches (the GRAPH ADMISSION section of [`crate::constants`]), read
 /// once per graph write so a harness arm can set them after start-up.
 #[derive(Debug, Clone, Copy)]
@@ -5883,6 +5890,9 @@ struct GraphAdmission {
     tag_admission: bool,
     /// Relational verbs and their stems become nodes (off: upstream #260).
     verb_entities: bool,
+    /// A derived entity of higher degree accretes no new edge. Held under
+    /// [`crate::constants::MAX_ENTITY_DEGREE`], where every new edge only buys a prune.
+    hub_degree_max: usize,
 }
 
 impl GraphAdmission {
@@ -5892,6 +5902,8 @@ impl GraphAdmission {
             ner_noise_gate: env_switch(c::NER_GRAPH_NOISE_GATE_ENV, true),
             tag_admission: env_switch(c::GRAPH_TAG_ADMISSION_ENV, true),
             verb_entities: env_switch(c::GRAPH_VERB_ENTITIES_ENV, false),
+            hub_degree_max: env_number(c::GRAPH_HUB_DEGREE_MAX_ENV, c::GRAPH_HUB_DEGREE_MAX)
+                .min(c::MAX_ENTITY_DEGREE - 1),
         }
     }
 }
@@ -6086,6 +6098,42 @@ mod graph_admission_tests {
         }
     }
 
+    /// One memory naming `people`, with no tags, built into the graph.
+    fn write_people(mgr: &MultiUserMemoryManager, people: &[&str], admission: GraphAdmission) {
+        let experience = Experience {
+            content: format!("{} met.", people.join(" and ")),
+            ner_entities: people.iter().map(|p| person(p)).collect(),
+            ..Default::default()
+        };
+        mgr.build_experience_graph(
+            USER,
+            &experience,
+            &MemoryId(uuid::Uuid::new_v4()),
+            &[],
+            None,
+            admission,
+        )
+        .expect("graph write");
+    }
+
+    fn joined(mgr: &MultiUserMemoryManager, a: &str, b: &str) -> bool {
+        let graph = mgr.get_user_graph(USER).expect("graph");
+        let graph = graph.read();
+        let id = |name: &str| {
+            graph
+                .find_entity_by_name_strict(name)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{name} is not a node"))
+                .uuid
+        };
+        let (a, b) = (id(a), id(b));
+        graph
+            .get_all_relationships()
+            .expect("edges")
+            .iter()
+            .any(|e| e.joins(&a, &b))
+    }
+
     /// Every gate off, so a test can switch on the one it measures.
     fn legacy() -> GraphAdmission {
         let mut admission = GraphAdmission::from_env();
@@ -6093,6 +6141,7 @@ mod graph_admission_tests {
         admission.tag_admission = false;
         // Except verb nodes: they would join every memory through "met".
         admission.verb_entities = false;
+        admission.hub_degree_max = crate::constants::MAX_ENTITY_DEGREE - 1;
         admission
     }
 
@@ -6224,6 +6273,20 @@ mod graph_admission_tests {
         verbs_on.verb_entities = true;
         assert_eq!(verb_nodes(GraphAdmission::from_env()), 0);
         assert!(verb_nodes(verbs_on) > 0);
+    }
+
+    #[test]
+    fn an_entity_past_the_hub_cap_takes_no_new_edge() {
+        let mut capped = legacy();
+        capped.hub_degree_max = 2;
+        for (admission, joined_after) in [(capped, false), (legacy(), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let mgr = manager(home.path());
+            write_people(&mgr, &["Hubert", "Alma", "Boris", "Celia"], admission);
+            write_people(&mgr, &["Hubert", "Delphine"], admission);
+            assert_eq!(joined(&mgr, "Hubert", "Delphine"), joined_after);
+            assert!(joined(&mgr, "Hubert", "Celia"), "edges below the cap stay");
+        }
     }
 }
 
