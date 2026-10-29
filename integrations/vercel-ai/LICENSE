@@ -1,0 +1,176 @@
+VELD EVALUATION LICENCE
+Version 1.0, 11 October 2026
+
+Copyright (c) 2025-2026 Portll. All rights reserved.
+
+veld is proprietary software. It is NOT open source and NOT source-available for any
+purpose beyond the evaluation described below. Access to the source, by any means,
+grants no rights except those stated here and those stated by the licences of the
+Excluded Components in section 6.
+
+
+1. DEFINITIONS
+
+   "Licensor" means Portll.
+   "Software" means veld, including its source, documentation and build outputs,
+     EXCEPT the Excluded Components identified in section 6.
+   "You" means the person or entity exercising the rights granted below.
+   "Evaluate" means to install, run, read and assess the Software for the sole purpose
+     of forming a view about it.
+
+
+2. GRANT
+
+   Subject to every condition in this licence, the Licensor grants You a personal,
+   non-exclusive, non-transferable, non-sublicensable, royalty-free and REVOCABLE
+   licence to Evaluate the Software on hardware You control.
+
+   That is the entire grant. No other right is granted, by implication, estoppel,
+   exhaustion or otherwise.
+
+
+3. CONDITIONS AND PROHIBITIONS
+
+   You may NOT, in whole or in part:
+
+   (a) use the Software commercially, or in or for any activity intended for or
+       directed toward commercial advantage or monetary compensation, whether by You
+       or on behalf of another;
+
+   (b) modify, adapt, alter, translate, port, patch, fork or otherwise change the
+       Software;
+
+   (c) create, or contribute to the creation of, any derivative work of the Software,
+       or any work based on, adapted from, or substantially derived from it, including
+       a reimplementation produced by reference to it;
+
+   (d) distribute, publish, disclose, sublicense, sell, rent, lease, lend, host, or
+       otherwise make the Software available to any third party, whether or not for a
+       fee, and whether or not modified;
+
+   (e) use the Software to provide a service to any third party;
+
+   (f) use the Software, or knowledge of it, to design, build, train or improve a
+       competing or substantially similar product or system;
+
+   (g) decompile, disassemble or reverse engineer any build output, except and only to
+       the extent this prohibition is unenforceable under applicable law;
+
+   (h) remove, obscure or alter any copyright, licence, attribution or notice.
+
+   Nothing in this section restricts a right You hold under law that cannot be waived
+   by agreement, and nothing in this section restricts a right granted to You by the
+   licence of an Excluded Component (section 6).
+
+
+4. RESERVATION OF RIGHTS
+
+   The Licensor retains all right, title and interest in the Software, including all
+   intellectual property rights. This licence transfers no ownership. Any right not
+   expressly granted in section 2 is reserved.
+
+   This licence binds You. It does not bind the Licensor, who remains free to license,
+   distribute, commercialise or relicense the Software on any terms.
+
+
+5. OTHER LICENCES, AND A STATED INTENTION
+
+   (a) PolyForm Internal Use License 1.0.0. The Licensor offers the Software under the
+       PolyForm Internal Use License 1.0.0, by written agreement, to a licensee named in
+       that agreement. That licence permits internal business use and is obtained by
+       contacting the Licensor; it is not granted by this document.
+
+   (b) Stated intention. The Licensor intends to release veld version 2.0 under the GNU
+       Affero General Public License, version 3 or later. This is a statement of present
+       intention and not a promise, a licence or an offer; it grants no right in any
+       version, and the Licensor may change it. Until a release is made under that
+       licence, this licence governs.
+
+
+6. EXCLUDED COMPONENTS. READ THIS BEFORE ASSUMING THIS LICENCE COVERS A FILE
+
+   This licence does NOT apply to third-party or separately-licensed components
+   distributed with the Software. Those are governed by their own licences, which sit
+   alongside them, and which may grant You MORE rights than this licence does,
+   including rights this licence otherwise prohibits, such as modification and
+   redistribution.
+
+   Where a directory contains its own LICENSE or NOTICE file, that file governs that
+   directory and everything beneath it, and this licence does not reach it.
+
+   The Licensor cannot and does not purport to restrict any right granted to You by
+   the licence of an Excluded Component. Where this licence and such a licence conflict
+   as to that component, the component's own licence prevails.
+
+   Excluded Components in this distribution:
+
+     (i)  The portions of this work that derive from shodh-memory, Copyright (c) 2025
+          Varun Sharma and contributors, licensed under the Apache License, Version 2.0.
+          Those portions remain under Apache-2.0 and remain available from the upstream
+          repository under that licence. The full Apache-2.0 text is distributed with
+          this work as LICENSE-APACHE-2.0, and NOTICE identifies the upstream work and
+          the basis on which the derivative work as a whole is offered under this
+          licence. Nothing here restricts, or purports to restrict, the Apache-2.0
+          grant in those portions.
+
+     (ii) Third-party crates, packages and models fetched or vendored by the build,
+          each under its own licence as declared in Cargo.lock, mcp-server/package.json
+          and the model manifests.
+
+
+7. TERM AND TERMINATION
+
+   This licence takes effect when You first access the Software and continues until
+   terminated.
+
+   It terminates automatically and immediately if You breach any condition in
+   section 3. The Licensor may also revoke it at any time, for any reason, on notice.
+
+   On termination You must stop using the Software and destroy every copy in Your
+   possession or control. Sections 3(c), 3(f), 4, 6, 8, 9 and 10 survive termination.
+
+
+8. FEEDBACK
+
+   If You send the Licensor feedback about the Software, the Licensor may use it
+   without restriction or obligation. You are under no duty to send any.
+
+
+9. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+   PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. THE SOFTWARE IS UNRELEASED,
+   INCOMPLETE AND UNSUPPORTED. NO OBLIGATION TO PROVIDE UPDATES, FIXES OR SUPPORT
+   ARISES FROM THIS LICENCE.
+
+
+10. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL THE LICENSOR BE LIABLE
+   FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+   Nothing in this licence excludes, restricts or modifies any consumer guarantee,
+   right or remedy under the Australian Consumer Law (Schedule 2 to the Competition
+   and Consumer Act 2010 (Cth)) that cannot lawfully be excluded, restricted or
+   modified.
+
+
+11. GENERAL
+
+   This licence is governed by the laws of South Australia, Australia, and You submit
+   to the non-exclusive jurisdiction of its courts.
+
+   If any provision is held unenforceable, it is severed and the rest continues in
+   force.
+
+   This is the entire agreement between You and the Licensor about the Software, and
+   supersedes any prior understanding about it.
+
+
+For any use beyond evaluation (commercial use, internal business use, modification,
+derivative works or redistribution) you need a separate written licence. The PolyForm
+Internal Use License 1.0.0 is the standard text offered for internal business use.
+
+Contact: john@portll.net

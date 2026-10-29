@@ -228,6 +228,18 @@ from veld.integrations.llamaindex import VeldLlamaMemory
 memory = VeldLlamaMemory(storage_path="./llamaindex_data")
 ```
 
+### CrewAI
+
+```python
+from crewai import Crew
+from veld.integrations.crewai import VeldCrewMemory
+
+# Use as the memory of a crew (or of one agent: Agent(memory=memory)).
+# Needs pip install veld[crewai] and a veld server; the API key comes from VELD_API_KEY.
+memory = VeldCrewMemory(server_url="http://127.0.0.1:3030", user_id="my-crew")
+crew = Crew(agents=[researcher], tasks=[task], memory=memory)
+```
+
 ## Performance
 
 Measured on Intel i7-1355U (10 cores, 1.7GHz):

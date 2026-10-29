@@ -42,6 +42,11 @@ Documentation = "https://github.com/Portll/veld"
 langchain = ["langchain-core>=0.2.0"]
 llamaindex = ["llama-index-core>=0.10.0"]
 openai-agents = ["openai-agents>=0.24.0", "pydantic>=2.14.1"]
+# Not in "all": crewai pins pydantic<2.13, which the openai-agents extra's pydantic>=2.14.1 excludes.
+# Capped below 1.16: the adapter (python/veld/integrations/crewai.py) calls Memory's private
+# _submit_save and _storage, which CrewAI can change in any minor release. Raise the cap only
+# after its tests pass against the new minor.
+crewai = ["crewai>=1.15.0,<1.16; python_version >= '3.10'"]
 all = ["langchain-core>=0.2.0", "llama-index-core>=0.10.0", "openai-agents>=0.24.0", "pydantic>=2.14.1"]
 
 [tool.maturin]

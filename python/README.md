@@ -118,6 +118,9 @@ pip install veld[langchain]
 # With LlamaIndex support
 pip install veld[llamaindex]
 
+# With CrewAI support (Python 3.10+)
+pip install veld[crewai]
+
 # All integrations
 pip install veld[all]
 ```
@@ -192,6 +195,36 @@ results = memory.get("programming preferences")
 # Get formatted context for prompts
 context = memory.get_context("current task query")
 ```
+
+**CrewAI**
+
+```python
+from crewai import Crew
+from veld.integrations.crewai import VeldCrewMemory
+
+memory = VeldCrewMemory(
+    server_url="http://127.0.0.1:3030",
+    user_id="agent-1",
+    api_key="your-key"  # or set VELD_API_KEY
+)
+
+crew = Crew(agents=[researcher], tasks=[task], memory=memory)
+crew.kickoff()
+
+# Agents recall from veld before each task and save their results after it.
+# Veld embeds and ranks on the server: no CrewAI embedder or analysis LLM calls.
+# Recalled memories reach the prompt labelled with their source's trust;
+# trusted_only=True (strict mode) withholds untrusted ones.
+```
+
+See [examples/crewai](../examples/crewai) for options and error handling.
+
+**Vercel AI SDK (TypeScript)**
+
+[`@veld/vercel-ai`](../integrations/vercel-ai) exposes veld remember and recall as AI SDK
+tools and puts recalled memories in the user's turn of a prompt, fenced and labelled by
+trust. See
+[examples/vercel-ai](../examples/vercel-ai).
 
 **ChatGPT (Custom GPT Actions)**
 

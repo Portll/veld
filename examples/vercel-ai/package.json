@@ -1,0 +1,17 @@
+{
+  "name": "veld-vercel-ai-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node chat.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.80",
+    "@veld/vercel-ai": "file:../../integrations/vercel-ai",
+    "ai": "^7.0.155",
+    "zod": "^4.6.7"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
