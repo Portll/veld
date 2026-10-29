@@ -135,15 +135,27 @@ While an instance follows a leader, only the frames it applies write to it:
 
 `GET /api/replication/role` takes any API key, and neither the admin key nor a tenant. It
 reports `{role: leader|follower|standalone, instance_id, leader_instance_id?,
-leader_url?, lag_frames?, lag_seconds?, followers_count?, max_lag_frames?}`. A leader is
-an instance that follows nothing and has been polled in the last 10 minutes; it reports
-how many followers did and the largest of their summed `lag_frames`. `lag_frames` sums the tenants' `lag`.
-`lag_seconds` is how far behind the follower was when it last reached its leader: the
-time from the start of the last pass that left every tenant at its head to the end of
-the last pass. It is absent until a pass has caught up, and it does not grow while the
-leader is unreachable. Authenticated responses from a follower carry it as
-`X-Veld-Replica-Lag-Seconds`. `/health/ready` is unchanged: it is public and publishes
-no topology.
+leader_url?, lag_frames?, lag_seconds?, leader_contact_age_seconds?, followers_count?,
+max_lag_frames?}`. A leader is an instance that follows nothing and has been polled in
+the last 10 minutes; it reports how many followers did and the largest of their summed
+`lag_frames`. A follower reports `lag_frames`, the sum of its tenants' `lag`, and two
+times, whole seconds:
+
+- `lag_seconds` is how far behind the leader the follower was at its last catch-up: from
+  the moment the last pass that left every tenant at its head asked the leader for its
+  tenants, to the end of the last pass (a pass ends only once it has read the leader's
+  status). It is absent until a pass has caught up since following began. It holds its
+  value while the leader is unreachable, so it says how current the follower was when
+  the leader went, which is what failover eligibility is decided on.
+- `leader_contact_age_seconds` is the time since a request to the leader last
+  succeeded, its status or a page of its feed, measured when the response is built. It
+  grows while the leader is unreachable, and stays within a poll interval through an
+  initial sync, whose pages each reach the leader. It is absent until the first request
+  succeeds after following began.
+
+A follower's responses to requests whose API key was verified carry them as
+`X-Veld-Replica-Lag-Seconds` and `X-Veld-Replica-Contact-Age-Seconds`, each only when
+known. `/health/ready` is unchanged: it is public and publishes no topology.
 
 ## The leader's view of its followers
 

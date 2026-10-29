@@ -221,10 +221,20 @@ pub struct FollowStatus {
     /// When the leader was asked for its tenants by the last pass that left every
     /// one of them at its head: this follower held all the leader had then.
     pub caught_up_at: Option<DateTime<Utc>>,
+    /// When a request to the leader last succeeded: its status, or a page of its feed.
+    pub leader_contact_at: Option<DateTime<Utc>>,
     pub users: BTreeMap<String, UserProgress>,
 }
 
 impl FollowStatus {
+    /// Seconds from the last successful request to the leader to `now`. Unlike
+    /// [`Self::lag_seconds`] it grows while the leader is unreachable, and it stays
+    /// small through an initial sync, whose pages each reach the leader. None until a
+    /// request has succeeded since following began.
+    pub fn leader_contact_age_seconds(&self, now: DateTime<Utc>) -> Option<u64> {
+        Some((now - self.leader_contact_at?).num_seconds().max(0) as u64)
+    }
+
     /// How far behind its leader this follower was, in seconds, when it last reached
     /// it: the time from the last pass that caught every tenant up to the end of the
     /// last pass. None until a pass has caught up since following began. It does not
@@ -311,6 +321,7 @@ pub struct LeaderRef {
     pub instance_id: Option<uuid::Uuid>,
     pub url: String,
     pub lag_seconds: Option<u64>,
+    pub contact_age_seconds: Option<u64>,
 }
 
 /// What this instance is to replication, as `GET /api/replication/role` reports it.
@@ -334,6 +345,9 @@ pub struct RoleReport {
     pub lag_frames: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag_seconds: Option<u64>,
+    /// See [`FollowStatus::leader_contact_age_seconds`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader_contact_age_seconds: Option<u64>,
     /// Followers that polled in the last [`FOLLOWER_TTL`]; absent when there are none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub followers_count: Option<usize>,
@@ -576,6 +590,14 @@ impl Replication {
             .record_pass(generation, leader_instance_id, listed, asked, finished);
     }
 
+    /// Record a request to the leader that succeeded `at`, if `generation` is current.
+    pub(crate) fn note_leader_contact(&self, generation: u64, at: DateTime<Utc>) {
+        let mut status = self.follow.write();
+        if status.generation == generation {
+            status.leader_contact_at = Some(at);
+        }
+    }
+
     pub fn leader(&self) -> Option<LeaderRef> {
         if !self.is_following() {
             return None;
@@ -586,6 +608,7 @@ impl Replication {
             instance_id: status.leader_instance_id,
             url: target.source.clone(),
             lag_seconds: status.lag_seconds(),
+            contact_age_seconds: status.leader_contact_age_seconds(Utc::now()),
         })
     }
 
@@ -605,6 +628,7 @@ impl Replication {
             leader_url: None,
             lag_frames: None,
             lag_seconds: None,
+            leader_contact_age_seconds: None,
             followers_count: None,
             max_lag_frames: None,
         };
@@ -619,6 +643,7 @@ impl Replication {
             report.leader_url = Some(target.source.clone());
             report.lag_frames = status.lag_frames();
             report.lag_seconds = status.lag_seconds();
+            report.leader_contact_age_seconds = status.leader_contact_age_seconds(now);
         }
         report
     }
@@ -1545,6 +1570,7 @@ async fn sync_user(
             page = get_json(target, Some(&identity), &path) => page?,
             () = shutdown.cancelled() => return Ok(consumed),
         };
+        replication.note_leader_contact(generation, Utc::now());
         head = page.head_lsn;
         if let Some(reason) = divergence(&progress, &page) {
             replication.mark_diverged(generation, cursor, &info.user_id, &reason)?;
@@ -1619,6 +1645,7 @@ async fn poll_once(
         leader = get_json(target, Some(&identity), "/api/admin/replication/status") => leader?,
         () = shutdown.cancelled() => return Ok(0),
     };
+    replication.note_leader_contact(generation, Utc::now());
     if leader.instance_id == Some(instance_id()) {
         let mut status = replication.follow.write();
         if status.generation == generation {
@@ -2332,6 +2359,42 @@ mod tests {
         );
     }
 
+    /// The relay decides failover on `lag_seconds`, which holds still through an outage;
+    /// the contact age is what grows.
+    #[test]
+    fn the_contact_age_grows_through_an_outage_while_the_lag_holds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let at = |s: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + s, 0).unwrap();
+        let replication = Replication::default();
+        replication
+            .follow(dir.path(), "http://127.0.0.1:9", "admin", Some("key"))
+            .unwrap();
+        let generation = replication.status().generation;
+        assert_eq!(replication.role_at(at(0)).leader_contact_age_seconds, None);
+
+        replication.record_pass(generation, None, &[], at(0), at(4));
+        replication.note_leader_contact(generation, at(4));
+        let reached = replication.role_at(at(4));
+        assert_eq!(
+            (reached.lag_seconds, reached.leader_contact_age_seconds),
+            (Some(4), Some(0))
+        );
+
+        let outage = replication.role_at(at(604));
+        assert_eq!(
+            (outage.lag_seconds, outage.leader_contact_age_seconds),
+            (Some(4), Some(600)),
+            "ten minutes without reaching the leader"
+        );
+
+        replication.note_leader_contact(generation - 1, at(700));
+        assert_eq!(
+            replication.role_at(at(704)).leader_contact_age_seconds,
+            Some(700),
+            "a stale poll's contact is not recorded"
+        );
+    }
+
     /// `after_lsn` is the follower's cursor, the last frame it applied; the feed
     /// serves from one past it. The lag must count exactly the frames that request
     /// would be served if nothing capped the page.
@@ -2639,6 +2702,10 @@ mod tests {
         assert!(
             role.lag_seconds.is_some(),
             "the pass caught every tenant up"
+        );
+        assert!(
+            role.leader_contact_age_seconds.is_some_and(|age| age <= 1),
+            "the poll reached the leader: {role:?}"
         );
 
         replication.set_advertised_url(None);

@@ -36,6 +36,9 @@ pub const NOT_REPLICATED: &str = "NOT_REPLICATED";
 /// Seconds this follower was behind its leader when it last reached it; see
 /// `FollowStatus::lag_seconds`. Absent until the follower has caught up once.
 pub const LAG_HEADER: &str = "x-veld-replica-lag-seconds";
+/// Seconds since this follower last reached its leader; see
+/// `FollowStatus::leader_contact_age_seconds`. Grows while the leader is unreachable.
+pub const CONTACT_AGE_HEADER: &str = "x-veld-replica-contact-age-seconds";
 /// A follower stays one until an operator unfollows it, so a refused client is told
 /// to wait rather than retry at once.
 pub const RETRY_AFTER_SECS: u64 = 30;
@@ -388,7 +391,8 @@ fn refusal(code: &str, message: &str, leader: &LeaderRef, name_leader: bool) -> 
 }
 
 /// Applied to every protected route. On a follower it refuses writes and reads of
-/// unreplicated stores, and stamps [`LAG_HEADER`] on authenticated responses.
+/// unreplicated stores, and stamps [`LAG_HEADER`] and [`CONTACT_AGE_HEADER`] on
+/// authenticated responses.
 pub async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let Some(leader) = state.replication.leader() else {
         return next.run(request).await;
@@ -413,10 +417,14 @@ pub async fn guard(State(state): State<AppState>, request: Request, next: Next) 
         ),
         Some(Read | Local) | None => next.run(request).await,
     };
-    if let (true, Some(lag)) = (verified, leader.lag_seconds) {
-        response
-            .headers_mut()
-            .insert(LAG_HEADER, HeaderValue::from(lag));
+    if verified {
+        let headers = response.headers_mut();
+        if let Some(lag) = leader.lag_seconds {
+            headers.insert(LAG_HEADER, HeaderValue::from(lag));
+        }
+        if let Some(age) = leader.contact_age_seconds {
+            headers.insert(CONTACT_AGE_HEADER, HeaderValue::from(age));
+        }
     }
     response
 }
@@ -916,21 +924,34 @@ mod tests {
         );
 
         follow(&harness);
-        let replication = &harness.state().replication;
-        let leader_id = uuid::Uuid::new_v4();
-        let asked = chrono::Utc::now();
-        replication.record_pass(
-            replication.status().generation,
-            Some(leader_id),
-            &[],
-            asked,
-            asked + chrono::Duration::seconds(3),
+        let (_, headers, _) = call(&harness, get("/api/replication/role")).await;
+        assert!(
+            headers.get(CONTACT_AGE_HEADER).is_none(),
+            "not before the leader has been reached"
         );
+        let replication = &harness.state().replication;
+        let generation = replication.status().generation;
+        let leader_id = uuid::Uuid::new_v4();
+        let asked = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let reached = asked + chrono::Duration::seconds(3);
+        replication.record_pass(generation, Some(leader_id), &[], asked, reached);
+        replication.note_leader_contact(generation, reached);
         let (status, headers, body) = call(&harness, get("/api/replication/role")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers.get(LAG_HEADER).unwrap(), "3");
+        let age: u64 = headers[CONTACT_AGE_HEADER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (117..=127).contains(&age),
+            "the leader was last reached about 117 s ago: {age}"
+        );
         assert_eq!(body["leader_instance_id"], leader_id.to_string());
-        assert_eq!(body["lag_seconds"], 3);
+        assert_eq!(body["lag_seconds"], 3, "the lag at the last catch-up");
+        let body_age = body["leader_contact_age_seconds"].as_u64().unwrap();
+        assert!(body_age.abs_diff(age) <= 1, "header {age}, body {body_age}");
         assert_eq!(body["lag_frames"], serde_json::Value::Null);
 
         let (status, headers, body) = call(
