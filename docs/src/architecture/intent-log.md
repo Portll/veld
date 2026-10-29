@@ -93,7 +93,9 @@ read past (`<data>/replication/feed-floors.json`, recorded only while erasure
 is on), and erases a `Forget` only once that floor is at or past it. A follower
 that does not poll for longer than the window is no longer counted: if it had
 applied a memory but not its `Forget`, it keeps the memory. The server warns at
-startup when erasure is on and it can feed followers.
+startup when erasure is on and it can feed followers. A follower with erasure on
+erases the same frames from its own journal: the purge changes no record, so it
+runs on a read-only replica too.
 
 ## Payload shape
 

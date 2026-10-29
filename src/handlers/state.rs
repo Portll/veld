@@ -3206,10 +3206,6 @@ impl MultiUserMemoryManager {
         }
     }
 
-    /// Run maintenance on all cached user memories
-    /// Erase from `user_id`'s sealed journal segments the frames of memories
-    /// forgotten more than `min_age` ago (see [`crate::intent_log::purge`]). One
-    /// pass per tenant at a time; best effort, a failure is logged.
     /// Note that a replication follower asked for `user_id`'s frames after
     /// `after_lsn`, for [`Self::purge_forgotten_journal`]. A fresh follower (no
     /// cursor) needs no protection: it never applied what a purge erases.
@@ -3224,6 +3220,21 @@ impl MultiUserMemoryManager {
             .note(user_id, after_lsn, window, std::time::SystemTime::now());
     }
 
+    /// Heavy cycle: erase from every open tenant's sealed journal segments the frames
+    /// of memories forgotten longer ago than the configured window. Off unless
+    /// VELD_JOURNAL_FORGET_PURGE_DAYS is set. Replay still reaches the same live state,
+    /// so a follower runs it too: its journal holds its own copies of what it applied.
+    fn purge_forgotten_journals(&self) {
+        if let Some(min_age) = self.server_config.journal_forget_purge_age() {
+            for (user_id_arc, _) in self.user_memories.iter() {
+                self.purge_forgotten_journal(user_id_arc.as_ref(), min_age);
+            }
+        }
+    }
+
+    /// Erase from `user_id`'s sealed journal segments the frames of memories
+    /// forgotten more than `min_age` ago (see [`crate::intent_log::purge`]). One
+    /// pass per tenant at a time; best effort, a failure is logged.
     fn purge_forgotten_journal(&self, user_id: &str, min_age: std::time::Duration) {
         let lock = JOURNAL_PURGE_LOCKS
             .entry(user_id.to_string())
@@ -3274,6 +3285,7 @@ impl MultiUserMemoryManager {
         }
     }
 
+    /// Run maintenance on all cached user memories
     pub fn run_maintenance_all_users(&self) -> usize {
         let cycle = self
             .maintenance_cycle
@@ -3300,6 +3312,7 @@ impl MultiUserMemoryManager {
         if !self.replication.client_writes_allowed() {
             if is_heavy {
                 self.compact_vector_indexes();
+                self.purge_forgotten_journals();
                 self.heavy_cycle_housekeeping();
             }
             tracing::debug!(
@@ -3645,15 +3658,8 @@ impl MultiUserMemoryManager {
             }
         }
 
-        // Heavy cycle: erase from sealed journal segments the frames of memories
-        // forgotten longer ago than the configured window. Off unless
-        // VELD_JOURNAL_FORGET_PURGE_DAYS is set.
         if is_heavy {
-            if let Some(min_age) = self.server_config.journal_forget_purge_age() {
-                for (user_id_arc, _) in self.user_memories.iter() {
-                    self.purge_forgotten_journal(user_id_arc.as_ref(), min_age);
-                }
-            }
+            self.purge_forgotten_journals();
         }
 
         // Flush databases only on heavy cycles — flush triggers RocksDB compaction

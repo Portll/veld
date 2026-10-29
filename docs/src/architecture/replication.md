@@ -124,9 +124,9 @@ While an instance follows a leader, only the frames it applies write to it:
   they share.
 - **Maintenance changes no record.** Decay write-back, tier promotion, compression,
   consolidation, fact extraction, graph strengthening and decay, the sleep-time passes and
-  reminder cleanup are skipped; the heavy cycle's flush, cache pruning and vector-index
-  compaction (a rebuild of an index past its rebuild or deleted-vector threshold) still
-  run. Reminders do not fire and the embedding backlog does not drain. The sleep-time
+  reminder cleanup are skipped; the heavy cycle's flush, cache pruning, vector-index
+  compaction (a rebuild of an index past its rebuild or deleted-vector threshold) and
+  journal erasure of forgotten memories (see [the intent log](intent-log.md)) still run. Reminders do not fire and the embedding backlog does not drain. The sleep-time
   workers claim nothing. Work that began before a runtime follow stops writing: a
   maintenance cycle before its next tenant or write phase, a detached `/api/consolidate`
   or `/api/consolidation/sleep` pass before its next phase, and a sleep-time pass before

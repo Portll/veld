@@ -1125,6 +1125,94 @@ mod tests {
         assert_eq!(memory.read().stored_count(), 1);
     }
 
+    /// Journal erasure changes no record, so a follower's heavy cycle erases a forgotten
+    /// memory from its own journal as a leader's does.
+    #[tokio::test]
+    async fn a_followers_heavy_cycle_erases_forgotten_memories_from_its_journal() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config = crate::config::ServerConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            backup_enabled: false,
+            journal_forget_purge_days: 1,
+            ..crate::config::ServerConfig::default()
+        };
+        let manager = crate::handlers::state::MultiUserMemoryManager::new(
+            temp_dir.path().to_path_buf(),
+            config,
+        )
+        .unwrap();
+        let harness = TestHarness::with_manager(manager, temp_dir);
+        let state = harness.state();
+        let log_path = state.user_dir(USER).unwrap().join("intent.log");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+
+        let forgotten = uuid::Uuid::new_v4().to_string();
+        let kept = uuid::Uuid::new_v4().to_string();
+        let remember = |id: &str| IntentPayload::Remember {
+            user_id: USER.into(),
+            memory_id: id.into(),
+            memory_bincode: format!("snapshot of {id}").into_bytes(),
+            schema_version: None,
+        };
+        {
+            // Frames small enough that each sync seals a segment, written two days ago.
+            let mut log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, None).unwrap();
+            log.set_segment_bytes(Some(120));
+            for frame in [
+                remember(&forgotten),
+                IntentPayload::Forget {
+                    user_id: USER.into(),
+                    memory_id: forgotten.clone(),
+                    schema_version: None,
+                },
+                remember(&kept),
+                remember(&kept),
+            ] {
+                log.append(&payload::encode(&frame).unwrap()).unwrap();
+                log.sync().unwrap();
+            }
+            let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 86_400);
+            for segment in log.sealed() {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&segment.path)
+                    .unwrap()
+                    .set_modified(two_days_ago)
+                    .unwrap();
+            }
+        }
+        let journal_holds = |id: &str| {
+            std::fs::read_dir(log_path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.to_string_lossy().contains("intent.log"))
+                .any(|path| {
+                    std::fs::read(&path)
+                        .unwrap()
+                        .windows(id.len())
+                        .any(|window| window == id.as_bytes())
+                })
+        };
+
+        state.get_user_memory(USER).unwrap();
+        follow(&harness);
+        assert!(
+            journal_holds(&forgotten),
+            "the journal holds the memory first"
+        );
+
+        let cycle_state = state.clone();
+        tokio::task::spawn_blocking(move || cycle_state.run_maintenance_all_users())
+            .await
+            .unwrap();
+
+        assert!(
+            !journal_holds(&forgotten),
+            "the follower erased the forgotten memory's frames"
+        );
+        assert!(journal_holds(&kept), "a live memory keeps its frames");
+    }
+
     #[tokio::test]
     async fn unreplicated_stores_answer_not_replicated_on_a_follower() {
         let harness = TestHarness::new();
