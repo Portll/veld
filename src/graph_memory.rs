@@ -914,6 +914,15 @@ pub struct Strengthening {
     pub step: f32,
 }
 
+impl Strengthening {
+    /// A repeat from a source already on the edge that earned no step: strength,
+    /// direction, activation count and tier are as they were, and only `last_activated`
+    /// and the source's repeat count moved.
+    pub fn moves_nothing(&self) -> bool {
+        self.evidence == Evidence::RepeatSource && self.step <= 0.0
+    }
+}
+
 /// Evidence record for an edge created by a strengthening event from `source`.
 pub(crate) fn evidence_from(source: &str) -> BTreeMap<String, u32> {
     let mut sources = BTreeMap::new();
@@ -5801,6 +5810,10 @@ impl GraphMemory {
     /// Implements "neurons that fire together, wire together".
     ///
     /// Uses a mutex to prevent race conditions during concurrent updates (SHO-64).
+    ///
+    /// A repeat from a source already on the edge that earns no step is not written:
+    /// it would only reset the edge's decay clock, in a write the intent log does not
+    /// carry, so a replica's copy of the edge would decay on a different clock.
     pub fn strengthen_synapse(&self, edge_uuid: &Uuid, source: &str) -> Result<()> {
         // Lock with timeout to prevent deadlock on panic
         let _guard = self
@@ -5809,7 +5822,11 @@ impl GraphMemory {
             .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in strengthen_synapse"))?;
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
-            if edge.strengthen_from(source).evidence == Evidence::NewSource {
+            let strengthening = edge.strengthen_from(source);
+            if strengthening.moves_nothing() {
+                return Ok(());
+            }
+            if strengthening.evidence == Evidence::NewSource {
                 self.total_activations.fetch_add(1, Ordering::Relaxed);
             }
 
@@ -5826,7 +5843,8 @@ impl GraphMemory {
     /// More efficient than calling strengthen_synapse individually for each edge.
     /// Uses RocksDB WriteBatch for atomic multi-write and a single lock acquisition.
     ///
-    /// Returns the number of synapses successfully strengthened.
+    /// Returns the number of synapses successfully strengthened. As in
+    /// [`Self::strengthen_synapse`], a repeat that earns no step is not written or counted.
     pub fn batch_strengthen_synapses(&self, edge_uuids: &[Uuid], source: &str) -> Result<usize> {
         if edge_uuids.is_empty() {
             return Ok(0);
@@ -5855,7 +5873,11 @@ impl GraphMemory {
         for (i, result) in results.into_iter().enumerate() {
             if let Ok(Some(value)) = result {
                 if let Ok(mut edge) = RelationshipEdge::decode(&value) {
-                    if edge.strengthen_from(source).evidence == Evidence::NewSource {
+                    let strengthening = edge.strengthen_from(source);
+                    if strengthening.moves_nothing() {
+                        continue;
+                    }
+                    if strengthening.evidence == Evidence::NewSource {
                         activations += 1;
                     }
                     match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
@@ -12120,6 +12142,63 @@ mod repeat_stable_order_tests {
             ["zz-strong", "peer-00", "peer-01", "peer-02", "peer-03"],
             "strength first, then peer name; edge uuids must not choose the survivors"
         );
+    }
+
+    #[test]
+    fn a_repeat_source_that_moves_nothing_is_not_written() {
+        assert_eq!(
+            crate::constants::HEBBIAN_REPEAT_SOURCE_BOOST,
+            0.0,
+            "this test pins the zero-boost default"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+        let a = graph.add_entity(entity("a", 0.5)).unwrap();
+        let b = graph.add_entity(entity("b", 0.5)).unwrap();
+        let c = graph.add_entity(entity("c", 0.5)).unwrap();
+        let first = graph.add_relationship(edge(a, b, 0.3)).unwrap();
+        let second = graph.add_relationship(edge(b, c, 0.3)).unwrap();
+        let stored = |uuid: &Uuid| graph.get_relationship(uuid).unwrap().unwrap();
+
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first], "recall-a")
+                .unwrap(),
+            1
+        );
+        let after_new = stored(&first);
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first], "recall-a")
+                .unwrap(),
+            0
+        );
+        let after_repeat = stored(&first);
+        assert_eq!(after_repeat.last_activated, after_new.last_activated);
+        assert_eq!(
+            after_repeat.strengthening_sources,
+            after_new.strengthening_sources
+        );
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first, second], "recall-a")
+                .unwrap(),
+            1,
+            "the edge new to the source is written, the repeat is not"
+        );
+        assert_eq!(
+            graph
+                .batch_strengthen_synapses(&[first], "recall-b")
+                .unwrap(),
+            1
+        );
+        assert!(stored(&first).strength > after_repeat.strength);
+
+        let before = stored(&second);
+        graph.strengthen_synapse(&second, "recall-a").unwrap();
+        assert_eq!(stored(&second).last_activated, before.last_activated);
+        graph.strengthen_synapse(&second, "recall-c").unwrap();
+        assert!(stored(&second).strength > before.strength);
     }
 
     #[test]
