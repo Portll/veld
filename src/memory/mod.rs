@@ -1054,6 +1054,37 @@ impl MemorySystem {
         Ok(system)
     }
 
+    /// Refill a BM25 index that was recreated empty because its on-disk schema
+    /// was older. The store, not the journal, is the source: memories written
+    /// before the journal existed are only there. One memory is read at a time,
+    /// and the projection's checkpoint is left alone, so its replay re-applies
+    /// the newer tail idempotently.
+    fn refill_rebuilt_bm25(&self) -> Result<()> {
+        let bm25 = self.hybrid_search.bm25_index();
+        if !bm25.take_rebuilt() {
+            return Ok(());
+        }
+        let mut indexed = 0usize;
+        for id in self.long_term_memory.get_all_ids()? {
+            let Ok(memory) = self.long_term_memory.get(&id) else {
+                continue;
+            };
+            if memory.is_forgotten() {
+                continue;
+            }
+            bm25.upsert(
+                &memory.id,
+                &memory.experience.content,
+                &memory.experience.tags,
+                &memory.experience.entities,
+            )?;
+            indexed += 1;
+        }
+        self.hybrid_search.commit_and_reload()?;
+        tracing::info!(indexed, "rebuilt BM25 index refilled from the store");
+        Ok(())
+    }
+
     /// Standalone mode has no journal to replay, so an in-memory index (a sealed
     /// store) is filled from the store itself when the system opens.
     fn backfill_in_memory_bm25(&self) -> Result<()> {
@@ -1589,6 +1620,13 @@ impl MemorySystem {
             hybrid_search_config.vector_weight,
             hybrid_search_config.graph_weight,
         );
+        // Weak, so a BM25 index the tenant registry keeps does not keep the
+        // store (and its lock) open after the tenant is evicted.
+        let content_store = Arc::downgrade(&primary_store);
+        bm25_index.attach_content_source(Arc::new(move |id: &MemoryId| {
+            let store = content_store.upgrade()?;
+            store.get(id).ok().map(|memory| memory.experience.content)
+        }));
         let hybrid_search_engine = hybrid_search::HybridSearchEngine::with_bm25_index(
             bm25_index,
             embedder.clone(),
@@ -1681,7 +1719,7 @@ impl MemorySystem {
         };
 
         let cache_space = embedder.primary_space();
-        Ok(Self {
+        let system = Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
             session_memory: Arc::new(RwLock::new(SessionMemory::new(
@@ -1780,7 +1818,9 @@ impl MemorySystem {
                 prefetch_tick::PrefetchUserState::default(),
             )),
             spreading_path_credit: Arc::new(parking_lot::Mutex::new(Vec::new())),
-        })
+        };
+        system.refill_rebuilt_bm25()?;
+        Ok(system)
     }
 
     /// Wire up GraphMemory for entity relationships and spreading activation
@@ -9835,6 +9875,48 @@ fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
     }
 
     chains
+}
+
+#[cfg(test)]
+mod bm25_rebuild_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// An index left by a version that stored content is rebuilt when the
+    /// system opens and refilled from the store, so its memories stay findable.
+    #[test]
+    fn a_rebuilt_bm25_index_is_refilled_from_the_store() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = || MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let id = {
+            let sys = MemorySystem::new(config(), None).expect("memory system");
+            let experience = Experience {
+                content: "The kumquat grafts took on the north fence".to_string(),
+                ..Default::default()
+            };
+            sys.remember(experience, None).expect("remember")
+        };
+
+        let bm25_path = tmp.path().join(BM25_INDEX_DIR);
+        std::fs::remove_dir_all(&bm25_path).expect("remove index");
+        std::fs::create_dir_all(&bm25_path).expect("index dir");
+        let mut builder = tantivy::schema::Schema::builder();
+        builder.add_text_field("id", tantivy::schema::STRING | tantivy::schema::STORED);
+        builder.add_text_field("content", tantivy::schema::TEXT | tantivy::schema::STORED);
+        builder.add_text_field("tags", tantivy::schema::TEXT);
+        builder.add_text_field("entities", tantivy::schema::TEXT);
+        builder.add_text_field("stemmed_content", tantivy::schema::TEXT);
+        tantivy::Index::create_in_dir(&bm25_path, builder.build()).expect("legacy index");
+
+        let sys = MemorySystem::new(config(), None).expect("reopen");
+        let bm25 = sys.hybrid_search.bm25_index();
+        assert!(!bm25.take_rebuilt(), "the open refilled it");
+        let hits = bm25.search("kumquat grafts", 10).expect("search");
+        assert_eq!(hits.first().map(|hit| &hit.0), Some(&id));
+    }
 }
 
 #[cfg(test)]

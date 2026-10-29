@@ -507,6 +507,10 @@ impl QueuedOp {
     }
 }
 
+/// Looks up a memory's content in the primary store, for the tie order of
+/// [`BM25Index`] search results; `None` when the memory or the store is gone.
+pub type ContentSource = Arc<dyn Fn(&MemoryId) -> Option<String> + Send + Sync>;
+
 /// BM25 Index using Tantivy
 pub struct BM25Index {
     index: Index,
@@ -519,6 +523,11 @@ pub struct BM25Index {
     stemmed_content_field: Field,
     /// Held in RAM only (an encrypted tenant): nothing of it is on disk.
     in_memory: bool,
+    /// Recreated empty at open because the index on disk had an older
+    /// schema; cleared by whoever refills it ([`Self::take_rebuilt`]).
+    rebuilt: std::sync::atomic::AtomicBool,
+    /// Where the tie order reads content, which the index does not store.
+    content_source: RwLock<Option<ContentSource>>,
     /// Upserts and deletes since the last commit, in the writer or queued.
     /// Only changed under the `queued` lock, so a commit reading it there
     /// knows exactly how many operations it covers.
@@ -539,8 +548,8 @@ impl BM25Index {
         // Memory ID (stored, not tokenized)
         schema_builder.add_text_field("id", STRING | STORED);
 
-        // Main content (tokenized for BM25)
-        schema_builder.add_text_field("content", TEXT | STORED);
+        // Main content (tokenized for BM25, not stored: the primary store has it)
+        schema_builder.add_text_field("content", TEXT);
 
         // Tags (tokenized)
         schema_builder.add_text_field("tags", TEXT);
@@ -563,20 +572,21 @@ impl BM25Index {
         let dir = tantivy::directory::MmapDirectory::open(path)
             .context("Failed to open tantivy directory")?;
 
+        let mut rebuilt = false;
         let index = if Index::exists(&dir)? {
             let existing = Index::open(dir).context("Failed to open existing BM25 index")?;
-            // Schema migration: if existing index lacks stemmed_content, rebuild
-            if existing.schema().get_field("stemmed_content").is_err() {
+            if let Some(reason) = Self::legacy_schema(&existing.schema()) {
                 tracing::warn!(
-                    "BM25 schema missing stemmed_content — rebuilding index for stemming support"
+                    path = %path.display(),
+                    reason,
+                    "BM25 index has an older schema; recreating it empty to be refilled",
                 );
                 drop(existing);
-                if let Err(e) = std::fs::remove_dir_all(path) {
-                    tracing::warn!("Failed to remove old BM25 index: {e}");
-                }
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("Failed to remove the old BM25 index at {path:?}"))?;
                 std::fs::create_dir_all(path)?;
-                Index::create_in_dir(path, schema)
-                    .context("Failed to create BM25 index with stemmed_content")?
+                rebuilt = true;
+                Index::create_in_dir(path, schema).context("Failed to recreate BM25 index")?
             } else {
                 existing
             }
@@ -584,14 +594,41 @@ impl BM25Index {
             Index::create_in_dir(path, schema).context("Failed to create BM25 index")?
         };
         info!("BM25 index initialized at {:?}", path);
-        Self::from_index(index, false)
+        let index = Self::from_index(index, false)?;
+        index.rebuilt.store(rebuilt, Ordering::Relaxed);
+        Ok(index)
+    }
+
+    /// Why an index written by an older version must be rebuilt, if it must.
+    fn legacy_schema(schema: &Schema) -> Option<&'static str> {
+        if schema.get_field("stemmed_content").is_err() {
+            return Some("no stemmed_content field");
+        }
+        match schema.get_field("content") {
+            Ok(field) if schema.get_field_entry(field).is_stored() => {
+                Some("content is stored, duplicating the primary store")
+            }
+            Ok(_) => None,
+            Err(_) => Some("no content field"),
+        }
+    }
+
+    /// Whether the index was recreated empty at open and still needs filling,
+    /// clearing the flag: exactly one caller refills it.
+    pub fn take_rebuilt(&self) -> bool {
+        self.rebuilt.swap(false, Ordering::Relaxed)
+    }
+
+    /// Read tie-order content from `source`, replacing any earlier source.
+    pub fn attach_content_source(&self, source: ContentSource) {
+        *self.content_source.write() = Some(source);
     }
 
     /// The index for an ENCRYPTED tenant: built in RAM, never written to disk.
     ///
-    /// It stores each memory's `content` and every token's positions, so on disk
-    /// beside a sealed store and journal it would be a plaintext copy of every
-    /// memory. It starts empty and its projection replays the whole intent log;
+    /// It holds every token of each memory's `content` with its positions, so on
+    /// disk beside a sealed store and journal it would be a plaintext copy of
+    /// every memory. It starts empty and its projection replays the whole intent log;
     /// an index left at `path` from before encryption is deleted as plaintext.
     pub fn in_memory(path: &Path) -> Result<Self> {
         if path.exists() {
@@ -658,6 +695,8 @@ impl BM25Index {
             entities_field,
             stemmed_content_field,
             in_memory,
+            rebuilt: std::sync::atomic::AtomicBool::new(false),
+            content_source: RwLock::new(None),
             uncommitted: AtomicU64::new(0),
             queued: parking_lot::Mutex::new(Vec::new()),
             last_commit: parking_lot::Mutex::new(Instant::now()),
@@ -927,15 +966,11 @@ impl BM25Index {
                     .and_then(|v| v.as_str())
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 if let Some(uuid) = id {
-                    let content = doc
-                        .get_first(self.content_field)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    scored.push((MemoryId(uuid), score, content));
+                    scored.push((MemoryId(uuid), score, String::new()));
                 }
             }
         }
+        self.fill_tied_content(&mut scored);
         scored.sort_by(|a, b| {
             b.1.total_cmp(&a.1)
                 .then_with(|| a.2.cmp(&b.2))
@@ -947,6 +982,28 @@ impl BM25Index {
             .into_iter()
             .map(|(id, score, _)| (id, score))
             .collect())
+    }
+
+    /// Read the content of every hit that shares its score with another hit,
+    /// the only hits whose order content decides. TopDocs returns hits in
+    /// descending score, so equal scores are adjacent.
+    fn fill_tied_content(&self, scored: &mut [(MemoryId, f32, String)]) {
+        let Some(source) = self.content_source.read().clone() else {
+            return;
+        };
+        let mut start = 0;
+        while start < scored.len() {
+            let mut end = start + 1;
+            while end < scored.len() && scored[end].1 == scored[start].1 {
+                end += 1;
+            }
+            if end - start > 1 {
+                for hit in &mut scored[start..end] {
+                    hit.2 = source(&hit.0).unwrap_or_default();
+                }
+            }
+            start = end;
+        }
     }
 
     /// Get document count
@@ -2010,6 +2067,161 @@ impl HybridSearchEngine {
 mod tests {
     use super::*;
 
+    /// The schema every index had before content stopped being stored.
+    fn stored_content_schema() -> Schema {
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("content", TEXT | STORED);
+        builder.add_text_field("tags", TEXT);
+        builder.add_text_field("entities", TEXT);
+        builder.add_text_field("stemmed_content", TEXT);
+        builder.build()
+    }
+
+    /// Write `docs` (id, content, tags) with BM25Index's writer settings and
+    /// wait for merges, so two schemas are compared on settled segments.
+    fn write_settled_index(path: &Path, schema: Schema, docs: &[(String, String, String)]) {
+        std::fs::create_dir_all(path).unwrap();
+        let index = Index::create_in_dir(path, schema.clone()).unwrap();
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        let field = |name| schema.get_field(name).unwrap();
+        for (id, content, tags) in docs {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(field("id"), id);
+            doc.add_text(field("content"), content);
+            doc.add_text(field("stemmed_content"), stem_text(content));
+            doc.add_text(field("tags"), tags);
+            doc.add_text(field("entities"), "");
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+    }
+
+    fn dir_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum()
+    }
+
+    /// An index written while content was stored is recreated empty with the
+    /// current schema, flagged once for its owner to refill, and opened as is
+    /// from then on.
+    #[test]
+    fn an_index_that_stores_content_is_rebuilt_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("bm25");
+        let legacy = vec![(
+            uuid::Uuid::new_v4().to_string(),
+            "legacy persimmon entry".to_string(),
+            String::new(),
+        )];
+        write_settled_index(&path, stored_content_schema(), &legacy);
+
+        let index = BM25Index::new(&path).unwrap();
+        assert_eq!(index.len(), 0, "the old documents are gone");
+        let schema = index.index.schema();
+        let content = schema.get_field("content").unwrap();
+        assert!(!schema.get_field_entry(content).is_stored());
+        assert!(index.take_rebuilt());
+        assert!(!index.take_rebuilt(), "only one caller refills it");
+
+        let id = MemoryId(uuid::Uuid::new_v4());
+        index
+            .upsert(&id, "refilled persimmon entry", &[], &[])
+            .unwrap();
+        index.commit_pending().unwrap();
+        drop(index);
+        let reopened = BM25Index::new(&path).unwrap();
+        assert!(!reopened.take_rebuilt());
+        assert_eq!(reopened.search("persimmon", 10).unwrap()[0].0, id);
+    }
+
+    /// Hits with equal scores are ordered by content, read from the attached
+    /// source since the index no longer stores it; without one, by id.
+    #[test]
+    fn tied_hits_are_ordered_by_content_from_the_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let index = BM25Index::new(temp_dir.path()).unwrap();
+        let later_id = MemoryId(uuid::Uuid::from_u128(2));
+        let earlier_id = MemoryId(uuid::Uuid::from_u128(1));
+        let contents: HashMap<MemoryId, &str> = [
+            (later_id.clone(), "alpha beta"),
+            (earlier_id.clone(), "beta alpha"),
+        ]
+        .into_iter()
+        .collect();
+        for (id, content) in &contents {
+            index.upsert(id, content, &[], &[]).unwrap();
+        }
+        index.commit_pending().unwrap();
+
+        let by_id = index.search("alpha", 2).unwrap();
+        assert_eq!(by_id[0].1, by_id[1].1, "precondition: the scores tie");
+        assert_eq!(by_id[0].0, earlier_id);
+
+        let source = contents
+            .iter()
+            .map(|(id, content)| (id.clone(), content.to_string()))
+            .collect::<HashMap<_, _>>();
+        index.attach_content_source(Arc::new(move |id| source.get(id).cloned()));
+        let by_content = index.search("alpha", 2).unwrap();
+        assert_eq!(by_content[0].0, later_id, "\"alpha beta\" sorts first");
+        assert_eq!(index.search("alpha", 1).unwrap()[0].0, later_id);
+    }
+
+    /// Index bytes per memory over the LoCoMo corpus, with content stored (the
+    /// old schema) and without. A measurement:
+    /// `scripts/test-local.sh --lib bm25_bytes_per_memory -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement; run with --ignored --nocapture"]
+    fn bm25_bytes_per_memory() {
+        let corpus = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/recall/corpora/locomo.jsonl"),
+        )
+        .unwrap();
+        let docs: Vec<(String, String, String)> = corpus
+            .lines()
+            .map(|line| {
+                let item: serde_json::Value = serde_json::from_str(line).unwrap();
+                let tags = item["tags"]
+                    .as_array()
+                    .map(|tags| {
+                        tags.iter()
+                            .filter_map(|t| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    item["content"].as_str().unwrap().to_string(),
+                    tags,
+                )
+            })
+            .collect();
+        let content_bytes: usize = docs.iter().map(|d| d.1.len()).sum();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stored = temp_dir.path().join("stored");
+        let unstored = temp_dir.path().join("unstored");
+        write_settled_index(&stored, stored_content_schema(), &docs);
+        write_settled_index(&unstored, BM25Index::schema(), &docs);
+        let n = docs.len() as f64;
+        let (before, after) = (dir_bytes(&stored), dir_bytes(&unstored));
+        println!(
+            "memories={} content={:.1} B/memory  stored={:.1} B/memory  unstored={:.1} B/memory  saved={:.1}%",
+            docs.len(),
+            content_bytes as f64 / n,
+            before as f64 / n,
+            after as f64 / n,
+            100.0 * (before - after) as f64 / before as f64
+        );
+        assert!(after < before);
+    }
+
     /// A write that finds a commit holding the writer is queued instead of
     /// waiting, and the next commit applies the queue in arrival order.
     #[test]
@@ -2265,14 +2477,17 @@ mod tests {
         let index = BM25Index::new(temp_dir.path()).unwrap();
         // Same length, same term frequency: every document scores the same for "lantern".
         // Written in reverse content order, one commit each, so doc order is not content order.
+        let mut contents_by_id = HashMap::new();
         for i in (0..12).rev() {
             let id = MemoryId(uuid::Uuid::new_v4());
-            index
-                .upsert(&id, &format!("lantern marker{i:02}"), &[], &[])
-                .unwrap();
+            let content = format!("lantern marker{i:02}");
+            index.upsert(&id, &content, &[], &[]).unwrap();
             index.commit().unwrap();
+            contents_by_id.insert(id, content);
         }
         index.reload().unwrap();
+        let source = contents_by_id.clone();
+        index.attach_content_source(Arc::new(move |id| source.get(id).cloned()));
 
         let results = index.search("lantern", 3).unwrap();
         assert_eq!(results.len(), 3);
@@ -2281,22 +2496,10 @@ mod tests {
             "fixture must tie"
         );
 
-        let searcher = index.reader.searcher();
-        let content_of = |id: &MemoryId| -> String {
-            let query = tantivy::query::TermQuery::new(
-                tantivy::Term::from_field_text(index.id_field, &id.0.to_string()),
-                tantivy::schema::IndexRecordOption::Basic,
-            );
-            let hits = searcher
-                .search(&query, &TopDocs::with_limit(1).order_by_score())
-                .unwrap();
-            let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
-            doc.get_first(index.content_field)
-                .and_then(|v| v.as_str())
-                .unwrap()
-                .to_string()
-        };
-        let contents: Vec<String> = results.iter().map(|(id, _)| content_of(id)).collect();
+        let contents: Vec<String> = results
+            .iter()
+            .map(|(id, _)| contents_by_id[id].clone())
+            .collect();
         assert_eq!(
             contents,
             ["lantern marker00", "lantern marker01", "lantern marker02"]
