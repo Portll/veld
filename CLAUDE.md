@@ -386,3 +386,12 @@ The default release binary is ~30 MB. `--features embedded-docs` adds ~3-5 MB fo
 - **Rectification / remediation**: [RECTIFICATION.md](RECTIFICATION.md), [REMEDIATION_PLAN.md](REMEDIATION_PLAN.md).
 
 The memory system you're using IS this codebase. Meta, but useful context.
+
+## Operating rules (token efficiency)
+
+- One task per session. When it lands, or context reaches about 150k tokens, write the handoff into
+  the spine task, run /session, and stop.
+- Never wait in a session for a verdict or CI. Hand the wait to the land job or the batch
+  coordinator, and end the session.
+- Batch status checks into one command; do not poll.
+- Anything a spine task record can carry (state, results, handoffs) goes there, not in SendMessage.
