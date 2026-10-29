@@ -117,6 +117,15 @@ on:
           default, e.g. rerank_context. Not gated: pair it with record=true.
         required: false
         default: ''
+      stage_trace:
+        description: >-
+          true adds, per case, gold's rank and the leading memory at every recall stage to the
+          per-case output, naming the stage at which another memory took rank 1. Diagnostic: it
+          sorts inside the timed recall, so latency is not comparable with a run without it.
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
       embedder:
         description: >-
           Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
@@ -280,6 +289,10 @@ jobs:
           # can be read as rank-low (gold in 11..100) or never retrieved. The headline metrics come
           # from the production-depth query alone (src/recall_harness/runner.rs, diag_k).
           RECALL_DIAG_K: '100'
+          # Gold's rank and the leading memory at every recall stage, per case, in the per-case
+          # output (memory::gold_funnel). It sorts inside the timed recall, so it is off unless
+          # dispatched with stage_trace=true.
+          RECALL_STAGE_TRACE: ${{ github.event.inputs.stage_trace == 'true' && '1' || '' }}
           # The reranker dials. Empty is unset: CognitiveDials::from_env keeps None for an
           # empty model id (sanitized away) and an unparsable count.
           VELD_DIALS_RERANK_MODEL: ${{ github.event.inputs.rerank_model || '' }}

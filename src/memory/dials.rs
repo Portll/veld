@@ -303,6 +303,11 @@ pub struct CognitiveDials {
     pub ce_blend_relational: Option<f32>,
     #[serde(default)]
     pub ce_blend_abstract: Option<f32>,
+    /// Layer 5.97: a leading result within this fraction of rank 1's score joins the top
+    /// `constants::CE_TOP_ORDER_COUNT` the cross-encoder orders; `0` leaves rank 1 alone.
+    /// Default `constants::CE_TOP_MARGIN`. The `ce_top_order` signal switches the layer off.
+    #[serde(default)]
+    pub ce_top_margin: Option<f32>,
     /// Layer 5.36 query-term coverage weight; `0` disables. Default
     /// `constants::QUERY_COVERAGE_WEIGHT`.
     #[serde(default)]
@@ -354,7 +359,7 @@ pub struct CognitiveDials {
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
     /// `people_density`, `prf`, `entity_overlap`, `length_penalty`,
     /// `temporal_topic_dedup`, `temporal_fact_boost`, `temporal_fact_untimed_fallback`,
-    /// `turn_context`, `neighbour_expansion`.
+    /// `turn_context`, `neighbour_expansion`, `ce_top_order`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
 
@@ -585,6 +590,17 @@ pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
         step: 0.05,
     },
     RecallSliderSpec {
+        id: "ce_top_margin",
+        group: "Rerank",
+        label: "CE orders the top three",
+        default: 1.0,
+        rec_lo: 0.2,
+        rec_hi: 1.0,
+        abs_lo: 0.0,
+        abs_hi: 1.0,
+        step: 0.05,
+    },
+    RecallSliderSpec {
         id: "query_coverage_weight",
         group: "Weights",
         label: "Query-term coverage",
@@ -759,6 +775,7 @@ impl Default for CognitiveDials {
             ce_blend_attribute: None,
             ce_blend_relational: None,
             ce_blend_abstract: None,
+            ce_top_margin: None,
             query_coverage_weight: None,
             people_boost_max: None,
             use_prf: None,
@@ -850,6 +867,7 @@ impl CognitiveDials {
         cl(&mut self.ce_blend_attribute, 0.0, 1.0);
         cl(&mut self.ce_blend_relational, 0.0, 1.0);
         cl(&mut self.ce_blend_abstract, 0.0, 1.0);
+        cl(&mut self.ce_top_margin, 0.0, 1.0);
         cl(&mut self.query_coverage_weight, 0.0, 0.9);
         cl(&mut self.people_boost_max, 0.0, 1.0);
         cl(&mut self.prf_weight, 0.0, 2.0);
@@ -1080,6 +1098,7 @@ impl CognitiveDials {
             env_parse::<f32>("VELD_TUNE_CE_BLEND_RELATIONAL").or(d.ce_blend_relational);
         d.ce_blend_abstract =
             env_parse::<f32>("VELD_TUNE_CE_BLEND_ABSTRACT").or(d.ce_blend_abstract);
+        d.ce_top_margin = env_parse::<f32>("VELD_TUNE_CE_TOP_MARGIN").or(d.ce_top_margin);
         d.query_coverage_weight =
             env_parse::<f32>("VELD_TUNE_QUERY_COVERAGE_WEIGHT").or(d.query_coverage_weight);
         d.people_boost_max = env_parse::<f32>("VELD_TUNE_PEOPLE_BOOST_MAX").or(d.people_boost_max);
@@ -1257,6 +1276,7 @@ mod tests {
             "temporal_fact_untimed_fallback",
             "turn_context",
             "neighbour_expansion",
+            "ce_top_order",
         ];
         for id in &all_ids {
             assert!(

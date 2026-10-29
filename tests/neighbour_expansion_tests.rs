@@ -250,9 +250,9 @@ fn recall_turtles(system: &MemorySystem, gold: &MemoryId) -> Recalled {
     let funnel = veld::memory::gold_funnel::take().expect("funnel armed");
     let neighbour_stage = funnel
         .iter()
-        .find(|(stage, _)| stage == "neighbour")
+        .find(|s| s.stage == "neighbour")
         .unwrap_or_else(|| panic!("no neighbour stage in {funnel:?}"))
-        .1;
+        .gold_rank;
     Recalled {
         ids: hits.iter().map(|m| m.id.clone()).collect(),
         contents: hits.iter().map(|m| m.experience.content.clone()).collect(),

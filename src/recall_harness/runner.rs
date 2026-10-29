@@ -30,8 +30,9 @@ use super::metrics::{paired_bootstrap_ci, Metrics};
 use super::report::{
     aggregate_category, aggregate_layer, median, AblationCaseRow, AblationReport, AblationRow,
     CategoryReport, DeltaCi, Failure, FunnelReport, FunnelStageRow, GraphStructure, LayerReport,
-    LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord,
-    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, RetrievalDials, SMOKE_K,
+    LearningCurveArm, LearningCurveReport, LinkingReport, LinkingRow, PerCaseRecord, RankedResult,
+    ReachabilityCategory, ReachabilityReport, Report, RerankSetting, RetrievalDials, StageTrace,
+    SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -472,7 +473,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
                 .expect("repeat 0 must have mode");
             (
                 mode.report_key().to_string(),
-                build_per_case_records(&cases, &mp.per_case, &mp.ranks, &mp.deep_ranks),
+                build_per_case_records(&cases, &mp.per_case, &mp.ranks, &mp.deep_ranks, &mp.traces),
             )
         })
         .collect();
@@ -510,6 +511,7 @@ fn build_per_case_records(
     metrics: &[Metrics],
     ranks: &[CaseRankList],
     deep_ranks: &[CaseRankList],
+    traces: &[CaseTrace],
 ) -> Vec<PerCaseRecord> {
     cases
         .iter()
@@ -565,9 +567,73 @@ fn build_per_case_records(
                 missed,
                 recall_at_50: recall_at(50),
                 recall_at_100: recall_at(100),
+                top: traces[i].top.clone(),
+                stages: traces[i].stages.clone(),
             }
         })
         .collect()
+}
+
+/// How many leading results each case's trace keeps; the best-ranked gold below them is added.
+const TRACE_TOP: usize = 3;
+
+/// One case's trace: its leading results with attribution and, under `RECALL_STAGE_TRACE=1`,
+/// gold's rank and the leader at each recall stage.
+#[derive(Default)]
+struct CaseTrace {
+    top: Vec<RankedResult>,
+    stages: Vec<StageTrace>,
+}
+
+fn case_trace(
+    scored: &[(Uuid, f32)],
+    relevance: &HashMap<Uuid, f32>,
+    attributions: &HashMap<MemoryId, crate::memory::types::SignalAttribution>,
+    stages: Vec<crate::memory::gold_funnel::FunnelStage>,
+    uuid_to_corpus_id: &HashMap<Uuid, String>,
+) -> CaseTrace {
+    let corpus_id = |u: &Uuid| {
+        uuid_to_corpus_id
+            .get(u)
+            .cloned()
+            .unwrap_or_else(|| format!("<unknown:{u}>"))
+    };
+    let first_gold_below = scored
+        .iter()
+        .position(|(u, _)| relevance.contains_key(u))
+        .filter(|i| *i >= TRACE_TOP);
+    let top = (0..scored.len().min(TRACE_TOP))
+        .chain(first_gold_below)
+        .map(|i| {
+            let (uuid, score) = scored[i];
+            let attr = attributions
+                .get(&MemoryId(uuid))
+                .cloned()
+                .unwrap_or_default();
+            RankedResult {
+                rank: i + 1,
+                id: corpus_id(&uuid),
+                gold: relevance.contains_key(&uuid),
+                score,
+                bm25: attr.bm25_contribution,
+                vector: attr.vector_contribution,
+                graph: attr.graph_contribution,
+                cross_encoder: attr.cross_encoder_contribution,
+                recency: attr.recency_contribution,
+                temporal_match: attr.temporal_match,
+                entity_overlap: attr.entity_overlap,
+            }
+        })
+        .collect();
+    let stages = stages
+        .into_iter()
+        .map(|s| StageTrace {
+            stage: s.stage,
+            gold_rank: s.gold_rank.map(|r| r + 1),
+            leader: s.leader.map(|id| corpus_id(&id.0)),
+        })
+        .collect();
+    CaseTrace { top, stages }
 }
 
 /// Per-case results for one `LayerMode` within a single ingest+query pass.
@@ -583,6 +649,8 @@ struct ModePassResult {
     /// diagnostic is off this is a copy of `ranks`. Diagnostic side channel
     /// only — never folded into gated aggregates or the determinism check.
     deep_ranks: Vec<CaseRankList>,
+    /// Per-case traces aligned with `ranks`; diagnostic only, like `deep_ranks`.
+    traces: Vec<CaseTrace>,
 }
 
 /// Output of one ingest pass plus N mode-keyed query passes over the
@@ -736,12 +804,21 @@ fn run_one_pass(
         .map(std::path::PathBuf::from);
     let mut pool_lines: Vec<String> = Vec::new();
 
+    // Per-stage trace (`RECALL_STAGE_TRACE=1`): arms `memory::gold_funnel` around each production
+    // recall, so the per-case output names the stage at which a non-gold memory took rank 1. The
+    // armed funnel sorts two candidate lists per query inside the timed call; off by default so
+    // the gated latency of a run that does not ask for it is untouched.
+    let stage_trace = std::env::var("RECALL_STAGE_TRACE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     for mode in layer_modes {
         let mut per_case = Vec::with_capacity(cases.len());
         let mut latencies_ms = Vec::with_capacity(cases.len());
         let mut by_category_cases: HashMap<SmokeCategory, Vec<Metrics>> = HashMap::new();
         let mut ranks: Vec<CaseRankList> = Vec::with_capacity(cases.len());
         let mut deep_ranks: Vec<CaseRankList> = Vec::with_capacity(cases.len());
+        let mut traces: Vec<CaseTrace> = Vec::with_capacity(cases.len());
 
         for case in cases {
             let mut query = Query {
@@ -764,11 +841,15 @@ fn run_one_pass(
                         .collect(),
                 );
             }
+            if stage_trace {
+                crate::memory::gold_funnel::begin(relevance.keys().map(|u| MemoryId(*u)).collect());
+            }
 
             let started = Instant::now();
             let result = system.read().recall(&query);
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             latencies_ms.push(elapsed_ms);
+            let funnel = crate::memory::gold_funnel::take().unwrap_or_default();
 
             let memories = match result {
                 Ok(m) => m,
@@ -787,6 +868,17 @@ fn run_one_pass(
             };
 
             let retrieved_uuids: Vec<Uuid> = memories.iter().map(|m| m.id.0).collect();
+            let scored: Vec<(Uuid, f32)> = memories
+                .iter()
+                .map(|m| (m.id.0, m.score.unwrap_or(0.0)))
+                .collect();
+            traces.push(case_trace(
+                &scored,
+                &relevance,
+                &system.read().last_signal_attributions(),
+                funnel,
+                &uuid_to_corpus_id,
+            ));
             let retrieved_corpus_ids: Vec<String> = retrieved_uuids
                 .iter()
                 .map(|u| {
@@ -929,6 +1021,7 @@ fn run_one_pass(
                 latencies_ms,
                 ranks,
                 deep_ranks,
+                traces,
             },
         );
     }
@@ -2799,7 +2892,25 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
         .filter(|k| *k >= SMOKE_K)
         .unwrap_or(SMOKE_K);
 
-    const STAGES: [&str; 5] = ["graph", "vector", "hybrid", "fusion", "final"];
+    const STAGES: [&str; 17] = [
+        "graph",
+        "vector",
+        "hybrid",
+        "date_window",
+        "rrf",
+        "boosts",
+        "fusion",
+        "unified",
+        "cross_encoder",
+        "fragment_demotion",
+        "coverage_people",
+        "derank_mmr",
+        "answer_type_linguistic",
+        "temporal_range",
+        "ordinal_abstention",
+        "sufficiency",
+        "final",
+    ];
 
     #[derive(Default, Clone)]
     struct Acc {
@@ -2849,14 +2960,17 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
         let _ = system.read().recall(&query);
         let funnel = crate::memory::gold_funnel::take().unwrap_or_default();
 
-        for (stage, rank) in &funnel {
-            overall.entry(stage.clone()).or_default().record(*rank);
+        for s in &funnel {
+            overall
+                .entry(s.stage.clone())
+                .or_default()
+                .record(s.gold_rank);
             by_cat
                 .entry(cat.clone())
                 .or_default()
-                .entry(stage.clone())
+                .entry(s.stage.clone())
                 .or_default()
-                .record(*rank);
+                .record(s.gold_rank);
         }
     }
 
@@ -4518,10 +4632,11 @@ mod tests {
                 retrieved: vec!["ssm-010".into()],
             },
         ];
+        let traces = vec![CaseTrace::default(), CaseTrace::default()];
 
         // Diagnostic off: the deep list is a copy of the production list, so
         // the depth fields degrade to plain wider cutoffs of the same list.
-        let recs = build_per_case_records(&cases, &metrics, &ranks, &ranks);
+        let recs = build_per_case_records(&cases, &metrics, &ranks, &ranks, &traces);
         assert_eq!(recs.len(), 2);
 
         let r0 = &recs[0];
@@ -4560,13 +4675,107 @@ mod tests {
                 retrieved: vec!["ssm-010".into()],
             },
         ];
-        let recs = build_per_case_records(&cases, &metrics, &ranks, &deep_ranks);
+        let recs = build_per_case_records(&cases, &metrics, &ranks, &deep_ranks, &traces);
         let r0 = &recs[0];
         assert_eq!(r0.missed, vec!["ssm-002".to_string()]);
         assert_eq!(r0.relevant_found, 1);
         assert_eq!(r0.recall_at_k, 0.5);
         assert_eq!(r0.recall_at_50, 1.0);
         assert_eq!(r0.recall_at_100, 1.0);
+        assert!(r0.top.is_empty() && r0.stages.is_empty());
+    }
+
+    #[test]
+    fn case_trace_keeps_the_leaders_and_the_gold_below_them() {
+        let ids: Vec<Uuid> = (1..=6).map(Uuid::from_u128).collect();
+        let uuid_to_corpus_id: HashMap<Uuid, String> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (*u, format!("t{}", i + 1)))
+            .collect();
+        let scored: Vec<(Uuid, f32)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (*u, 1.0 - i as f32 * 0.1))
+            .collect();
+        let relevance = HashMap::from([(ids[4], 1.0)]);
+        let attributions = HashMap::from([(
+            MemoryId(ids[0]),
+            crate::memory::types::SignalAttribution {
+                bm25_contribution: 0.4,
+                cross_encoder_contribution: 0.7,
+                entity_overlap: true,
+                ..Default::default()
+            },
+        )]);
+        let stages = vec![
+            crate::memory::gold_funnel::FunnelStage {
+                stage: "rrf".into(),
+                gold_rank: Some(0),
+                leader: Some(MemoryId(ids[4])),
+            },
+            crate::memory::gold_funnel::FunnelStage {
+                stage: "final".into(),
+                gold_rank: Some(4),
+                leader: Some(MemoryId(ids[0])),
+            },
+        ];
+
+        let trace = case_trace(
+            &scored,
+            &relevance,
+            &attributions,
+            stages,
+            &uuid_to_corpus_id,
+        );
+
+        let ranks: Vec<(usize, &str, bool)> = trace
+            .top
+            .iter()
+            .map(|r| (r.rank, r.id.as_str(), r.gold))
+            .collect();
+        assert_eq!(
+            ranks,
+            vec![
+                (1, "t1", false),
+                (2, "t2", false),
+                (3, "t3", false),
+                (5, "t5", true)
+            ]
+        );
+        assert_eq!(trace.top[0].bm25, 0.4);
+        assert_eq!(trace.top[0].cross_encoder, 0.7);
+        assert!(trace.top[0].entity_overlap);
+        assert_eq!(trace.top[3].bm25, 0.0);
+        assert_eq!(
+            trace.stages,
+            vec![
+                StageTrace {
+                    stage: "rrf".into(),
+                    gold_rank: Some(1),
+                    leader: Some("t5".into()),
+                },
+                StageTrace {
+                    stage: "final".into(),
+                    gold_rank: Some(5),
+                    leader: Some("t1".into()),
+                },
+            ]
+        );
+
+        let gold_on_top = HashMap::from([(ids[1], 1.0)]);
+        let trace = case_trace(
+            &scored,
+            &gold_on_top,
+            &attributions,
+            Vec::new(),
+            &uuid_to_corpus_id,
+        );
+        assert_eq!(
+            trace.top.len(),
+            TRACE_TOP,
+            "gold inside the top adds no row"
+        );
     }
 
     /// Smoke test the full runner end-to-end against the canonical fixtures.

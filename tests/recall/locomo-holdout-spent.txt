@@ -174,3 +174,35 @@ conv-50_q155
 conv-26_q0
 conv-26_q25
 conv-26_q98
+#
+# 2026-10-30, veld-e4: the 29 cases whose top-1 fell from fusion=rrf (72f8f303), read case by case
+# from veld-0a's hold-out pair (head 2300c637 against fc8793e1) to diagnose the top-1 swaps.
+conv-26_q78
+conv-26_q143
+conv-30_q36
+conv-30_q50
+conv-30_q66
+conv-30_q70
+conv-41_q4
+conv-41_q51
+conv-41_q130
+conv-43_q159
+conv-44_q64
+conv-44_q75
+conv-47_q69
+conv-47_q105
+conv-48_q26
+conv-48_q58
+conv-48_q92
+conv-48_q163
+conv-48_q167
+conv-48_q172
+conv-49_q8
+conv-49_q65
+conv-49_q80
+conv-49_q93
+conv-49_q96
+conv-50_q24
+conv-50_q66
+conv-50_q72
+conv-50_q105

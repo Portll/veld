@@ -284,6 +284,41 @@ pub struct PerCaseRecord {
     pub recall_at_50: f64,
     #[serde(default)]
     pub recall_at_100: f64,
+    /// The top results of the production list plus the best-ranked gold below them, with the
+    /// signal attribution recall recorded for each. Says what took rank 1 when gold did not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<RankedResult>,
+    /// Gold's rank and the leading memory at each recall stage boundary, from
+    /// `memory::gold_funnel`. Present only under `RECALL_STAGE_TRACE=1`. Says which stage put the
+    /// leader above gold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<StageTrace>,
+}
+
+/// One result of a case's production list. `rank` is 1-based. The signal fields copy
+/// `SignalAttribution`; zero and false where recall recorded nothing for the memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RankedResult {
+    pub rank: usize,
+    pub id: String,
+    pub gold: bool,
+    pub score: f32,
+    pub bm25: f32,
+    pub vector: f32,
+    pub graph: f32,
+    pub cross_encoder: f32,
+    pub recency: f32,
+    pub temporal_match: bool,
+    pub entity_overlap: bool,
+}
+
+/// One recall stage boundary for one case. `gold_rank` is 1-based, None when no gold memory is
+/// in the stage's list; `leader` is the corpus id at rank 1 there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StageTrace {
+    pub stage: String,
+    pub gold_rank: Option<usize>,
+    pub leader: Option<String>,
 }
 
 /// One arm of the E6c planted-repetition study. `recall@10` / `ndcg@10` / `mrr`
