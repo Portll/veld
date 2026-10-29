@@ -165,11 +165,18 @@ def check(args):
         names.append(row["upstream_commit"][:7])
         return any(n and n in body for n in names)
 
+    reachable = set()
+
     def veld_commit_exists(ref):
+        # A commit exists if a fresh clone of origin can reach it: from HEAD or an origin branch.
+        # A local clone keeps the objects and tags a history rewrite took off origin, so object
+        # presence passed here while CI failed on the same tree.
+        if not reachable:
+            reachable.update(git(args.veld, "rev-list", "HEAD", "--remotes=origin").split())
         if ref not in commit_ok:
-            r = subprocess.run(["git", "-C", args.veld, "cat-file", "-e", f"{ref}^{{commit}}"],
-                               capture_output=True)
-            commit_ok[ref] = r.returncode == 0
+            r = subprocess.run(["git", "-C", args.veld, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                               capture_output=True, text=True)
+            commit_ok[ref] = r.returncode == 0 and r.stdout.strip() in reachable
         return commit_ok[ref]
 
     for n, r in enumerate(rows, start=2):
