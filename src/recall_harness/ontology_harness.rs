@@ -180,6 +180,7 @@ pub fn generate_ontology_fixtures(items: usize) -> (Vec<CorpusItem>, Vec<SmokeCa
             memory_type: "fact".to_string(),
             tags: vec![],
             created_at: base + chrono::Duration::minutes(8 * i as i64),
+            episode: None,
         });
         for d in 0..DISTRACTORS_PER_ITEM {
             // Stride the org list so each item's distractors are distinct orgs.
@@ -190,6 +191,7 @@ pub fn generate_ontology_fixtures(items: usize) -> (Vec<CorpusItem>, Vec<SmokeCa
                 memory_type: "fact".to_string(),
                 tags: vec![],
                 created_at: base + chrono::Duration::minutes(8 * i as i64 + 1 + d as i64),
+                episode: None,
             });
         }
 

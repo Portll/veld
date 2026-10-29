@@ -322,6 +322,11 @@ pub struct MultiUserMemoryManager {
     pub journaled_writers:
         DashMap<String, std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>>,
 
+    /// Each tenant's [`crate::memory::Bm25DocumentSlot`]: bound by `get_user_memory`, read
+    /// by the tenant's BM25 projection. Kept for the process lifetime, so a writer opened
+    /// before an eviction reads the source the reopened memory system binds.
+    bm25_document_slots: DashMap<String, std::sync::Arc<crate::memory::Bm25DocumentSlot>>,
+
     /// One init-lock per tenant for the lazy `JournaledWriter` creation.
     /// Without this, two concurrent first-touch requests for the same
     /// user could both miss the cache, both call `IntentLog::open`, and
@@ -786,6 +791,7 @@ impl MultiUserMemoryManager {
             slow_store_opens: std::sync::atomic::AtomicUsize::new(0),
             bm25_indices: DashMap::new(),
             journaled_writers: DashMap::new(),
+            bm25_document_slots: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
             reconciled_users: DashMap::new(),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
@@ -1611,6 +1617,10 @@ impl MultiUserMemoryManager {
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
         user_mem.set_feedback_store(self.feedback_store.clone());
 
+        // Bound before the reconcile below opens the writer, so its BM25 projection
+        // replays with the source in place.
+        self.bm25_document_slot(user_id)
+            .bind(user_mem.bm25_document_source());
         let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
 
         self.user_memories
@@ -2294,6 +2304,14 @@ impl MultiUserMemoryManager {
         Ok(index)
     }
 
+    /// The tenant's BM25 document slot, created empty on first use.
+    fn bm25_document_slot(&self, user_id: &str) -> Arc<crate::memory::Bm25DocumentSlot> {
+        self.bm25_document_slots
+            .entry(user_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// Get or create a [`JournaledWriter`] for `user_id`.
     ///
     /// On first call for a tenant, this:
@@ -2461,7 +2479,7 @@ impl MultiUserMemoryManager {
         let bm25_index = self.get_user_bm25_index(user_id)?;
         // An in-memory index starts empty every time, so its projection replays
         // the whole log rather than resuming from the checkpoint a past index wrote.
-        let mut bm25_projection = if bm25_index.is_in_memory() {
+        let bm25_projection = if bm25_index.is_in_memory() {
             crate::memory::Bm25Projection::new_from_start(
                 bm25_index.clone(),
                 checkpoint_store.clone(),
@@ -2469,6 +2487,8 @@ impl MultiUserMemoryManager {
         } else {
             crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone())
         };
+        let mut bm25_projection =
+            bm25_projection.with_document_slot(self.bm25_document_slot(user_id));
         // Fourth projection (default-OFF, gated by VELD_WIKI_RENDER): the
         // wiki render. Init or replay failure is non-fatal — the other
         // projections and the write path are unaffected; the wiki is simply

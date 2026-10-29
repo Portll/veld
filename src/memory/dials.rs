@@ -126,6 +126,38 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rerank_count: Option<usize>,
 
+    /// Override ingest-time contextualisation of linked memories (conversation turns and
+    /// episode-threaded memories): the embedding and BM25 document carry the memory's date
+    /// and the memory that preceded it (see `memory::index_text`). `None` keeps the engine
+    /// default, which is on; `Some(false)` indexes the bare content.
+    #[serde(default)]
+    pub turn_context: Option<bool>,
+
+    /// Whether a contextualised turn's embedding also carries its date and the prior
+    /// turn, on top of the BM25 document. `None` keeps the engine default, which is
+    /// off: on the LoCoMo gate the prior turn's text pulled short turns' embeddings
+    /// toward the turn they answered and cost more gold than it found.
+    #[serde(default)]
+    pub turn_context_embedding: Option<bool>,
+
+    /// Whether recall runs neighbour expansion: for each of the top
+    /// `neighbour_expansion_top` fused candidates that is a linked memory (a conversation
+    /// turn or an episode-threaded memory), the memory recorded as following it (`memory::turn_successors`) joins the pre-rerank pool at
+    /// the parent's fused score times a decay, so the cross-encoder judges it on its own
+    /// text. `None` keeps the engine default, which is on.
+    #[serde(default)]
+    pub neighbour_expansion: Option<bool>,
+
+    /// How many of the top fused candidates neighbour expansion reads. `None` keeps the
+    /// engine default, [`crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT`]; sanitised
+    /// to `1..=NEIGHBOUR_EXPANSION_TOP_MAX`.
+    #[serde(default)]
+    pub neighbour_expansion_top: Option<usize>,
+
+    /// Whether neighbour expansion also brings in the turn each ranked turn follows (its
+    /// `preceding_memory_id`). `None` keeps the engine default, which is off.
+    #[serde(default)]
+    pub neighbour_expansion_predecessor: Option<bool>,
     /// Fused candidates kept for the cross-encoder layer (recall Layer 4's truncation).
     /// `None` keeps 30, or 50 for a decomposed query; the pool never drops below
     /// `rerank_count`. Raising `rerank_count` alone cannot reach gold that the truncation
@@ -259,9 +291,19 @@ pub struct CognitiveDials {
     /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
-    /// `people_density`, `prf`.
+    /// `people_density`, `prf`, `turn_context`, `neighbour_expansion`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
+
+    /// Set of opt-in signal IDs switched on: ranking changes that did not earn a default
+    /// but stay measurable on one build. Empty (the default) runs none of them. Populated
+    /// from `VELD_DIALS_ENABLE_SIGNALS` (comma-separated IDs) or `PUT /api/dials`.
+    ///
+    /// Opt-in signal IDs (measured on locomo-holdout, 2026-10-21, see
+    /// `docs/src/architecture/dials.md`): `entity_overlap_relative`,
+    /// `topic_dedup_topical`, `competition_demote`, `rerank_context`.
+    #[serde(default)]
+    pub enabled_signals: HashSet<String>,
 }
 
 /// UI/range metadata for a recall slider (consumed by `GET /api/dials/schema`).
@@ -623,6 +665,11 @@ impl Default for CognitiveDials {
             use_mmr: None,
             candidate_count: None,
             rerank_count: None,
+            turn_context: None,
+            turn_context_embedding: None,
+            neighbour_expansion: None,
+            neighbour_expansion_top: None,
+            neighbour_expansion_predecessor: None,
             rerank_pool: None,
             rerank_model: None,
             rrf_weights: None,
@@ -658,6 +705,7 @@ impl Default for CognitiveDials {
             density_linguistic_w: None,
             updated_at: None,
             disabled_signals: HashSet::new(),
+            enabled_signals: HashSet::new(),
         }
     }
 }
@@ -676,6 +724,10 @@ impl CognitiveDials {
         }
         if let Some(r) = self.rerank_count {
             self.rerank_count = Some(r.clamp(1, 200));
+        }
+        if let Some(n) = self.neighbour_expansion_top {
+            self.neighbour_expansion_top =
+                Some(n.clamp(1, crate::constants::NEIGHBOUR_EXPANSION_TOP_MAX));
         }
         if let Some(p) = self.rerank_pool {
             self.rerank_pool = Some(p.clamp(10, 500));
@@ -750,6 +802,49 @@ impl CognitiveDials {
         !self.disabled_signals.contains(id)
     }
 
+    /// Returns `true` when the named opt-in signal is switched on (in `enabled_signals`).
+    #[inline]
+    pub fn signal_opted_in(&self, id: &str) -> bool {
+        self.enabled_signals.contains(id)
+    }
+
+    /// Whether linked memories are contextualised at ingest (`turn_context`;
+    /// the engine default is on). The `turn_context` signal switches it off too, so an
+    /// ablation arm can run it both ways from one build.
+    #[inline]
+    pub fn turn_context_enabled(&self) -> bool {
+        self.turn_context.unwrap_or(true) && self.signal_enabled("turn_context")
+    }
+
+    /// Whether a contextualised turn's embedding carries the context too
+    /// (`turn_context_embedding`; the engine default is off).
+    #[inline]
+    pub fn turn_context_embedding_enabled(&self) -> bool {
+        self.turn_context_enabled() && self.turn_context_embedding.unwrap_or(false)
+    }
+
+    /// Whether recall runs neighbour expansion (`neighbour_expansion`; the engine
+    /// default is on). The `neighbour_expansion` signal switches it off too.
+    #[inline]
+    pub fn neighbour_expansion_enabled(&self) -> bool {
+        self.neighbour_expansion.unwrap_or(true) && self.signal_enabled("neighbour_expansion")
+    }
+
+    /// How many top fused candidates neighbour expansion reads (`neighbour_expansion_top`).
+    #[inline]
+    pub fn neighbour_expansion_top_n(&self) -> usize {
+        self.neighbour_expansion_top
+            .unwrap_or(crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT)
+            .clamp(1, crate::constants::NEIGHBOUR_EXPANSION_TOP_MAX)
+    }
+
+    /// Whether neighbour expansion also brings in each ranked turn's predecessor
+    /// (`neighbour_expansion_predecessor`; the engine default is off).
+    #[inline]
+    pub fn neighbour_expansion_predecessor_enabled(&self) -> bool {
+        self.neighbour_expansion_enabled() && self.neighbour_expansion_predecessor.unwrap_or(false)
+    }
+
     /// Cross-encoder share of the Layer 5.3 blend for a query shape: `ce_blend` when set,
     /// else the shape's own dial, else its `constants::CE_BLEND_*` default.
     pub fn ce_share(&self, shape: crate::memory::query_parser::RerankShape) -> f32 {
@@ -785,7 +880,9 @@ impl CognitiveDials {
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
     /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
     /// WORKING_MEMORY_THRESHOLD}`,
-    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_MODEL,DATE_WINDOW_LEG}`.
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT,RERANK_POOL,RERANK_MODEL,
+    /// DATE_WINDOW_LEG,TURN_CONTEXT,TURN_CONTEXT_EMBEDDING,NEIGHBOUR_EXPANSION,
+    /// NEIGHBOUR_EXPANSION_TOP,NEIGHBOUR_EXPANSION_PREDECESSOR}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
             std::env::var(key).ok().map(|v| {
@@ -836,6 +933,21 @@ impl CognitiveDials {
         }
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
             d.rerank_count = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT") {
+            d.turn_context = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT_EMBEDDING") {
+            d.turn_context_embedding = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_NEIGHBOUR_EXPANSION") {
+            d.neighbour_expansion = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_NEIGHBOUR_EXPANSION_TOP") {
+            d.neighbour_expansion_top = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_NEIGHBOUR_EXPANSION_PREDECESSOR") {
+            d.neighbour_expansion_predecessor = Some(v);
         }
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_POOL") {
             d.rerank_pool = Some(v);
@@ -903,6 +1015,14 @@ impl CognitiveDials {
                 .map(String::from)
                 .collect();
         }
+        if let Ok(raw) = std::env::var("VELD_DIALS_ENABLE_SIGNALS") {
+            d.enabled_signals = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+        }
         d.sanitized()
     }
 }
@@ -918,6 +1038,18 @@ mod tests {
         assert!(!d.any_re_encode_layer());
         assert!(d.refiner_mode.is_none());
         assert!(d.use_reranking.is_none());
+        assert!(d.turn_context.is_none());
+        assert!(d.turn_context_enabled());
+        assert!(d.turn_context_embedding.is_none());
+        assert!(!d.turn_context_embedding_enabled());
+        assert!(d.neighbour_expansion.is_none());
+        assert!(d.neighbour_expansion_enabled());
+        assert_eq!(
+            d.neighbour_expansion_top_n(),
+            crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT
+        );
+        assert!(d.neighbour_expansion_predecessor.is_none());
+        assert!(!d.neighbour_expansion_predecessor_enabled());
         assert!(d.use_mmr.is_none());
         assert!(d.candidate_count.is_none());
         assert!(d.rerank_count.is_none());
@@ -984,6 +1116,8 @@ mod tests {
             "query_coverage",
             "people_density",
             "prf",
+            "turn_context",
+            "neighbour_expansion",
         ];
         for id in &all_ids {
             assert!(
@@ -1039,6 +1173,26 @@ mod tests {
         }
     }
 
+    /// Opt-in signals stay off unless `enabled_signals` names them.
+    #[test]
+    fn opt_in_signals_are_off_by_default() {
+        let d = CognitiveDials::default();
+        for id in [
+            "entity_overlap_relative",
+            "topic_dedup_topical",
+            "competition_demote",
+            "rerank_context",
+        ] {
+            assert!(!d.signal_opted_in(id), "{id}");
+        }
+        let d = CognitiveDials {
+            enabled_signals: HashSet::from(["rerank_context".to_string()]),
+            ..Default::default()
+        };
+        assert!(d.signal_opted_in("rerank_context"));
+        assert!(!d.signal_opted_in("competition_demote"));
+    }
+
     /// SD-3: VELD_DIALS_DISABLE_SIGNALS env var is parsed and produces the correct
     /// disabled set; all other env-reading behaviour is unchanged.
     #[test]
@@ -1085,6 +1239,38 @@ mod tests {
         assert_eq!(d.candidate_count, Some(1000));
         assert_eq!(d.rerank_count, Some(1));
         assert_eq!(d.rrf_weights, Some((1.0, 0.0, 0.5)));
+
+        let none = CognitiveDials {
+            neighbour_expansion_top: Some(0),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(none.neighbour_expansion_top, Some(1));
+        let wide = CognitiveDials {
+            neighbour_expansion_top: Some(10_000),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(
+            wide.neighbour_expansion_top,
+            Some(crate::constants::NEIGHBOUR_EXPANSION_TOP_MAX)
+        );
+    }
+
+    #[test]
+    fn the_predecessor_leg_needs_neighbour_expansion_on() {
+        let d = CognitiveDials {
+            neighbour_expansion: Some(false),
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        };
+        assert!(!d.neighbour_expansion_enabled());
+        assert!(!d.neighbour_expansion_predecessor_enabled());
+        let on = CognitiveDials {
+            neighbour_expansion_predecessor: Some(true),
+            ..Default::default()
+        };
+        assert!(on.neighbour_expansion_predecessor_enabled());
     }
 
     /// The reranker dials round-trip through the JSON the `/api/dials` routes carry, and
