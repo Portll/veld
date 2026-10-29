@@ -2734,26 +2734,47 @@ pub async fn upsert_memory(
         repo,
     };
 
+    // Store and journal in one blocking task: a blocking task runs to completion even when
+    // the request is dropped, so a client that gives up mid-write cannot leave a stored
+    // memory without its frame (followers would never see it).
     let store_start = std::time::Instant::now();
-    let (memory_id, was_update) = {
+    let (memory_id, was_update, stored_in) = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
         let memory = memory_system.clone();
         let exp = experience.clone();
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.upsert_with_provenance_journaled(
+            let (memory_id, was_update) = memory.read().upsert_with_provenance_journaled(
                 external_id,
                 exp,
                 change_type,
                 changed_by,
                 change_reason,
                 provenance,
-            )
+            )?;
+            let stored_in = store_start.elapsed();
+            let kind = if was_update {
+                SnapshotKind::Update
+            } else {
+                SnapshotKind::Remember
+            };
+            journal_stored(
+                &state,
+                &memory,
+                &user_id,
+                std::slice::from_ref(&memory_id),
+                kind,
+            );
+            anyhow::Ok((memory_id, was_update, stored_in))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         .map_err(AppError::Internal)?
     };
+    stage_timer.record_elapsed("store", stored_in);
+    stage_timer.record("journal", store_start + stored_in);
 
+    let read_back_start = std::time::Instant::now();
     let (version, stored_tags) = {
         let memory = memory_system.clone();
         let mid = memory_id.clone();
@@ -2767,7 +2788,7 @@ pub async fn upsert_memory(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
-    stage_timer.record("store", store_start);
+    stage_timer.record("store", read_back_start);
     // The stored list, not the request's: an upsert's tags are the record's new tags, and the
     // ledger has to describe the record.
     let tag_sources_start = std::time::Instant::now();
@@ -2780,86 +2801,6 @@ pub async fn upsert_memory(
     )
     .await;
     stage_timer.record("tag_sources", tag_sources_start);
-
-    // W5: journal the upsert as a `Remember` (create) or `Update`
-    // (existing) payload. The opaque memory bincode bytes are the same
-    // shape in both cases — the variant is just a hint to projections
-    // that want to distinguish first-write from edit (the SQLite
-    // projection treats them identically — both UPSERT keyed by
-    // `(user_id, memory_id)`).
-    {
-        let journal_start = std::time::Instant::now();
-        let state_clone = state.clone();
-        let user_id = req.user_id.clone();
-        let memory_system_for_journal = memory_system.clone();
-        let mid = memory_id.clone();
-        let is_update = was_update;
-        let journal_join = tokio::task::spawn_blocking(move || {
-            let bincode = {
-                let guard = memory_system_for_journal.read();
-                match guard.get_memory(&mid) {
-                    Ok(mem) => {
-                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(
-                                    memory_id = %mid.0,
-                                    error = %e,
-                                    "skipping intent-log journal (upsert): bincode encode failed",
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            memory_id = %mid.0,
-                            error = %e,
-                            "skipping intent-log journal (upsert): memory not retrievable",
-                        );
-                        return;
-                    }
-                }
-            };
-            let payload = if is_update {
-                crate::intent_log::IntentPayload::Update {
-                    user_id: user_id.clone(),
-                    memory_id: mid.0.to_string(),
-                    memory_bincode: bincode,
-                    schema_version: Some(
-                        crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
-                    ),
-                }
-            } else {
-                crate::intent_log::IntentPayload::Remember {
-                    user_id: user_id.clone(),
-                    memory_id: mid.0.to_string(),
-                    memory_bincode: bincode,
-                    schema_version: Some(
-                        crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION,
-                    ),
-                }
-            };
-            if let Err(e) = state_clone.journal_and_apply(&user_id, &payload) {
-                tracing::warn!(
-                    user_id = %user_id,
-                    memory_id = %mid.0,
-                    error = %e,
-                    "intent-log journal_and_apply (upsert) failed (RocksDB write already durable)",
-                );
-            }
-        });
-        // Awaited before responding — see the matching comment in
-        // `remember`: a detached journal task leaves a store-ahead-of-log
-        // crash window and nondeterministic LSN order.
-        if let Err(e) = journal_join.await {
-            tracing::warn!(
-                error = %e,
-                "intent-log journal task (upsert) panicked (RocksDB write already durable; C2 reconcile will backfill)",
-            );
-        }
-        stage_timer.record("journal", journal_start);
-    }
     queue_journaled_embed(&state, &memory_system, &req.user_id, &memory_id);
 
     // Build episodic graph for multi-hop retrieval. An update rebuilds the episode, so the

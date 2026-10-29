@@ -871,6 +871,56 @@ async fn upsert_memory() {
     assert!(status.is_success(), "upsert returned {status}");
 }
 
+/// Memory ids the tenant's intent log holds a frame for.
+fn journaled_ids(h: &Harness, user: &str) -> Vec<String> {
+    let journal = h._dir.path().join(user).join("intent.log");
+    let Ok(frames) = veld::intent_log::IntentLogIter::open_for_scan(&journal) else {
+        return Vec::new();
+    };
+    frames
+        .map(|r| {
+            let (_, payload) = veld::intent_log::payload::decode_record(&r.expect("journal frame"))
+                .expect("decode frame");
+            payload.memory_id().to_string()
+        })
+        .collect()
+}
+
+/// A client that gives up once the memory is stored must still leave it journaled, or a
+/// follower never receives it (redb soak 9.6: 39 memories stored without a frame).
+#[tokio::test]
+async fn an_upsert_dropped_after_its_store_is_still_journaled() {
+    let h = Harness::new();
+    let user = "upsert-dropped";
+    let external_id = "ext-dropped";
+    h.mgr.get_user_memory(user).expect("open tenant");
+
+    let mut request = Box::pin(h.app().oneshot(authed_post(
+        "/api/upsert",
+        json!({"user_id": user, "external_id": external_id, "content": "The ferry left early."}),
+    )));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // Checked before every poll, so the handler is polled at most once after the store
+    // lands: never far enough to reach a journal step that follows it.
+    while upserted(&h, user, external_id).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "upsert never stored");
+        if futures::poll!(request.as_mut()).is_ready() {
+            panic!("upsert answered before its store was observed");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    drop(request);
+
+    let id = the_one(&h, user, external_id).id.0.to_string();
+    for _ in 0..100 {
+        if journaled_ids(&h, user).contains(&id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("stored memory {id} has no intent-log frame after its request was dropped");
+}
+
 /// Every memory carrying `external_id`, read from the store rather than from the response.
 fn upserted(h: &Harness, user: &str, external_id: &str) -> Vec<veld::memory::Memory> {
     let memory = h.mgr.get_user_memory(user).expect("memory");
