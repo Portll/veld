@@ -4513,6 +4513,27 @@ impl MultiUserMemoryManager {
         declared: &[DeclaredEntity],
         tag_sources: Option<&TagSources>,
     ) -> Result<()> {
+        self.build_experience_graph(
+            user_id,
+            experience,
+            memory_id,
+            declared,
+            tag_sources,
+            GraphAdmission::from_env(),
+        )
+    }
+
+    /// [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared)
+    /// under the given gate switches.
+    fn build_experience_graph(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        declared: &[DeclaredEntity],
+        tag_sources: Option<&TagSources>,
+        admission: GraphAdmission,
+    ) -> Result<()> {
         let graph = self.get_user_graph(user_id)?;
 
         // =====================================================================
@@ -4627,7 +4648,9 @@ impl MultiUserMemoryManager {
         // Filter noise entities
         let filtered_entities: Vec<_> = extracted_entities
             .into_iter()
-            .filter(|e| ner_span_becomes_node(e, &stop_words, &declared_names))
+            .filter(|e| {
+                ner_span_becomes_node(e, &stop_words, &declared_names, admission.ner_noise_gate)
+            })
             .collect();
 
         tracing::debug!(
@@ -5792,6 +5815,37 @@ mod shared_store_bootstrap_tests {
     }
 }
 
+/// `default`, unless `name` is set to `0`/`false` (off) or `1`/`true` (on).
+fn env_switch(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => match v.trim() {
+            "0" => false,
+            "1" => true,
+            v if v.eq_ignore_ascii_case("false") => false,
+            v if v.eq_ignore_ascii_case("true") => true,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+/// The graph-admission switches (the GRAPH ADMISSION section of [`crate::constants`]), read
+/// once per graph write so a harness arm can set them after start-up.
+#[derive(Debug, Clone, Copy)]
+struct GraphAdmission {
+    /// The NER confidence floor and verb-noise list at graph insertion.
+    ner_noise_gate: bool,
+}
+
+impl GraphAdmission {
+    fn from_env() -> Self {
+        use crate::constants as c;
+        Self {
+            ner_noise_gate: env_switch(c::NER_GRAPH_NOISE_GATE_ENV, true),
+        }
+    }
+}
+
 /// Whether a NER span becomes a graph node.
 ///
 /// Port of upstream shodh-memory #573 (902daf83), adapted to veld's typer.
@@ -5812,26 +5866,39 @@ mod shared_store_bootstrap_tests {
 /// Both confidence rules therefore apply only to `MISC`, the label the typers
 /// give to spans they could not place and the fallback NER gives to generic
 /// nouns, where a confidence floor still earns its keep against verb noise.
-/// There is no absolute floor: the fallback typer runs in the gate, and its
-/// salience-derived confidence is not the quantity a floor would be set in.
 ///
-/// The length, stop-word and declared-name rules are unchanged and apply to
-/// every label: a declared name is already the declared entity, and a stop
-/// word names nothing whatever label it carries.
+/// The absolute floor of upstream #261 ([`crate::constants::NER_GRAPH_CONFIDENCE_FLOOR`])
+/// binds `MISC` too, and only `MISC`. Upstream applies it to every label, but there it
+/// equals GLiNER's commit threshold, so it never rejects a span the typer committed;
+/// veld's floor is the fallback's 0.5, which would reject the GLiNER-scaled PER spans
+/// above. It catches stored records a rebuild replays from before the fallback had a
+/// floor.
+///
+/// The length, stop-word, verb-noise and declared-name rules apply to every label: a
+/// declared name is already the declared entity, and a stop word or a verb names
+/// nothing whatever label it carries. `noise_gate` off
+/// ([`crate::constants::NER_GRAPH_NOISE_GATE_ENV`]) drops the floor and the verb list.
 fn ner_span_becomes_node(
     span: &crate::embeddings::ner::NerEntity,
     stop_words: &std::collections::HashSet<&str>,
     declared_names: &std::collections::HashSet<String>,
+    noise_gate: bool,
 ) -> bool {
     let name = span.text.trim();
-    if name.len() < 3 {
+    if name.len() < crate::constants::NER_ENTITY_MIN_LENGTH {
         return false;
     }
     let lower = name.to_lowercase();
     if stop_words.contains(lower.as_str()) || declared_names.contains(&lower) {
         return false;
     }
+    if noise_gate && crate::constants::NER_VERB_NOISE.contains(&lower.as_str()) {
+        return false;
+    }
     if matches!(span.entity_type, NerEntityType::Misc) {
+        if noise_gate && span.confidence < crate::constants::NER_GRAPH_CONFIDENCE_FLOOR {
+            return false;
+        }
         if !name.chars().any(|c| c.is_uppercase()) && span.confidence < 0.7 {
             return false;
         }
@@ -5857,10 +5924,14 @@ mod ner_span_admission_tests {
         }
     }
 
-    fn admitted(span: &NerEntity) -> bool {
+    fn admitted_with(span: &NerEntity, noise_gate: bool) -> bool {
         let stop_words: std::collections::HashSet<&str> = ["the", "team"].into_iter().collect();
         let declared: std::collections::HashSet<String> = ["joanna".to_string()].into();
-        ner_span_becomes_node(span, &stop_words, &declared)
+        ner_span_becomes_node(span, &stop_words, &declared, noise_gate)
+    }
+
+    fn admitted(span: &NerEntity) -> bool {
+        admitted_with(span, true)
     }
 
     /// A four-letter PER span at the fallback typer's confidence was the exact
@@ -5886,8 +5957,8 @@ mod ner_span_admission_tests {
     /// MISC keeps both confidence rules: it is where verb noise lands.
     #[test]
     fn misc_spans_still_need_confidence() {
-        assert!(!admitted(&span("decided", NerEntityType::Misc, 0.65)));
-        assert!(admitted(&span("decided", NerEntityType::Misc, 0.7)));
+        assert!(!admitted(&span("pottery", NerEntityType::Misc, 0.65)));
+        assert!(admitted(&span("pottery", NerEntityType::Misc, 0.7)));
         assert!(!admitted(&span("Oslo", NerEntityType::Misc, 0.79)));
         assert!(admitted(&span("Oslo", NerEntityType::Misc, 0.8)));
         assert!(admitted(&span("Covid", NerEntityType::Misc, 0.5)));
@@ -5899,6 +5970,27 @@ mod ner_span_admission_tests {
         assert!(!admitted(&span("Al", NerEntityType::Person, 0.99)));
         assert!(!admitted(&span("Team", NerEntityType::Organization, 0.99)));
         assert!(!admitted(&span("Joanna", NerEntityType::Person, 0.99)));
+    }
+
+    /// A MISC span a typer would no longer commit stays out, whatever its shape, and a
+    /// listed verb or adjective is never a node under any label. Both go with the switch.
+    #[test]
+    fn misc_spans_under_the_floor_and_verb_noise_are_not_nodes() {
+        let floor = crate::constants::NER_GRAPH_CONFIDENCE_FLOOR;
+        let sub_floor = span("Pottery Class", NerEntityType::Misc, floor - 0.07);
+        assert!(!admitted(&sub_floor));
+        assert!(admitted_with(&sub_floor, false));
+        assert!(admitted(&span("Pottery Class", NerEntityType::Misc, floor)));
+
+        for (noise, ty) in [
+            ("Decided", NerEntityType::Misc),
+            ("Running", NerEntityType::Organization),
+            ("Important", NerEntityType::Person),
+        ] {
+            let noise = span(noise, ty, 0.95);
+            assert!(!admitted(&noise), "{noise:?}");
+            assert!(admitted_with(&noise, false), "{noise:?}");
+        }
     }
 }
 
