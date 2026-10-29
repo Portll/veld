@@ -7695,3 +7695,109 @@ mod fusion_tests {
         assert_eq!(graph_activation_factor(0.5, -1.0), 1.0);
     }
 }
+
+#[cfg(test)]
+mod owner_scope_tests {
+    use super::*;
+    use crate::memory::{MemoryConfig, MemorySystem};
+
+    /// Sets an env var for the scope of the guard and restores it on drop, so a failed
+    /// expectation cannot leave recall read-only for the rest of the test process.
+    struct EnvVar(&'static str, Option<String>);
+
+    impl EnvVar {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self(name, previous)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    fn score_of(sys: &MemorySystem, user_id: Option<&str>, id: &MemoryId) -> f32 {
+        let query = Query {
+            user_id: user_id.map(str::to_string),
+            query_text: Some("When did Melanie run a marathon?".to_string()),
+            max_results: 5,
+            ..Default::default()
+        };
+        sys.recall(&query)
+            .expect("recall")
+            .iter()
+            .find(|m| &m.id == id)
+            .and_then(|m| m.score)
+            .expect("the fact's source is recalled")
+    }
+
+    /// A recall that names no user, on a system that knows its owner, runs the owner's fact
+    /// layers: the temporal fact stored for the owner boosts its source memory exactly as a
+    /// recall naming the owner does, and an unowned system's recall does not. A regression
+    /// in the owner match at the top of `recall()` scores the source as the unowned recall.
+    #[test]
+    fn a_userless_recall_on_an_owned_system_runs_the_owners_fact_layers() {
+        let _env = crate::memory::ablation::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Read-only recall writes no access counts or activation, so the three recalls below
+        // differ only in which user they run as.
+        let _readonly = EnvVar::set("VELD_RECALL_READONLY", "1");
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut sys = MemorySystem::new(
+            MemoryConfig {
+                storage_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("memory system");
+        let content = "Melanie ran a marathon yesterday";
+        let entities = vec!["Melanie".to_string()];
+        let source = sys
+            .remember(
+                Experience {
+                    content: content.to_string(),
+                    entities: entities.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("remember");
+        sys.remember(
+            Experience {
+                content: "Caroline went to a support group meeting".to_string(),
+                entities: vec!["Caroline".to_string()],
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("remember");
+        let created_at = sys.get_memory(&source).expect("stored").created_at;
+        let stored = sys
+            .store_temporal_facts_for_memory("alice", &source, content, &entities, created_at)
+            .expect("store temporal facts");
+        assert!(stored > 0, "the content must yield a temporal fact");
+
+        let unowned = score_of(&sys, None, &source);
+        sys.set_owner_user_id("alice");
+        let scoped = score_of(&sys, None, &source);
+        let named = score_of(&sys, Some("alice"), &source);
+
+        assert!(
+            (scoped - named).abs() < 1e-6,
+            "a user-less recall on alice's system must score as alice's recall: {scoped} vs {named}"
+        );
+        assert!(
+            scoped > unowned,
+            "the owner's temporal fact must boost its source: {scoped} owned vs {unowned} unowned"
+        );
+    }
+}
