@@ -1904,13 +1904,14 @@ impl super::MemorySystem {
             // Sparse graphs = mature, curated connections = trust graph more
             // Dense graphs = fresh, noisy connections = trust semantic/BM25 more
             //
-            // FLAT (the default) scores a candidate in each list by its score over the list's
-            // best, so a list's top hit enters at the list's weight: reciprocal rank gave rank 1
-            // weight / 21 and discarded how far ahead of rank 2 it was, which buried a candidate
-            // one list was sure of under the other list's crowd. Vector and BM25 join as the
-            // stronger plus FLAT_CONSENSUS of the weaker; the other lists add. The `fusion` dial
-            // (or SHODH_FUSION_RRF) restores reciprocal rank, where K sets top-rank
-            // discrimination. K precedence: per-query rrf_k → live dial `rrf_k_outer` → 20.0.
+            // Reciprocal rank (the default) adds weight / (k + rank) per list; K sets top-rank
+            // discrimination, precedence per-query rrf_k → live dial `rrf_k_outer` → 20.0.
+            // FLAT, behind the `fusion` dial or SHODH_FUSION_FLAT, scores a candidate in each
+            // list by its score over the list's best, vector and BM25 joined as the stronger
+            // plus FLAT_CONSENSUS of the weaker. On the LoCoMo hold-out (1,166 cases) against
+            // main, FLAT traded the top hit for depth (p@1 -0.050, recall@10 +0.032), and
+            // reciprocal rank under the same bounded boosts did better on both (+0.023,
+            // +0.043). Upstream's own gate arm leaned the same way on p@1 (0.48 FLAT, 0.50 RRF).
             let fusion_mode = super::ablation::fusion_mode(early_dials_snapshot.fusion);
             let k: f32 = query
                 .rrf_k

@@ -60,9 +60,11 @@ pub enum FusionMode {
     /// Calibrated max (shodh-memory's FLAT fusion, #320). Each list enters at its weight
     /// times the candidate's score over the list's best score; the vector and BM25 lists
     /// join as the larger of the two plus [`crate::constants::FLAT_CONSENSUS`] of the
-    /// smaller.
+    /// smaller. Not the default: on veld's LoCoMo hold-out it cost p@1 (see
+    /// [`crate::constants::FLAT_CONSENSUS`]).
     Flat,
-    /// Reciprocal rank: each list adds `weight / (k + rank)`, with k from `rrf_k_outer`.
+    /// Reciprocal rank, the default: each list adds `weight / (k + rank)`, with k from
+    /// `rrf_k_outer`.
     Rrf,
 }
 
@@ -185,9 +187,9 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub date_window_leg: Option<bool>,
 
-    /// How recall Layer 4 fuses its candidate lists. `None` is [`FusionMode::Flat`] unless
-    /// `SHODH_FUSION_RRF` asks for reciprocal rank ([`crate::memory::ablation`]); a set dial
-    /// wins over that variable.
+    /// How recall Layer 4 fuses its candidate lists. `None` is [`FusionMode::Rrf`] unless
+    /// `SHODH_FUSION_FLAT` asks for FLAT ([`crate::memory::ablation`]); a set dial wins over
+    /// that variable.
     #[serde(default)]
     pub fusion: Option<FusionMode>,
 

@@ -149,25 +149,25 @@ pub fn graph_fusion_weight_override() -> Option<f32> {
         .map(|w| w.clamp(0.0, 1.0))
 }
 
-/// `SHODH_FUSION_RRF=1|true` — fuse recall Layer 4 by reciprocal rank instead of FLAT,
-/// under upstream's name for the same escape hatch (shodh-memory #320), so its arms run
-/// unchanged. The `fusion` cognitive dial, when set, wins over this variable.
-pub fn rrf_fusion_requested() -> bool {
-    std::env::var("SHODH_FUSION_RRF")
+/// `SHODH_FUSION_FLAT=1|true` — fuse recall Layer 4 by FLAT calibrated max instead of
+/// reciprocal rank, under upstream's name for forcing it (shodh-memory #320). The `fusion`
+/// cognitive dial, when set, wins over this variable.
+pub fn flat_fusion_requested() -> bool {
+    std::env::var("SHODH_FUSION_FLAT")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
 /// The Layer 4 fusion a query runs under: the `fusion` dial, else
-/// [`rrf_fusion_requested`], else FLAT.
+/// [`flat_fusion_requested`], else reciprocal rank.
 pub fn fusion_mode(
     dial: Option<crate::memory::dials::FusionMode>,
 ) -> crate::memory::dials::FusionMode {
     use crate::memory::dials::FusionMode;
-    dial.unwrap_or(if rrf_fusion_requested() {
-        FusionMode::Rrf
-    } else {
+    dial.unwrap_or(if flat_fusion_requested() {
         FusionMode::Flat
+    } else {
+        FusionMode::Rrf
     })
 }
 
@@ -296,18 +296,18 @@ mod tests {
     }
 
     #[test]
-    fn fusion_is_flat_unless_the_dial_or_the_upstream_flag_asks_for_rrf() {
+    fn fusion_is_rrf_unless_the_dial_or_the_upstream_flag_asks_for_flat() {
         use crate::memory::dials::FusionMode;
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("SHODH_FUSION_RRF");
-        assert_eq!(fusion_mode(None), FusionMode::Flat);
-        assert_eq!(fusion_mode(Some(FusionMode::Rrf)), FusionMode::Rrf);
-        std::env::set_var("SHODH_FUSION_RRF", "true");
+        std::env::remove_var("SHODH_FUSION_FLAT");
         assert_eq!(fusion_mode(None), FusionMode::Rrf);
         assert_eq!(fusion_mode(Some(FusionMode::Flat)), FusionMode::Flat);
-        std::env::set_var("SHODH_FUSION_RRF", "0");
+        std::env::set_var("SHODH_FUSION_FLAT", "true");
         assert_eq!(fusion_mode(None), FusionMode::Flat);
-        std::env::remove_var("SHODH_FUSION_RRF");
+        assert_eq!(fusion_mode(Some(FusionMode::Rrf)), FusionMode::Rrf);
+        std::env::set_var("SHODH_FUSION_FLAT", "0");
+        assert_eq!(fusion_mode(None), FusionMode::Rrf);
+        std::env::remove_var("SHODH_FUSION_FLAT");
     }
 
     #[test]

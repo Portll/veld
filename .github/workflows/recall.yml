@@ -86,8 +86,8 @@ on:
         default: ''
       fusion:
         description: >-
-          Layer 4 fusion for the fusion dial: flat (calibrated max) or rrf (reciprocal rank);
-          empty keeps the shipped flat. A set value is recorded as an override, so the gate
+          Layer 4 fusion for the fusion dial: rrf (reciprocal rank) or flat (calibrated max);
+          empty keeps the shipped rrf. A set value is recorded as an override, so the gate
           refuses it against the baseline: pair it with record=true.
         required: false
         default: ''

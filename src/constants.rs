@@ -2836,7 +2836,13 @@ pub const PRF_WEIGHT: f32 = 0.3;
 /// keeps a candidate one list ranks well from being buried by the other list's crowd; the
 /// share is the credit for both lists finding it. Upstream's value. Upstream measured FLAT
 /// against reciprocal-rank fusion at +0.0665 recall@10 on its LoCoMo run, and on veld's
-/// 100-case gate (2026-10-24, rule-based NER) at 0.664 against 0.622.
+/// 100-case gate (2026-10-24, rule-based NER) at recall@10 0.664 against 0.622, p@1 0.48
+/// against 0.50.
+///
+/// FLAT is not veld's default. On the LoCoMo hold-out (1,166 cases, paired against main
+/// 351f02a1, run 40686627313) FLAT scored p@1 -0.0497 [-0.0695, -0.0300] and recall@10
+/// +0.0317, lower on every category (run 40832148811); reciprocal rank under the same bounded
+/// boosts scored p@1 +0.0232 [+0.0077, +0.0395] and recall@10 +0.0431 (run 40832157818).
 pub const FLAT_CONSENSUS: f32 = 0.3;
 
 /// Graph activation bonus in recall Layer 4 (shodh-memory #174): a graph candidate's graph

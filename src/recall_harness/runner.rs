@@ -1832,8 +1832,8 @@ pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
         arm("-bm25", &[("SHODH_ABLATE_BM25", "1")]),
         arm("-spreading", &[("SHODH_ABLATE_SPREADING", "1")]),
         arm("-boost-stack", &[("SHODH_DISABLE_BOOSTS", "all")]),
-        // Reciprocal-rank Layer 4 fusion in place of FLAT, upstream's escape hatch (#320).
-        arm("fusion=rrf", &[("SHODH_FUSION_RRF", "1")]),
+        // FLAT calibrated-max Layer 4 fusion in place of reciprocal rank (upstream #320).
+        arm("fusion=flat", &[("SHODH_FUSION_FLAT", "1")]),
         // Single-leg isolation: one leg's candidates only.
         arm("leg=vector", &[("SHODH_LEG", "vector")]),
         arm("leg=bm25", &[("SHODH_LEG", "bm25")]),

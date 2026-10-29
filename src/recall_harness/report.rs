@@ -151,7 +151,7 @@ pub struct RetrievalDials {
     /// The `date_window_leg` dial: `None` is the engine default (on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_window_leg: Option<bool>,
-    /// The `fusion` dial: `None` is the engine default (FLAT).
+    /// The `fusion` dial: `None` is the engine default (reciprocal rank).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fusion: Option<crate::memory::dials::FusionMode>,
     /// The `graph_candidates_only` dial: `None` is the engine default (the graph leg scores).
@@ -1484,8 +1484,8 @@ mod tests {
             date_window_leg: Some(false),
             ..Default::default()
         };
-        let rrf = RetrievalDials {
-            fusion: Some(crate::memory::dials::FusionMode::Rrf),
+        let flat = RetrievalDials {
+            fusion: Some(crate::memory::dials::FusionMode::Flat),
             ..Default::default()
         };
         let admit_only = RetrievalDials {
@@ -1498,7 +1498,7 @@ mod tests {
         };
         for (set, named) in [
             (off, "date_window_leg=false"),
-            (rrf, "fusion=rrf"),
+            (flat, "fusion=flat"),
             (admit_only, "graph_candidates_only=true"),
             (
                 untimed_off,
