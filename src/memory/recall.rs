@@ -4849,6 +4849,35 @@ impl super::MemorySystem {
             }
         }
 
+        // =====================================================================
+        // LAYER 5.97: THE CROSS-ENCODER ORDERS THE TOP RESULTS
+        // =====================================================================
+        // At its Layer 5.3 share the cross-encoder barely moves the top of a reciprocal-rank
+        // list, though it reads the right answer above a wrong rank 1 more often than not (see
+        // constants::CE_TOP_MARGIN). Here it orders the leading results within the margin of
+        // rank 1. An ordinal pin is left alone: time decides those, and the pin is re-asserted
+        // at the end of recall.
+        // [signal: ce_top_order] Gated by the disabled_signals dial; on by default.
+        let ce_top_margin = dials_snapshot
+            .ce_top_margin
+            .unwrap_or(crate::constants::CE_TOP_MARGIN);
+        if ordinal_pin.is_none()
+            && ce_top_margin > 0.0
+            && dials_snapshot.signal_enabled("ce_top_order")
+            && Self::order_top_by_cross_encoder(
+                &mut memories,
+                |id| {
+                    signal_attributions
+                        .get(id)
+                        .map(|a| a.cross_encoder_contribution)
+                },
+                crate::constants::CE_TOP_ORDER_COUNT,
+                ce_top_margin,
+            )
+        {
+            tracing::debug!("Layer 5.97: cross-encoder reordered the top results");
+        }
+
         crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
 
         let t_total = recall_start.elapsed();
@@ -5147,6 +5176,58 @@ impl super::MemorySystem {
         };
         memories.insert(0, pinned);
         memories.truncate(max_results.max(1));
+    }
+
+    /// Order the leading results by cross-encoder score: the first `count` whose score is
+    /// within `margin` (a fraction of rank 1's) of rank 1. Leaves the list alone when any of
+    /// them has no cross-encoder score (outside the rerank budget, or a shape the reranker
+    /// skips) or rank 1 has no positive score. The reordered results take the original scores
+    /// in rank order, so the list stays monotonic and a caller that re-sorts keeps the order.
+    /// Returns whether the order changed.
+    fn order_top_by_cross_encoder(
+        memories: &mut [SharedMemory],
+        cross_encoder: impl Fn(&MemoryId) -> Option<f32>,
+        count: usize,
+        margin: f32,
+    ) -> bool {
+        let lead = match memories.first().and_then(|m| m.score) {
+            Some(s) if s > 0.0 => s,
+            _ => return false,
+        };
+        let window = memories
+            .iter()
+            .take(count)
+            .take_while(|m| (lead - m.score.unwrap_or(0.0)) / lead <= margin)
+            .count();
+        if window < 2 {
+            return false;
+        }
+        let ce: Vec<f32> = match memories[..window]
+            .iter()
+            .map(|m| cross_encoder(&m.id).filter(|s| *s > 0.0))
+            .collect::<Option<Vec<f32>>>()
+        {
+            Some(ce) => ce,
+            None => return false,
+        };
+        let mut order: Vec<usize> = (0..window).collect();
+        order.sort_by(|a, b| ce[*b].total_cmp(&ce[*a]));
+        if order.iter().enumerate().all(|(rank, i)| rank == *i) {
+            return false;
+        }
+        let scores: Vec<Option<f32>> = memories[..window].iter().map(|m| m.score).collect();
+        let reordered: Vec<SharedMemory> = order.iter().map(|i| memories[*i].clone()).collect();
+        for (slot, (memory, score)) in memories[..window]
+            .iter_mut()
+            .zip(reordered.into_iter().zip(scores))
+        {
+            let mut cloned: Memory = memory.as_ref().clone();
+            if let Some(s) = score {
+                cloned.set_score(s);
+            }
+            *slot = Arc::new(cloned);
+        }
+        true
     }
 
     /// Spreading activation recall: graph-driven memory retrieval (V5 toroid closure)
@@ -7115,6 +7196,67 @@ mod ordinal_pin_tests {
         MemorySystem::reassert_ordinal_pin(&mut list, pinned.clone(), 10);
         assert_eq!(list[0].id, pinned.id);
         assert_eq!(list[0].score, Some(0.95));
+    }
+
+    fn ce_of(pairs: &[(&SharedMemory, f32)]) -> impl Fn(&MemoryId) -> Option<f32> {
+        let map: std::collections::HashMap<MemoryId, f32> =
+            pairs.iter().map(|(m, s)| (m.id.clone(), *s)).collect();
+        move |id| map.get(id).copied()
+    }
+
+    fn ids(list: &[SharedMemory]) -> Vec<MemoryId> {
+        list.iter().map(|m| m.id.clone()).collect()
+    }
+
+    #[test]
+    fn the_cross_encoder_orders_the_top_three_and_scores_stay_monotonic() {
+        let (a, b, c, d) = (
+            scored("a", 0.9),
+            scored("b", 0.8),
+            scored("c", 0.7),
+            scored("d", 0.6),
+        );
+        let ce = ce_of(&[(&a, 0.2), (&b, 0.9), (&c, 0.5), (&d, 0.99)]);
+        let mut list = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        assert!(MemorySystem::order_top_by_cross_encoder(
+            &mut list, ce, 3, 1.0
+        ));
+        assert_eq!(ids(&list), ids(&[b, c, a, d]), "rank 4 stays outside");
+        let scores: Vec<f32> = list.iter().map(|m| m.score.unwrap()).collect();
+        assert_eq!(scores, vec![0.9, 0.8, 0.7, 0.6]);
+    }
+
+    #[test]
+    fn only_results_within_the_margin_of_rank_one_are_reordered() {
+        let (a, b, c) = (scored("a", 1.0), scored("b", 0.95), scored("c", 0.5));
+        let ce = ce_of(&[(&a, 0.1), (&b, 0.2), (&c, 0.9)]);
+        let mut list = vec![a.clone(), b.clone(), c.clone()];
+        assert!(MemorySystem::order_top_by_cross_encoder(
+            &mut list, ce, 3, 0.1
+        ));
+        assert_eq!(ids(&list), ids(&[b, a, c]));
+    }
+
+    #[test]
+    fn a_leader_without_a_cross_encoder_score_keeps_the_list() {
+        let (a, b) = (scored("a", 0.9), scored("b", 0.8));
+        let ce = ce_of(&[(&b, 0.9)]);
+        let mut list = vec![a.clone(), b.clone()];
+        assert!(!MemorySystem::order_top_by_cross_encoder(
+            &mut list, ce, 3, 1.0
+        ));
+        assert_eq!(ids(&list), ids(&[a, b]));
+    }
+
+    #[test]
+    fn an_order_the_cross_encoder_agrees_with_is_unchanged() {
+        let (a, b) = (scored("a", 0.9), scored("b", 0.8));
+        let ce = ce_of(&[(&a, 0.9), (&b, 0.1)]);
+        let mut list = vec![a.clone(), b.clone()];
+        assert!(!MemorySystem::order_top_by_cross_encoder(
+            &mut list, ce, 3, 1.0
+        ));
+        assert_eq!(ids(&list), ids(&[a, b]));
     }
 }
 
