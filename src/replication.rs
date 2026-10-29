@@ -5,8 +5,10 @@
 //! projections (vector, BM25, SQLite, wiki) and its own log follow. The intent log
 //! already holds a full memory snapshot per `Remember`/`Update`, so a follower that
 //! starts empty converges on the leader's memories by replaying from LSN 0, ids and
-//! timestamps intact. Embeddings travel inside the snapshot: the follower never
-//! re-embeds.
+//! timestamps intact. Embeddings travel inside the snapshot, and the follower embeds
+//! only a snapshot whose vector its index cannot hold: the leader's embedding migration
+//! rewrites vectors in its store without journaling them, so its log keeps the old
+//! model's vector for every memory not written since.
 //!
 //! Scope and limits, stated rather than implied:
 //! - One direction. A follower is read-mostly; writes made on it are not sent
@@ -1833,6 +1835,170 @@ mod tests {
                 "{swept} survived its bulk forget on the follower"
             );
         }
+    }
+
+    /// A redb follower, as the live replica is.
+    #[cfg(feature = "storage-redb")]
+    fn redb_follower() -> (MultiUserMemoryManager, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config = crate::config::ServerConfig {
+            storage_path: tmp.path().to_path_buf(),
+            backup_enabled: false,
+            requested_storage_backend: crate::config::StorageBackend::Redb,
+            effective_storage_backend: crate::config::StorageBackend::Redb,
+            ..crate::config::ServerConfig::default()
+        };
+        let manager =
+            MultiUserMemoryManager::new(tmp.path().to_path_buf(), config).expect("redb follower");
+        (manager, tmp)
+    }
+
+    /// The leader's embedding migration rewrote its records' vectors in place without
+    /// journaling them, so its log still holds the old model's vector for every memory not
+    /// written since: the live replica refused 18 of them at every reindex, startup repair
+    /// and minute-by-minute backlog drain ("Failed to add vector to index"). Every memory a
+    /// page brings is vector-indexed on a redb follower, stored with a vector its index
+    /// holds, and a later snapshot of the same text neither re-embeds nor grows vectors.
+    #[cfg(feature = "storage-redb")]
+    #[test]
+    fn every_replicated_memory_is_vector_indexed_on_a_redb_follower() {
+        use crate::memory::types::{Experience, Memory};
+
+        let (follower, _tmp) = redb_follower();
+        assert_eq!(
+            follower.server_config().effective_storage_backend,
+            crate::config::StorageBackend::Redb
+        );
+        let user = "replica-user";
+        let memory_sys = follower.get_user_memory(user).unwrap();
+        let dim = memory_sys.read().test_primary_dimension();
+        let foreign = if dim == 768 { 384 } else { 768 };
+        let sv = Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION);
+        let snapshot = |content: String, embeddings: Option<Vec<f32>>| {
+            Memory::new(
+                MemoryId(uuid::Uuid::new_v4()),
+                Experience {
+                    content,
+                    embeddings,
+                    ..Default::default()
+                },
+                0.5,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let frame = |lsn: u64, memory: &Memory, update: bool| {
+            let memory_id = memory.id.0.to_string();
+            let memory_bincode =
+                bincode::serde::encode_to_vec(memory, bincode::config::standard()).unwrap();
+            let user_id = user.to_string();
+            let payload = if update {
+                IntentPayload::Update {
+                    user_id,
+                    memory_id,
+                    memory_bincode,
+                    schema_version: sv,
+                }
+            } else {
+                IntentPayload::Remember {
+                    user_id,
+                    memory_id,
+                    memory_bincode,
+                    schema_version: sv,
+                }
+            };
+            (lsn, payload)
+        };
+
+        let long: String = (0..60)
+            .map(|i| format!("Shift note {i}: the gantry crane was inspected and logged. "))
+            .collect();
+        let memories = [
+            // The live failure: a short record carrying the pre-migration vector.
+            snapshot(
+                "the night ferry leaves pier four at eleven".into(),
+                Some(vec![0.05; foreign]),
+            ),
+            // Chunked content with a pre-migration vector.
+            snapshot(long, Some(vec![0.05; foreign])),
+            // Written after the migration.
+            snapshot(
+                "the tide gauge reads high on Thursdays".into(),
+                Some(vec![0.25; dim]),
+            ),
+            // Its leader's embed had not landed when it was journaled.
+            snapshot("the harbour crane is serviced in spring".into(), None),
+        ];
+        let page: Vec<_> = memories
+            .iter()
+            .enumerate()
+            .map(|(lsn, memory)| frame(lsn as u64, memory, false))
+            .collect();
+        assert_eq!(
+            apply_replicated_page(&follower, user, page).unwrap(),
+            memories.len() as u64
+        );
+
+        let indexed_with_fitting_vector = |what: &str| {
+            let guard = memory_sys.read();
+            for memory in &memories {
+                assert!(
+                    !guard.test_vector_ids(&memory.id).is_empty(),
+                    "{what}: {} is not vector-indexed",
+                    memory
+                        .experience
+                        .content
+                        .chars()
+                        .take(40)
+                        .collect::<String>()
+                );
+                let stored = guard.get_memory(&memory.id).unwrap();
+                if let Some(vector) = &stored.experience.embeddings {
+                    assert_eq!(
+                        vector.len(),
+                        dim,
+                        "{what}: stored vector of {}",
+                        memory.id.0
+                    );
+                }
+            }
+            let (stored, vector_indexed, _) = guard.index_coverage().unwrap();
+            assert_eq!(stored, memories.len(), "{what}");
+            assert_eq!(vector_indexed, stored, "{what}: index coverage");
+        };
+        indexed_with_fitting_vector("first page");
+        let stored_vector = |memory: &Memory| {
+            memory_sys
+                .read()
+                .get_memory(&memory.id)
+                .unwrap()
+                .experience
+                .embeddings
+                .clone()
+        };
+        let refitted = stored_vector(&memories[0]);
+        let vectors_before = memory_sys.read().test_vector_ids(&memories[0].id);
+
+        // An access on the leader re-journals the record with the vector it still holds.
+        let accessed = memories[0].clone();
+        accessed.set_importance(0.6);
+        assert_eq!(
+            apply_replicated_page(&follower, user, vec![frame(10, &accessed, true)]).unwrap(),
+            1
+        );
+        indexed_with_fitting_vector("second page");
+        assert_eq!(
+            stored_vector(&memories[0]),
+            refitted,
+            "the stored vector of the same text is kept, not embedded again"
+        );
+        assert_eq!(
+            memory_sys.read().test_vector_ids(&memories[0].id),
+            vectors_before,
+            "the same text keeps its indexed vectors"
+        );
     }
 
     #[test]

@@ -1466,7 +1466,7 @@ impl MemorySystem {
                             failed += 1;
                             tracing::error!(
                                 memory_id = %memory.id.0,
-                                error = %e,
+                                error = format!("{e:#}"),
                                 "Failed to repair orphaned memory"
                             );
                         }
@@ -2725,8 +2725,19 @@ impl MemorySystem {
 
         let importance = memory.importance();
 
+        // A vector the primary index cannot hold came from a model this store has left:
+        // a follower stores the leader's snapshots, and a leader that re-embedded its
+        // records without journaling them still logs the old vector. It is replaced as a
+        // missing one is, but the memory is not arriving: it passed the write gate when
+        // that vector was made, so the gate and interference below do not run again.
+        let refit = memory
+            .experience
+            .embeddings
+            .as_deref()
+            .is_some_and(|e| !self.retriever.fits_primary(e));
+
         // Generate embedding if not already present
-        if memory.experience.embeddings.is_none() {
+        if memory.experience.embeddings.is_none() || refit {
             // Use enriched searchable text (with context prefix) for consistency
             // with the synchronous index_memory() path. Without this, deferred
             // embeddings lack context prefixes and produce different similarity
@@ -2766,7 +2777,8 @@ impl MemorySystem {
 
             // E6: update the TCM drift state from this memory's embedding and
             // snapshot it onto the WhenFacet (encode-driven; persisted just below).
-            if let Some(emb) = memory.experience.embeddings.clone() {
+            // A refit is not an encode: the memory keeps the drift it was encoded with.
+            if let Some(emb) = memory.experience.embeddings.clone().filter(|_| !refit) {
                 let snapshot = self.update_tcm_context(&emb);
                 memory.when.context_drift = snapshot;
             }
@@ -2793,9 +2805,16 @@ impl MemorySystem {
                     // Rewritten meanwhile; that write embedded its own content.
                     return Ok(EmbedIndexOutcome::default());
                 }
-                if fresh.experience.embeddings.is_none() {
+                let fresh_fits = fresh
+                    .experience
+                    .embeddings
+                    .as_deref()
+                    .is_some_and(|e| self.retriever.fits_primary(e));
+                if !fresh_fits {
                     fresh.experience.embeddings = memory.experience.embeddings.take();
-                    fresh.when.context_drift = std::mem::take(&mut memory.when.context_drift);
+                    if !refit {
+                        fresh.when.context_drift = std::mem::take(&mut memory.when.context_drift);
+                    }
                 }
                 // R3: populate the conjunctive binding from the engram's W-facets
                 // (was dead scaffold). Surfaced at recall so the consumer can tell a
@@ -2839,14 +2858,25 @@ impl MemorySystem {
             }
         }
 
-        // Vector index (uses pre-computed embedding for short content, re-embeds chunks)
+        // Vector index (uses pre-computed embedding for short content, re-embeds chunks).
+        // A memory the index already holds (a startup repair indexed it, its stored vector
+        // stayed foreign) is reindexed, so the old vectors go rather than gaining a twin.
         let memory_arc = Arc::new(memory);
-        if let Err(e) = self.retriever.index_memory(&memory_arc) {
-            tracing::warn!("Background vector indexing failed for {}: {e}", memory_id.0);
+        let already_indexed = self.retriever.is_indexed(memory_id);
+        let indexed = if already_indexed {
+            self.retriever.reindex_memory(&memory_arc)
+        } else {
+            self.retriever.index_memory(&memory_arc)
+        };
+        if let Err(e) = indexed {
+            tracing::warn!(
+                "Background vector indexing failed for {}: {e:#}",
+                memory_id.0
+            );
             if let Err(record_err) = self.embedding_backlog.record(
                 memory_id,
                 embedding_backlog::EnqueueReason::IndexFailed,
-                Some(&e.to_string()),
+                Some(&format!("{e:#}")),
             ) {
                 tracing::error!(
                     "embedding backlog: could not record {}: {record_err}",
@@ -2854,10 +2884,17 @@ impl MemorySystem {
                 );
             }
         } else {
-            self.stats.write().vector_index_count += 1;
+            if !already_indexed {
+                self.stats.write().vector_index_count += 1;
+            }
             if let Err(e) = self.embedding_backlog.delete(memory_id) {
                 tracing::error!("embedding backlog: could not clear {}: {e}", memory_id.0);
             }
+        }
+
+        if refit {
+            crate::metrics::EMBED_BACKGROUND_DURATION.observe(start.elapsed().as_secs_f64());
+            return Ok(outcome);
         }
 
         // Write gate + interference detection (retroactive + proactive)
@@ -5686,9 +5723,8 @@ impl MemorySystem {
         // Re-index in vector DB with updated embeddings
         if let Err(e) = self.retriever.reindex_memory(memory) {
             tracing::warn!(
-                "Failed to reindex memory {} in vector DB: {}",
-                memory_id.0,
-                e
+                "Failed to reindex memory {} in vector DB: {e:#}",
+                memory_id.0
             );
         }
 
@@ -5722,48 +5758,123 @@ impl MemorySystem {
     ///
     /// The records are written in one atomic store write (one commit and sync for a
     /// follower's page, not one per memory), so `memories` should name each id once.
+    ///
+    /// A snapshot's vector is stored only when this store's index can hold it. A leader
+    /// whose embedding migration rewrote its records without journaling them still logs
+    /// the old model's vector for every memory not written since, and the follower's
+    /// index refuses that vector at every reindex, startup repair and backlog drain.
+    /// Such a snapshot takes the stored vector when the stored record has the same
+    /// content, else a vector embedded here.
     pub fn upsert_memories(&self, memories: &[Memory]) -> Result<usize> {
-        // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
-        // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
-        // them, and a replica applying every snapshot grew 18.7 vectors per memory.
-        let vectors_kept: Vec<bool> = memories
-            .iter()
-            .map(|memory| {
-                self.retriever.is_indexed(&memory.id)
-                    && self.long_term_memory.get(&memory.id).is_ok_and(|stored| {
+        let mut fitted: Vec<Memory> = Vec::with_capacity(memories.len());
+        let mut vectors_kept: Vec<bool> = Vec::with_capacity(memories.len());
+        for memory in memories {
+            let indexed = self.retriever.is_indexed(&memory.id);
+            let foreign = memory
+                .experience
+                .embeddings
+                .as_deref()
+                .is_some_and(|e| !self.retriever.fits_primary(e));
+            // Read only when it can matter: a replay's new memories are neither.
+            let stored = if indexed || foreign {
+                self.long_term_memory.get(&memory.id).ok()
+            } else {
+                None
+            };
+            let memory = self.fit_snapshot_vector(memory, stored.as_ref());
+            // A snapshot that leaves the vectors' inputs as stored (an anchor, an access,
+            // a tag change) keeps the indexed vectors: a reindex soft-deletes and re-adds
+            // them, and a replica applying every snapshot grew 18.7 vectors per memory.
+            vectors_kept.push(
+                indexed
+                    && stored.is_some_and(|stored| {
                         keeps_vectors(&stored, &memory.experience.content)
                             && stored.experience.embeddings == memory.experience.embeddings
-                    })
-            })
-            .collect();
-        self.long_term_memory.update_many(memories)?;
-        for (memory, vectors_kept) in memories.iter().zip(vectors_kept) {
+                    }),
+            );
+            fitted.push(memory);
+        }
+        self.long_term_memory.update_many(&fitted)?;
+        for (memory, vectors_kept) in fitted.into_iter().zip(vectors_kept) {
             if !vectors_kept {
-                if let Err(e) = self.retriever.reindex_memory(memory) {
+                if let Err(e) = self.retriever.reindex_memory(&memory) {
                     tracing::warn!(
-                        "Failed to reindex memory {} in vector DB: {}",
-                        memory.id.0,
-                        e
+                        "Failed to reindex memory {} in vector DB: {e:#}",
+                        memory.id.0
                     );
+                    if let Err(record_err) = self.embedding_backlog.record(
+                        &memory.id,
+                        embedding_backlog::EnqueueReason::IndexFailed,
+                        Some(&format!("{e:#}")),
+                    ) {
+                        tracing::error!(
+                            "embedding backlog: could not record {}: {record_err}",
+                            memory.id.0
+                        );
+                    }
                 }
             }
-            let shared = std::sync::Arc::new(memory.clone());
+            let shared = std::sync::Arc::new(memory);
             {
                 let mut working = self.working_memory.write();
-                if working.contains(&memory.id) {
-                    let _ = working.remove(&memory.id);
+                if working.contains(&shared.id) {
+                    let _ = working.remove(&shared.id);
                     let _ = working.add_shared(std::sync::Arc::clone(&shared));
                 }
             }
             {
                 let mut session = self.session_memory.write();
-                if session.contains(&memory.id) {
-                    let _ = session.remove(&memory.id);
+                if session.contains(&shared.id) {
+                    let _ = session.remove(&shared.id);
                     let _ = session.add_shared(shared);
                 }
             }
         }
         Ok(memories.len())
+    }
+
+    /// `memory` with a primary vector this store's index can hold: its own when it fits,
+    /// else the stored record's when that has the same content and a vector that fits,
+    /// else one embedded here from the text the index embeds. When the embedder cannot
+    /// produce one the snapshot keeps its vector, and the reindex that follows records
+    /// the memory in the embedding backlog. A memory without a vector is left to the
+    /// index, which embeds it.
+    fn fit_snapshot_vector(&self, memory: &Memory, stored: Option<&Memory>) -> Memory {
+        let mut memory = memory.clone();
+        let foreign = memory
+            .experience
+            .embeddings
+            .as_deref()
+            .is_some_and(|e| !self.retriever.fits_primary(e));
+        if !foreign {
+            return memory;
+        }
+        let reusable = stored
+            .filter(|s| s.experience.content == memory.experience.content)
+            .and_then(|s| s.experience.embeddings.clone())
+            .filter(|e| self.retriever.fits_primary(e));
+        let refit = match reusable {
+            Some(vector) => Ok(vector),
+            None => self.embedder.encode(
+                &crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory),
+            ),
+        };
+        match refit {
+            Ok(vector) => {
+                tracing::debug!(
+                    memory_id = %memory.id.0,
+                    from = memory.experience.embeddings.as_ref().map_or(0, Vec::len),
+                    to = vector.len(),
+                    "snapshot vector refitted to this index's dimension"
+                );
+                memory.experience.embeddings = Some(vector);
+            }
+            Err(e) => tracing::warn!(
+                memory_id = %memory.id.0,
+                "snapshot vector does not fit this index and could not be re-embedded: {e:#}"
+            ),
+        }
+        memory
     }
 
     /// Set or update the parent of a memory for hierarchical organization
@@ -7861,6 +7972,18 @@ impl MemorySystem {
     #[cfg(test)]
     pub(crate) fn test_session_contains(&self, id: &MemoryId) -> bool {
         self.session_memory.read().contains(id)
+    }
+
+    /// Test-only: the primary index's vector ids for `id`; empty when it is not indexed.
+    #[cfg(test)]
+    pub(crate) fn test_vector_ids(&self, id: &MemoryId) -> Vec<u32> {
+        self.retriever.vector_ids_of(id)
+    }
+
+    /// Test-only: the dimension the primary index holds.
+    #[cfg(test)]
+    pub(crate) fn test_primary_dimension(&self) -> usize {
+        self.embedder.primary_dimension()
     }
 
     /// Test-only: force `access_history` + `last_accessed` on a stored memory so
@@ -10142,13 +10265,153 @@ mod vector_index_reopen_tests {
 }
 
 #[cfg(test)]
+mod foreign_vector_tests {
+    use super::*;
+
+    /// A dimension the primary index does not hold: the other of the two the store has
+    /// used (MiniLM 384, Nomic 768).
+    fn foreign_dimension(system: &MemorySystem) -> usize {
+        if system.embedder.primary_dimension() == 768 {
+            384
+        } else {
+            768
+        }
+    }
+
+    /// Stored as a follower stored a pre-migration snapshot, before snapshots were refitted.
+    fn stored_with_foreign_vector(system: &MemorySystem, content: &str) -> Memory {
+        let memory = Memory::new(
+            MemoryId(Uuid::new_v4()),
+            Experience {
+                content: content.to_string(),
+                embeddings: Some(vec![0.05; foreign_dimension(system)]),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        system
+            .long_term_memory
+            .update_many(std::slice::from_ref(&memory))
+            .expect("store");
+        memory
+    }
+
+    fn stored_vector_len(system: &MemorySystem, id: &MemoryId) -> usize {
+        system
+            .long_term_memory
+            .get(id)
+            .expect("stored")
+            .experience
+            .embeddings
+            .map_or(0, |e| e.len())
+    }
+
+    /// The live replica's 18: stored with a 384-d vector against a 768-d index, retried by
+    /// the drain every minute and refused every time. The drain re-embeds the stored vector
+    /// at this index's dimension, indexes the memory once and clears its row.
+    #[test]
+    fn the_backlog_drain_refits_a_stored_vector_of_another_dimension() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let dim = system.embedder.primary_dimension();
+            let memory =
+                stored_with_foreign_vector(&system, "the night ferry leaves pier four at eleven");
+            system
+                .embedding_backlog
+                .record(
+                    &memory.id,
+                    embedding_backlog::EnqueueReason::IndexFailed,
+                    Some("Failed to add vector to index"),
+                )
+                .expect("backlog row");
+
+            let (report, rewritten) = system.drain_embedding_backlog_journaled(10).expect("drain");
+
+            assert_eq!(
+                (report.drained, report.failed, report.remaining),
+                (1, 0, 0),
+                "{backend}: {report:?}"
+            );
+            assert_eq!(
+                rewritten,
+                vec![memory.id.clone()],
+                "{backend}: the refit is journaled"
+            );
+            assert_eq!(
+                stored_vector_len(&system, &memory.id),
+                dim,
+                "{backend}: stored vector"
+            );
+            assert_eq!(
+                system.retriever.vector_ids_of(&memory.id).len(),
+                1,
+                "{backend}: indexed once"
+            );
+            assert!(system
+                .embedding_backlog
+                .get(&memory.id)
+                .expect("read backlog")
+                .is_none());
+        }
+    }
+
+    /// The startup repair and every reindex pass a stored record to the index as it is: a
+    /// vector of another dimension is embedded again rather than refused.
+    #[test]
+    fn indexing_a_record_whose_vector_is_another_dimension_embeds_it_again() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let memory =
+                stored_with_foreign_vector(&system, "the tide tables are posted at the ramp");
+            system
+                .retriever
+                .index_memory(&memory)
+                .unwrap_or_else(|e| panic!("{backend}: {e:#}"));
+            assert_eq!(
+                system.retriever.vector_ids_of(&memory.id).len(),
+                1,
+                "{backend}"
+            );
+        }
+    }
+
+    /// Fitting a snapshot reuses the stored vector of the same content instead of embedding
+    /// it again, and leaves a vector that already fits alone.
+    #[test]
+    fn a_refit_snapshot_reuses_the_stored_vector_of_the_same_content() {
+        for (backend, system, _tmp) in super::lifecycle_tests::systems() {
+            let dim = system.embedder.primary_dimension();
+            let mut stored =
+                stored_with_foreign_vector(&system, "the harbour master signs off at six");
+            stored.experience.embeddings = Some(vec![0.25; dim]);
+            let mut snapshot = stored.clone();
+            snapshot.experience.embeddings = Some(vec![0.05; foreign_dimension(&system)]);
+
+            let fitted = system.fit_snapshot_vector(&snapshot, Some(&stored));
+            assert_eq!(
+                fitted.experience.embeddings, stored.experience.embeddings,
+                "{backend}"
+            );
+
+            let fits = system.fit_snapshot_vector(&stored, None);
+            assert_eq!(
+                fits.experience.embeddings, stored.experience.embeddings,
+                "{backend}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use crate::config::StorageBackend;
     use tempfile::TempDir;
 
     /// One memory system per storage engine this build carries.
-    fn systems() -> Vec<(StorageBackend, MemorySystem, TempDir)> {
+    pub(super) fn systems() -> Vec<(StorageBackend, MemorySystem, TempDir)> {
         let config_for = |tmp: &TempDir| MemoryConfig {
             storage_path: tmp.path().to_path_buf(),
             ..Default::default()
