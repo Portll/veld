@@ -258,6 +258,92 @@ pub const NER_FALLBACK_CONFIDENCE_FLOOR: f32 = 0.5;
 /// Env var overriding [`NER_FALLBACK_CONFIDENCE_FLOOR`].
 pub const NER_FALLBACK_CONFIDENCE_ENV: &str = "VELD_NER_FALLBACK_CONFIDENCE";
 
+/// Minimum character length of an NER span that becomes a graph node (upstream #261): BPE
+/// misalignment leaves two-character fragments ("au", "th") at high confidence.
+pub const NER_ENTITY_MIN_LENGTH: usize = 3;
+
+/// Confidence floor for a MISC span at graph insertion (upstream #261, which #573 redefined as
+/// the typer's own commit threshold). veld's lowest commit threshold is the fallback's
+/// [`NER_FALLBACK_CONFIDENCE_FLOOR`]; BERT-tiny commits at `VELD_NER_CONFIDENCE` (0.7). The
+/// floor therefore rejects only a stored record, as a rebuild replays it, that scored below
+/// every typer's line. PER, ORG and LOC spans are exempt (see `ner_span_becomes_node`).
+pub const NER_GRAPH_CONFIDENCE_FLOOR: f32 = NER_FALLBACK_CONFIDENCE_FLOOR;
+
+/// Past-tense verbs, gerunds and adjectives an NER typer labels as entities (upstream #261).
+/// None names a thing, whatever label it carries, so none becomes a graph node.
+pub const NER_VERB_NOISE: &[&str] = &[
+    "decided",
+    "added",
+    "removed",
+    "changed",
+    "updated",
+    "created",
+    "deleted",
+    "fixed",
+    "moved",
+    "used",
+    "called",
+    "made",
+    "set",
+    "found",
+    "tried",
+    "started",
+    "finished",
+    "built",
+    "ran",
+    "got",
+    "switched",
+    "enabled",
+    "disabled",
+    "configured",
+    "deployed",
+    "merged",
+    "pushed",
+    "pulled",
+    "committed",
+    "resolved",
+    "closed",
+    "implemented",
+    "refactored",
+    "migrated",
+    "installed",
+    "upgraded",
+    "using",
+    "running",
+    "building",
+    "testing",
+    "working",
+    "making",
+    "getting",
+    "setting",
+    "adding",
+    "fixing",
+    "checking",
+    "looking",
+    "new",
+    "old",
+    "good",
+    "bad",
+    "first",
+    "last",
+    "next",
+    "other",
+    "same",
+    "different",
+    "important",
+    "available",
+    "possible",
+    "current",
+    "previous",
+    "following",
+    "existing",
+    "certain",
+];
+
+/// Env switch for [`NER_GRAPH_CONFIDENCE_FLOOR`] and [`NER_VERB_NOISE`]: `0` or `false` turns
+/// both off. On by default.
+pub const NER_GRAPH_NOISE_GATE_ENV: &str = "VELD_GRAPH_NER_NOISE_GATE";
+
 // =============================================================================
 // COMPRESSION THRESHOLDS
 // Based on information theory and cognitive psychology research on memory decay
