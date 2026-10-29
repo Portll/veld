@@ -4098,9 +4098,12 @@ mod tests {
     /// the keyword "set" lies outside both mentions and outside the cue, so the fragment guard
     /// passes it; only the write's tag provenance tells it from a name the writer chose. The
     /// same writes without provenance are the control: there "set" must weld the chains, or
-    /// the fixture no longer exercises the bridge.
+    /// the fixture no longer exercises the bridge. Both arms write with the tag-admission gate
+    /// off, under which every tag is a node, so the provenance rule is what they measure; under
+    /// the default gates the keyword is never a node at all, which the third arm pins.
     #[test]
     fn derived_keyword_between_event_names_takes_no_causal_edge() {
+        use crate::handlers::state::GraphAdmission;
         use crate::memory::tag_sources::{SourcedTag, TagSource, TagSources, TAG_SOURCES_SCHEMA};
 
         let dir = unique_storage_dir("causal-provenance");
@@ -4110,9 +4113,12 @@ mod tests {
             ("the Talvik incident", "the Brask incident"),
             ("the Ostrel incident", "the Quarn incident"),
         ];
-        for (user, with_provenance) in [
-            ("causal-provenance-on", true),
-            ("causal-provenance-off", false),
+        let mut every_tag_a_node = GraphAdmission::from_env();
+        every_tag_a_node.tag_admission = false;
+        for (user, with_provenance, admission) in [
+            ("causal-provenance-on", true, every_tag_a_node),
+            ("causal-provenance-off", false, every_tag_a_node),
+            ("causal-provenance-gated", true, GraphAdmission::from_env()),
         ] {
             for (cause, effect) in chains {
                 let tags = vec![cause.to_string(), effect.to_string(), "set".to_string()];
@@ -4136,15 +4142,45 @@ mod tests {
                     ..Default::default()
                 };
                 manager
-                    .process_experience_into_graph_declared(
+                    .build_experience_graph(
                         user,
                         &experience,
                         &MemoryId(Uuid::new_v4()),
                         &[],
                         with_provenance.then_some(&sources),
+                        admission,
                     )
                     .expect("graph");
             }
+        }
+
+        {
+            let graph = manager
+                .get_user_graph("causal-provenance-gated")
+                .expect("graph");
+            let g = graph.read();
+            assert!(
+                g.find_entity_by_name_strict("set")
+                    .expect("lookup")
+                    .is_none(),
+                "a YAKE keyword became a node under the tag-admission gate"
+            );
+            let node = |name: &str| {
+                g.find_entity_by_name_strict(name)
+                    .expect("lookup")
+                    .unwrap_or_else(|| panic!("caller tag '{name}' is not a node"))
+                    .uuid
+            };
+            let (morwen, talvik) = (node("the Morwen incident"), node("the Talvik incident"));
+            assert!(
+                g.get_entity_relationships_limited(&morwen, Some(64))
+                    .expect("edges")
+                    .iter()
+                    .any(|e| e.from_entity == morwen
+                        && e.to_entity == talvik
+                        && e.relation_type.is_causal()),
+                "the caller-tagged pair lost its causal edge under the gates"
+            );
         }
 
         let census = |user: &str| {

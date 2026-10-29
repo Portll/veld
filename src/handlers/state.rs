@@ -4547,7 +4547,7 @@ impl MultiUserMemoryManager {
 
     /// [`process_experience_into_graph_declared`](Self::process_experience_into_graph_declared)
     /// under the given gate switches.
-    fn build_experience_graph(
+    pub(crate) fn build_experience_graph(
         &self,
         user_id: &str,
         experience: &Experience,
@@ -6089,32 +6089,32 @@ fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// The graph-admission switches (the GRAPH ADMISSION section of [`crate::constants`]), read
 /// once per graph write so a harness arm can set them after start-up.
 #[derive(Debug, Clone, Copy)]
-struct GraphAdmission {
+pub(crate) struct GraphAdmission {
     /// The NER confidence floor and verb-noise list at graph insertion.
-    ner_noise_gate: bool,
+    pub(crate) ner_noise_gate: bool,
     /// A tag becomes a node only on an authority, and never beside the NER node it twins.
-    tag_admission: bool,
+    pub(crate) tag_admission: bool,
     /// Relational verbs and their stems become nodes (off: upstream #260).
-    verb_entities: bool,
+    pub(crate) verb_entities: bool,
     /// A derived entity of higher degree accretes no new edge. Held under
     /// [`crate::constants::MAX_ENTITY_DEGREE`], where every new edge only buys a prune.
-    hub_degree_max: usize,
+    pub(crate) hub_degree_max: usize,
     /// A generic edge is born only when its pair's PMI reaches `pmi_gate_min`.
-    pmi_gate: bool,
-    pmi_gate_min: f32,
+    pub(crate) pmi_gate: bool,
+    pub(crate) pmi_gate_min: f32,
     /// No edge between two entities a heavy cycle scored as low-selectivity hubs.
-    selectivity_skip: bool,
+    pub(crate) selectivity_skip: bool,
     /// An edge the sentence does not type takes the type its label pair implies.
-    label_pair_typing: bool,
+    pub(crate) label_pair_typing: bool,
     /// Two people are typed `Knows` (off: upstream).
-    person_person_knows: bool,
+    pub(crate) person_person_knows: bool,
     /// The semantic typer types a pair whose nearest exemplar reaches `semantic_min_cosine`.
-    semantic_relations: bool,
-    semantic_min_cosine: f32,
+    pub(crate) semantic_relations: bool,
+    pub(crate) semantic_min_cosine: f32,
 }
 
 impl GraphAdmission {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         use crate::constants as c;
         Self {
             ner_noise_gate: env_switch(c::NER_GRAPH_NOISE_GATE_ENV, true),
