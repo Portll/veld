@@ -10,6 +10,7 @@ redb and RocksDB implementations, and the tools that move data between engines.
 | `legacy_rocksdb.rs` | The RocksDB implementation. Compiled with the `rocksdb` feature. |
 | `portable.rs` | The VELDPORT interchange codec used by export, import and migrate. |
 | `migrate/` | `veld export`, `veld import` and `veld migrate`; each unit is verified by frame count and SHA-256 digest. |
+| `value_envelope.rs` | The compressed envelope for a memory record (`VEZ1`, raw length, zstd level 3). Both engines read it under any record encryption, and export and migrate carry the plain bincode inside it; neither engine writes it yet. |
 | `boot_guard.rs` | Refuses to serve an empty store while the other engine holds data. |
 | `relational/` | The relational store trait and its SQLite, Postgres and SQL Server backends. |
 | `test_support.rs` | One store per enabled engine, so a test runs its assertions on each. |

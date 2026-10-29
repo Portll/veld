@@ -672,6 +672,8 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
         ));
     }
 
+    let data = &*crate::storage::value_envelope::unwrap(data)?;
+
     // Check for versioned format: SHO + version byte + payload + 4-byte CRC32
     if data.len() >= 8 && &data[0..3] == STORAGE_MAGIC {
         let version = data[3];
@@ -712,13 +714,21 @@ pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, 
             "record is encrypted; a portable dump cannot carry it"
         ));
     }
-    if is_current_memory_encoding(data) {
-        return Ok(std::borrow::Cow::Borrowed(data));
+    let inner = crate::storage::value_envelope::unwrap(data)?;
+    if is_current_memory_encoding(&inner) {
+        return Ok(inner);
     }
-    let (memory, _) = deserialize_memory(data)?;
+    let (memory, _) = deserialize_memory(&inner)?;
     let encoded = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
         .context("re-encoding a decoded memory")?;
     Ok(std::borrow::Cow::Owned(encoded))
+}
+
+/// Whether a stored value holds one `Memory` in the current layout, plain or in the
+/// value envelope.
+pub(crate) fn is_current_memory_value(data: &[u8]) -> bool {
+    crate::storage::value_envelope::unwrap(data)
+        .is_ok_and(|inner| is_current_memory_encoding(&inner))
 }
 
 /// Whether `data` is exactly one `Memory` in the current plain-bincode layout, which
@@ -4048,12 +4058,8 @@ impl MemoryStorage {
             // Try current format first (quick check). An encrypted record is already
             // in the v2 envelope format, so treat it as current rather than
             // decrypt + re-encrypt it on every migration pass.
-            let is_current = crate::keystore::is_encrypted_record(&value)
-                || bincode::serde::decode_from_slice::<Memory, _>(
-                    &value,
-                    bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
-                )
-                .is_ok();
+            let is_current =
+                crate::keystore::is_encrypted_record(&value) || is_current_memory_value(&value);
 
             if is_current {
                 already_current += 1;
@@ -5277,6 +5283,61 @@ mod tests {
     }
 
     use super::wire_fixtures::{encode, memory_with_session, strip_writer_structs};
+
+    /// A memory whose bincode the value envelope shrinks: a long, repetitive body.
+    fn compressible_memory(label: &str) -> Memory {
+        Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience {
+                content: format!("{label}: ")
+                    + &"the harbour crane is serviced in spring. ".repeat(40),
+                ..Default::default()
+            },
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(feature = "rocksdb")]
+    /// A record in the value envelope, as the writer that follows this reader stores it, reads
+    /// back next to a plain one, and `migrate_legacy` counts both as current rather than
+    /// rewriting them.
+    #[test]
+    fn an_enveloped_record_reads_and_counts_as_current() {
+        let (storage, _dir) = test_storage();
+        let enveloped = compressible_memory("enveloped");
+        let value = crate::storage::value_envelope::wrap(encode(&enveloped));
+        assert!(crate::storage::value_envelope::is_enveloped(&value));
+        storage.db.put(enveloped.id.0.as_bytes(), &value).unwrap();
+        let plain = compressible_memory("plain");
+        storage.store(&plain).unwrap();
+
+        for memory in [&enveloped, &plain] {
+            assert_eq!(
+                storage.get(&memory.id).unwrap().experience.content,
+                memory.experience.content
+            );
+        }
+        let (migrated, current, failed) = storage.migrate_legacy().unwrap();
+        assert_eq!((migrated, current, failed), (0, 2, 0));
+        assert_eq!(
+            storage.db.get(enveloped.id.0.as_bytes()).unwrap().unwrap(),
+            value
+        );
+    }
+
+    /// Export and migrate carry an enveloped record as the plain bincode inside it.
+    #[test]
+    fn a_portable_value_is_the_bincode_inside_the_envelope() {
+        let memory = compressible_memory("portable");
+        let plain = encode(&memory);
+        let enveloped = crate::storage::value_envelope::wrap(plain.clone());
+        let carried = portable_memory_value(&enveloped).unwrap();
+        assert_eq!(carried.as_ref(), plain.as_slice());
+    }
 
     #[cfg(feature = "rocksdb")]
     /// A value that is not a memory but whose tail is UTF-8 used to "decode" through a raw-parse
