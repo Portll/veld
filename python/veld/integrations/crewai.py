@@ -35,7 +35,7 @@ import re
 import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 try:
     from crewai.memory.types import MemoryMatch, MemoryRecord, ScopeInfo
@@ -57,6 +57,14 @@ from urllib3.util.retry import Retry
 # Every memory this adapter writes carries TAG. Scope, category, source and
 # privacy ride in prefixed tags, because veld's remember route has no other
 # field for them and tags are what its list, recall and forget routes filter on.
+#
+# The value after each prefix is percent-encoded (every character but letters,
+# digits and "_.-~"). Veld redacts tags that look like credentials or home
+# directories before storing them: a raw "crewai:scope:/home/team" matched its
+# path rule (/(?:Users|home)/...) and came back as "redacted:path", so recall
+# and reset by that scope missed the memory. Encoded, "/" is "%2F" and none of
+# the redactor's shapes can match a value. It also keeps commas out of tags,
+# which the list route would split its filter on.
 TAG = "crewai"
 _SCOPE_PREFIX = "crewai:scope:"
 _CATEGORY_PREFIX = "crewai:category:"
@@ -188,6 +196,10 @@ def _parse_time(value: Any) -> datetime:
         raise VeldRequestError(f"veld returned created_at {value!r}, which is not RFC 3339") from e
 
 
+def _tag_value(value: str) -> str:
+    return quote(value, safe="")
+
+
 def _scope_tags(scope: Optional[str]) -> List[str]:
     """Tags for a scope and each of its ancestors, so an exact-match tag filter
     on any ancestor selects the whole subtree."""
@@ -195,7 +207,7 @@ def _scope_tags(scope: Optional[str]) -> List[str]:
     if path == "/":
         return []
     parts = path.strip("/").split("/")
-    return [_SCOPE_PREFIX + "/" + "/".join(parts[: i + 1]) for i in range(len(parts))]
+    return [_SCOPE_PREFIX + _tag_value("/" + "/".join(parts[: i + 1])) for i in range(len(parts))]
 
 
 def _subtree_tag(scope_prefix: Optional[str]) -> str:
@@ -204,16 +216,11 @@ def _subtree_tag(scope_prefix: Optional[str]) -> str:
     return tags[-1] if tags else TAG
 
 
-def _in_scope(scope: str, prefix: Optional[str]) -> bool:
-    path = normalize_scope_path(prefix or "/")
-    return path == "/" or scope == path or scope.startswith(path + "/")
-
-
 def _record_tags(record: MemoryRecord) -> List[str]:
     tags = [TAG, *_scope_tags(record.scope)]
-    tags.extend(_CATEGORY_PREFIX + c for c in record.categories)
+    tags.extend(_CATEGORY_PREFIX + _tag_value(c) for c in record.categories)
     if record.source:
-        tags.append(_SOURCE_PREFIX + record.source)
+        tags.append(_SOURCE_PREFIX + _tag_value(record.source))
     if record.private:
         tags.append(_PRIVATE_TAG)
     return tags
@@ -239,11 +246,11 @@ def _build_record(
         if not isinstance(tag, str):
             continue
         if tag.startswith(_SCOPE_PREFIX):
-            scopes.append(tag[len(_SCOPE_PREFIX):])
+            scopes.append(unquote(tag[len(_SCOPE_PREFIX):]))
         elif tag.startswith(_CATEGORY_PREFIX):
-            categories.append(tag[len(_CATEGORY_PREFIX):])
+            categories.append(unquote(tag[len(_CATEGORY_PREFIX):]))
         elif tag.startswith(_SOURCE_PREFIX):
-            source = tag[len(_SOURCE_PREFIX):]
+            source = unquote(tag[len(_SOURCE_PREFIX):])
         elif tag == _PRIVATE_TAG:
             private = True
     created = _parse_time(created_at)
@@ -367,17 +374,16 @@ class _VeldStore:
     def _scan(self, scope_prefix: Optional[str]) -> List[Tuple[MemoryRecord, bool]]:
         """Every adapter-written record under ``scope_prefix``, each paired with
         whether the list route cut its content to a preview."""
+        # An encoded scope tag holds no comma, so the list route, which splits its
+        # tag filter on commas, can filter by it directly.
         wanted = _subtree_tag(scope_prefix)
-        # The list route splits its tag filter on commas, so a scope containing one
-        # is filtered here instead.
-        server_tag = wanted if "," not in wanted else TAG
         rows: List[Tuple[MemoryRecord, bool]] = []
         offset = 0
         while True:
             body = self._http.request(
                 "POST",
                 "/api/memories",
-                {"user_id": self._user_id, "tags": server_tag, "limit": _LIST_PAGE, "offset": offset},
+                {"user_id": self._user_id, "tags": wanted, "limit": _LIST_PAGE, "offset": offset},
             )
             items = _memories(body)
             for item in items:
@@ -388,8 +394,7 @@ class _VeldStore:
                     item.get("importance", 0.5),
                     item.get("created_at"),
                 )
-                if server_tag == wanted or _in_scope(record.scope, scope_prefix):
-                    rows.append((record, bool(item.get("content_truncated"))))
+                rows.append((record, bool(item.get("content_truncated"))))
             offset += len(items)
             if not items or offset >= int(body.get("total", 0)):
                 return rows
@@ -555,7 +560,9 @@ class VeldCrewMemory(Memory):
     - ``recall`` runs veld's retrieval pipeline once; ``depth`` is accepted and
       has no effect.
     - Scope, categories, source and the private flag are stored as tags prefixed
-      ``crewai:``. ``metadata`` and ``importance`` passed to ``remember`` are not
+      ``crewai:``, their values percent-encoded so that veld's tag redactor
+      leaves them intact (scope ``/home/team`` is ``crewai:scope:%2Fhome%2Fteam``).
+      ``metadata`` and ``importance`` passed to ``remember`` are not
       stored: veld's remember route has no free-form field and scores
       importance itself.
     - ``recall`` searches the whole user_id, including memories other clients

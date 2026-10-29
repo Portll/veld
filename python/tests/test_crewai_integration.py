@@ -7,6 +7,7 @@ when CrewAI is not installed (pip install veld[crewai])."""
 import importlib.util
 import os
 import pathlib
+import re
 import sys
 import unittest
 import warnings
@@ -208,10 +209,10 @@ class TestRemember(unittest.TestCase):
             body["tags"],
             [
                 "crewai",
-                "crewai:scope:/crew",
-                "crewai:scope:/crew/research",
-                "crewai:scope:/crew/research/client",
-                "crewai:scope:/crew/research/client/acme",
+                "crewai:scope:%2Fcrew",
+                "crewai:scope:%2Fcrew%2Fresearch",
+                "crewai:scope:%2Fcrew%2Fresearch%2Fclient",
+                "crewai:scope:%2Fcrew%2Fresearch%2Fclient%2Facme",
                 "crewai:category:preferences",
                 "crewai:source:alice",
                 "crewai:private",
@@ -269,7 +270,7 @@ class TestRemember(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         body = session.calls[0]["json"]
         self.assertEqual([m["content"] for m in body["memories"]], ["first", "second"])
-        self.assertEqual(body["memories"][0]["tags"], ["crewai", "crewai:scope:/notes"])
+        self.assertEqual(body["memories"][0]["tags"], ["crewai", "crewai:scope:%2Fnotes"])
         self.assertEqual(body["memories"][0]["source_type"], "ai_generated")
 
     def test_background_save_failure_warns_and_does_not_raise(self):
@@ -309,7 +310,7 @@ class TestRecall(unittest.TestCase):
         item = recall_item(
             "mem-1",
             "The client wants weekly reports",
-            ["crewai", "crewai:scope:/crew", "crewai:scope:/crew/acme", "crewai:category:prefs", "Acme Corp"],
+            ["crewai", "crewai:scope:%2Fcrew", "crewai:scope:%2Fcrew%2Facme", "crewai:category:prefs", "Acme Corp"],
             score=0.82,
         )
         memory, session = build({("POST", "/api/recall"): FakeResponse(200, {"memories": [item], "count": 1})})
@@ -336,8 +337,8 @@ class TestRecall(unittest.TestCase):
         )
         memory.recall("q")
         memory.recall("q", scope="agent/writer")
-        self.assertEqual(session.calls[0]["json"]["tags"], ["crewai:scope:/crew/research"])
-        self.assertEqual(session.calls[1]["json"]["tags"], ["crewai:scope:/crew/research/agent/writer"])
+        self.assertEqual(session.calls[0]["json"]["tags"], ["crewai:scope:%2Fcrew%2Fresearch"])
+        self.assertEqual(session.calls[1]["json"]["tags"], ["crewai:scope:%2Fcrew%2Fresearch%2Fagent%2Fwriter"])
         self.assertEqual(session.calls[1]["json"]["mode"], "semantic")
 
     def test_suspected_injection_is_dropped_unless_asked_for(self):
@@ -439,7 +440,7 @@ class TestForgetAndReset(unittest.TestCase):
         )
         self.assertEqual(memory.forget(scope="old"), 4)
         self.assertEqual(
-            session.calls[0]["json"], {"user_id": "crew-user", "tags": ["crewai:scope:/crew/research/old"]}
+            session.calls[0]["json"], {"user_id": "crew-user", "tags": ["crewai:scope:%2Fcrew%2Fresearch%2Fold"]}
         )
 
     def test_reset_deletes_only_adapter_memories(self):
@@ -481,16 +482,16 @@ class TestForgetAndReset(unittest.TestCase):
 class TestListingAndUpdate(unittest.TestCase):
     def _rows(self):
         return [
-            list_item("a", "older", ["crewai", "crewai:scope:/crew", "crewai:scope:/crew/a", "crewai:category:x"],
+            list_item("a", "older", ["crewai", "crewai:scope:%2Fcrew", "crewai:scope:%2Fcrew%2Fa", "crewai:category:x"],
                       "2026-10-01T00:00:00Z"),
-            list_item("b", "preview...", ["crewai", "crewai:scope:/crew", "crewai:scope:/crew/b", "crewai:category:x",
+            list_item("b", "preview...", ["crewai", "crewai:scope:%2Fcrew", "crewai:scope:%2Fcrew%2Fb", "crewai:category:x",
                                           "crewai:category:y"], "2026-10-02T00:00:00Z", truncated=True),
         ]
 
     def test_list_records_newest_first_with_full_content(self):
         full = {
             "id": "b",
-            "experience": {"content": "the whole text", "entities": ["crewai", "crewai:scope:/crew/b"]},
+            "experience": {"content": "the whole text", "entities": ["crewai", "crewai:scope:%2Fcrew%2Fb"]},
             "importance": 0.7,
             "created_at": "2026-10-02T00:00:00Z",
         }
@@ -503,7 +504,7 @@ class TestListingAndUpdate(unittest.TestCase):
         records = memory.list_records(scope="/crew")
         self.assertEqual([r.id for r in records], ["b", "a"])
         self.assertEqual(records[0].content, "the whole text")
-        self.assertEqual(session.calls[0]["json"]["tags"], "crewai:scope:/crew")
+        self.assertEqual(session.calls[0]["json"]["tags"], "crewai:scope:%2Fcrew")
         self.assertEqual(session.calls[1]["params"], {"user_id": "crew-user", "decompress": "1"})
 
     def test_listing_pages_until_total(self):
@@ -533,7 +534,7 @@ class TestListingAndUpdate(unittest.TestCase):
     def test_update_rewrites_content(self):
         current = {
             "id": "a",
-            "experience": {"content": "old", "entities": ["crewai", "crewai:scope:/notes"]},
+            "experience": {"content": "old", "entities": ["crewai", "crewai:scope:%2Fnotes"]},
             "importance": 0.5,
             "created_at": "2026-10-01T00:00:00Z",
         }
@@ -568,6 +569,105 @@ class TestListingAndUpdate(unittest.TestCase):
         memory, session = build()
         memory.close()
         self.assertTrue(session.closed)
+
+
+# veld's home-directory rule, copied from src/redaction.rs (PATH). Veld replaces a
+# whole tag with "redacted:path" when the rule matches anywhere in it.
+_VELD_PATH_RULE = re.compile(r"/(?:Users|home)/[A-Za-z0-9._\-]+")
+
+
+def _veld_redact(tag):
+    return "redacted:path" if _VELD_PATH_RULE.search(tag) else tag
+
+
+class RedactingVeld:
+    """An in-memory veld for the routes scope round-trips use. Like the server, it
+    redacts tags on the way in; recall matches any filter tag, forget-by-tags
+    deletes on any match, and the list route needs every comma-separated tag."""
+
+    def __init__(self):
+        self.stored = {}
+
+    def _remember(self, call):
+        memory_id = f"m-{len(self.stored) + 1}"
+        self.stored[memory_id] = {
+            "content": call["json"]["content"],
+            "tags": [_veld_redact(t) for t in call["json"]["tags"]],
+        }
+        return FakeResponse(200, {"id": memory_id, "success": True})
+
+    def _recall(self, call):
+        wanted = set(call["json"].get("tags") or [])
+        hits = [
+            recall_item(memory_id, m["content"], m["tags"], source_trusted=True)
+            for memory_id, m in self.stored.items()
+            if not wanted or wanted & set(m["tags"])
+        ]
+        return FakeResponse(200, {"memories": hits, "count": len(hits)})
+
+    def _list(self, call):
+        wanted = set(call["json"]["tags"].split(","))
+        rows = [
+            list_item(memory_id, m["content"], m["tags"], "2026-10-01T00:00:00Z")
+            for memory_id, m in self.stored.items()
+            if wanted <= set(m["tags"])
+        ]
+        return FakeResponse(200, {"memories": rows, "total": len(rows)})
+
+    def _forget_tags(self, call):
+        wanted = set(call["json"]["tags"])
+        doomed = [i for i, m in self.stored.items() if wanted & set(m["tags"])]
+        for memory_id in doomed:
+            del self.stored[memory_id]
+        return FakeResponse(200, {"success": True, "deleted_count": len(doomed)})
+
+    def routes(self):
+        return {
+            ("POST", "/api/remember"): self._remember,
+            ("POST", "/api/recall"): self._recall,
+            ("POST", "/api/memories"): self._list,
+            ("POST", "/api/forget/tags"): self._forget_tags,
+        }
+
+
+@unittest.skipUnless(HAVE_CREWAI, "crewai is not installed")
+class TestScopeSurvivesRedaction(unittest.TestCase):
+    def test_the_fake_redacts_a_raw_home_scope_tag(self):
+        self.assertEqual(_veld_redact("crewai:scope:/home/team"), "redacted:path")
+
+    def test_home_scope_round_trips_through_recall_count_and_reset(self):
+        veld = RedactingVeld()
+        memory, _ = build(veld.routes())
+        record = memory.remember("The team ships on Thursdays", scope="/home/team")
+        memory.remember("Unrelated note", scope="/office")
+
+        stored_tags = veld.stored[record.id]["tags"]
+        self.assertNotIn("redacted:path", stored_tags)
+        self.assertIn("crewai:scope:%2Fhome%2Fteam", stored_tags)
+
+        matches = memory.recall("when does the team ship?", scope="/home/team")
+        self.assertEqual([m.record.id for m in matches], [record.id])
+        self.assertEqual(matches[0].record.scope, "/home/team")
+        self.assertEqual(memory._storage.count("/home/team"), 1)
+        self.assertEqual(memory.list_scopes("/home"), ["/home/team"])
+
+        memory.reset(scope="/home/team")
+        self.assertNotIn(record.id, veld.stored)
+        self.assertEqual(len(veld.stored), 1)
+
+    def test_categories_and_source_are_encoded_too(self):
+        veld = RedactingVeld()
+        memory, _ = build(veld.routes())
+        record = memory.remember(
+            "note", scope="/a", categories=["/Users/alice/notes", "a,b"], source="/home/bob", private=True
+        )
+        tags = veld.stored[record.id]["tags"]
+        self.assertNotIn("redacted:path", tags)
+        self.assertIn("crewai:category:a%2Cb", tags)
+
+        matches = memory.recall("note", source="/home/bob")
+        self.assertEqual(matches[0].record.categories, ["/Users/alice/notes", "a,b"])
+        self.assertEqual(matches[0].record.source, "/home/bob")
 
 
 @unittest.skipUnless(HAVE_CREWAI, "crewai is not installed")

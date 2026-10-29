@@ -42,8 +42,10 @@ memory" tools, backed by veld. `Agent(memory=memory)` gives one agent its own me
 | Importance | Inferred by the LLM | Scored by veld |
 
 Scope, categories, source and the private flag are kept as tags prefixed `crewai:`, so
-`root_scope`, `memory.scope(...)` and `memory.slice(...)` work. `metadata` and `importance`
-passed to `remember` are not stored.
+`root_scope`, `memory.scope(...)` and `memory.slice(...)` work. Their values are
+percent-encoded (scope `/home/team` is the tag `crewai:scope:%2Fhome%2Fteam`), because veld
+redacts a tag that contains a home-directory path, and an unencoded scope like that would be
+stored as `redacted:path`. `metadata` and `importance` passed to `remember` are not stored.
 
 ## Direct use
 
