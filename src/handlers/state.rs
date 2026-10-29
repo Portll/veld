@@ -5167,7 +5167,7 @@ impl MultiUserMemoryManager {
                     None
                 };
                 // Typing chain, upstream's order: the sentence's cue, the semantic typer, then
-                // the label pair (upstream #259/#260). A fragment of a co-mentioned name is
+                // the label pair (upstream #260). A fragment of a co-mentioned name is
                 // never typed, and a causal type needs two causal candidates, as a cue does.
                 let fragment = fragment_of_comention[i] || fragment_of_comention[j];
                 let semantic_hit = if cue_hit.is_none() && !fragment {

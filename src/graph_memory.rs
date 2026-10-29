@@ -2227,7 +2227,7 @@ pub fn extract_directed_predicate(
 /// The relation the ontology implies between two co-mentioned entities by their labels alone,
 /// as `(relation, a_is_source)`, or `None` when no rule types the pair.
 ///
-/// Ported from upstream shodh-memory #259/#260 (`infer_relation_type_for_pair`), with two
+/// Ported from upstream shodh-memory #260 (`infer_relation_type_for_pair`), with two
 /// adaptations. Upstream matches only the pair in the order the memory listed it, so
 /// `(Organization, Person)` went untyped and `(Location, Person)` became a `LocatedIn` edge
 /// from the place; here the table is consulted in both orders and the edge points from the
