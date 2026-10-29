@@ -164,6 +164,7 @@ pub fn generate_selective_fixtures(groups: usize) -> SelectiveFixtures {
                 memory_type: "fact".to_string(),
                 tags: vec![token.clone()],
                 created_at: base + chrono::Duration::minutes((MEMORIES_PER_GROUP * g + m) as i64),
+                episode: None,
             });
             if m % stride == 0 && imp.len() < IMPORTANT_PER_GROUP {
                 imp.push(id);
@@ -401,6 +402,7 @@ pub fn generate_planted_fixtures(groups: usize) -> PlantedFixtures {
                 memory_type: "fact".to_string(),
                 tags: vec![token.clone()],
                 created_at: at(m),
+                episode: None,
             });
             gold.push(id);
         }
@@ -413,6 +415,7 @@ pub fn generate_planted_fixtures(groups: usize) -> PlantedFixtures {
             memory_type: "fact".to_string(),
             tags: vec![token.clone(), appeal.clone()],
             created_at: at(PLANTED_GOLD_PER_GROUP),
+            episode: None,
         });
         let helper = format!("plant-{g:04}-h");
         corpus.push(CorpusItem {
@@ -423,6 +426,7 @@ pub fn generate_planted_fixtures(groups: usize) -> PlantedFixtures {
             memory_type: "fact".to_string(),
             tags: vec![appeal.clone()],
             created_at: at(PLANTED_GOLD_PER_GROUP + 1),
+            episode: None,
         });
         queries.push(format!("What was filed regarding the {token} initiative?"));
         attack_queries.push(format!("What happened with the {appeal} appeal?"));

@@ -55,6 +55,10 @@ enum Suite {
     /// Who did what to whom: 240 questions over 60 pairs of role-swapped twin
     /// memories with identical words. Chance is 50% p@1. Diagnostic, not gated.
     Directional,
+    /// Agent sessions shaped the way the Claude Code hook writes them: tasks, errors, fixes
+    /// and decisions threaded by episode, among unthreaded project notes. Measures recall
+    /// off dialogue, where adjacency is an episode chain. Not gated.
+    AgentEpisodes,
 }
 
 impl Suite {
@@ -65,6 +69,7 @@ impl Suite {
             Suite::LocomoHoldout => "locomo-holdout",
             Suite::LocomoGate => "locomo-gate",
             Suite::Directional => "directional",
+            Suite::AgentEpisodes => "agent-episodes",
         }
     }
 
@@ -89,6 +94,10 @@ impl Suite {
             Suite::Directional => Some((
                 fx::manifest_path(fx::DIRECTIONAL_CORPUS_PATH),
                 fx::manifest_path(fx::DIRECTIONAL_CASES_PATH),
+            )),
+            Suite::AgentEpisodes => Some((
+                fx::manifest_path(fx::AGENT_EPISODES_CORPUS_PATH),
+                fx::manifest_path(fx::AGENT_EPISODES_CASES_PATH),
             )),
         }
     }
