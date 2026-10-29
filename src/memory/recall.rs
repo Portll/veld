@@ -2376,7 +2376,9 @@ impl super::MemorySystem {
                             // not at all, so it counts in full.
                             let identifiers =
                                 matched.iter().filter(|qs| is_structured_token(qs)).count();
-                            let word_weight: f32 = matched
+                            // Summed in a fixed order: `matched` follows the stem set's hash
+                            // order, and an f32 sum in another order differs in its last bits.
+                            let mut word_weights: Vec<f32> = matched
                                 .iter()
                                 .filter(|qs| !is_structured_token(qs))
                                 .map(|qs| {
@@ -2385,7 +2387,9 @@ impl super::MemorySystem {
                                         matching_candidates[*qs],
                                     )
                                 })
-                                .sum();
+                                .collect();
+                            word_weights.sort_by(f32::total_cmp);
+                            let word_weight: f32 = word_weights.iter().sum();
                             if entity_overlap_on {
                                 if let Some(score) = fused.get_mut(id) {
                                     *score *= 1.0
