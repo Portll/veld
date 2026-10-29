@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-LoCoMo end-to-end QA accuracy (J, LLM-judged) for veld.
+LoCoMo end-to-end QA accuracy (J, LLM-judged) for veld, and for mem0 OSS on the same protocol.
 
-Protocol:
+Protocol (--system veld, the default):
   1. Dataset: snap-research LoCoMo locomo10.json, cached in ~/.cache/veld-bench/; its sha256 is
      recorded in the results.
   2. Server: a scratch `veld server` spawned from --binary on a free port, with a fresh temporary
@@ -20,20 +20,48 @@ Protocol:
   4. Retrieval: POST /api/recall {user_id, query, limit: k} once per question; context lines are
      "[<created_at date>] <content>". --eval-now pins the server's scoring clock (VELD_EVAL_NOW);
      unset, recency is scored against the wall clock.
-  5. Reader: Mem0's ANSWER_PROMPT. Judge: Mem0's ACCURACY_PROMPT (J). --runs repeats reader +
+  5. Context: each question's retrieved lines are counted in tokens (tiktoken o200k_base, the
+     same count for every system). --context-budget N keeps the longest prefix of the ranked
+     lines that fits N tokens, so systems can be compared at one budget; unset, all k are kept.
+     Evidence hit@k is measured on the lines the reader sees.
+  6. Reader: Mem0's ANSWER_PROMPT. Judge: Mem0's ACCURACY_PROMPT (J). --runs repeats reader +
      judge over the same retrieved contexts. J is the share of judged answers labelled CORRECT;
-     mean and sample sd are over runs; a judge reply without a CORRECT/WRONG label is an error
-     row, left unjudged, never counted WRONG.
+     mean and sample sd are over runs, and a 95% Wilson interval is over questions (the mean J
+     over runs and the mean judged count per run). A judge reply without a CORRECT/WRONG label is
+     an error row, left unjudged, never counted WRONG.
      - --provider anthropic (default): claude-opus-5-5 for both (reader effort medium, judge
        effort low, thinking always on, server-side refusal fallbacks on).
      - --provider openai-compatible: chat.completions at --base-url with --model (or
        --reader-model / --judge-model), temperature 0, the prompt as the only user message; the
        judge runs in JSON mode. The answer is message.content alone; reasoning is never read.
        Known Groq models carry default reasoning efforts (MODEL_DEFAULTS) and list prices.
+     - --provider lmstudio: the same against an LM Studio host (spine reaches the M4 through its
+       ssh tunnel). LM Studio refuses JSON mode, so the judge gets the label as a json_schema;
+       reasoning effort defaults to none for both, since structured output comes back empty with
+       reasoning on; tokens cost nothing.
+  7. Errors: a failed (question, run) is sent again, up to --attempts times in all, unless the
+     error is fatal (bad key or request, a spent quota that will not refill within the wait cap),
+     truncation or refusal, which repeat at temperature 0. A daily-quota 429 that names a wait
+     under the cap is waited out, not fatal. Whatever is still unjudged is counted by reason; the
+     results carry status "incomplete" and the process exits 3. An incomplete run is not a
+     result: rerun with --resume.
+
+--system mem0: the same dataset, questions, reader, judge, runs and resume, with mem0 OSS (PyPI
+mem0ai, version recorded) as the memory: one mem0 user per conversation, every turn ingested
+through mem0's own LLM extraction at the session's real time, the extraction LLM and embedder on
+the reader's host. See benchmarks/locomo_qa_mem0.py for the ingest and retrieval details. Needs
+--provider lmstudio or openai-compatible, and mem0's own venv.
 
 Categories (LoCoMo code -> name, the mapping benchmarks/locomo_to_harness.py in shodh-memory used
 to build tests/recall/locomo_cases.jsonl): 1 multi_hop, 2 temporal, 3 open_domain, 4 single_hop,
-5 adversarial. Adversarial questions are excluded, as Mem0 does.
+5 adversarial. Adversarial questions are excluded, as Mem0 does, leaving 1,540.
+
+Question count: the retrieval harness (tests/recall/locomo_cases.jsonl) has 1,531 cases. It keeps
+a question only when an evidence id names a turn exactly, which drops 9: four with no evidence
+(conv-26_q30, conv-26_q46, conv-50_q39, conv-50_q42), four with several ids in one string
+(conv-26_q37 "D8:6; D9:17", conv-49_q31, conv-49_q38, conv-49_q46) and one zero-padded id
+(conv-50_q69 "D30:05"). This harness judges all 1,540, reads the packed and padded ids as the
+turns they name, marks each row in_retrieval_set, and reports J on those rows too.
 
 Comparability: published LoCoMo J figures (Mem0 and the systems its paper compares) use
 gpt-4o-mini as reader and judge. Any other reader or judge makes these numbers incomparable with
@@ -41,11 +69,16 @@ them; compare runs of this harness made with the same models and settings.
 
 Setup (once):
     /opt/homebrew/bin/python3.13 -m venv ~/.venvs/veld-bench
-    ~/.venvs/veld-bench/bin/pip install -r benchmarks/requirements-longmemeval.txt
+    ~/.venvs/veld-bench/bin/pip install -r benchmarks/requirements-longmemeval.txt tiktoken
+    # mem0 2.x, and the last 1.x, each in its own venv:
+    /opt/homebrew/bin/python3.13 -m venv ~/.venvs/veld-bench-mem0
+    ~/.venvs/veld-bench-mem0/bin/pip install -r benchmarks/requirements-locomo-qa-mem0.txt
+    /opt/homebrew/bin/python3.13 -m venv ~/.venvs/veld-bench-mem0-v1
+    ~/.venvs/veld-bench-mem0-v1/bin/pip install -r benchmarks/requirements-locomo-qa-mem0-v1.txt
 Credentials: anthropic.Anthropic() reads ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or an
-`ant auth login` profile. openai-compatible: --api-key-keychain NAME reads the macOS keychain
-item NAME at run time, --api-key-env NAME an environment variable; neither, and the SDK reads
-OPENAI_API_KEY.
+`ant auth login` profile. openai-compatible and lmstudio: --api-key-keychain NAME reads the macOS
+keychain item NAME at run time, --api-key-env NAME an environment variable; neither, and the SDK
+reads OPENAI_API_KEY.
 
 Usage (from the repository root):
     # Dry run: spawn, ingest, retrieve, print assembled prompts and a token/cost projection.
@@ -69,6 +102,14 @@ Usage (from the repository root):
         --copy-env VELD_DIALS_DISABLE_SIGNALS --eval-now auto \\
         --output ~/.cache/veld-bench/results/locomo_qa_full_gpt-oss-120b.json
 
+    # The M4 through spine's tunnel, mem0 2.x against the same reader and judge, 1,000-token
+    # contexts. Spine's locomo-qa lane job runs these (spine bin/eval-act.mjs).
+    ~/.venvs/veld-bench-mem0/bin/python benchmarks/locomo_qa_eval.py --system mem0 \\
+        --conversations conv-26 --runs 1 --provider lmstudio \\
+        --base-url http://127.0.0.1:11234/v1 --model qwen/qwen3.8-27b \\
+        --api-key-keychain LMSTUDIO_M4PRO_API_KEY --top-k 20 --context-budget 1000 \\
+        --output ~/.cache/veld-bench/results/locomo_qa_mem0_conv-26.json
+
     # After a crash or Ctrl-C: the same command plus --resume. Stored retrievals are reused and
     # only unjudged (question, run) pairs are sent again.
 
@@ -81,6 +122,7 @@ import atexit
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -136,7 +178,20 @@ MODEL_DEFAULTS = {
 PRICE_SOURCE = {
     "anthropic": "Anthropic list price for claude-opus-5-5",
     "openai-compatible": "https://console.groq.com/docs/models (read 2026-10-22)",
+    "lmstudio": "a local LM Studio host: no per-token charge",
 }
+LMSTUDIO_DEFAULTS = {"price": {"input_tokens": 0.0, "output_tokens": 0.0},
+                     "reader_effort": "none", "judge_effort": "none", "reasoning_format": None}
+DEFAULT_ATTEMPTS = 3
+RETRY_PAUSE_S = 20
+EXIT_INCOMPLETE = 3
+# An error that would recur on a resend at temperature 0, or that every later call would hit.
+NOT_RETRIED = re.compile(r"^(length|max_tokens|refusal)\b")
+QUOTA_WAIT = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?")
+
+TOKENIZER = "o200k_base"
+TOKEN_CACHE_DIR = Path.home() / ".cache" / "veld-bench" / "tiktoken"
+WILSON_Z = 1.959964
 TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "reasoning_tokens",
               "cached_input_tokens")
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -248,6 +303,7 @@ JUDGE_SCHEMA = {
 }
 
 SESSION_KEY = re.compile(r"^session_(\d+)$")
+EVIDENCE_ID = re.compile(r"\bD(\d+):0*(\d+)\b")
 DATETIME_FORMATS = ("%I:%M %p on %d %B, %Y", "%I:%M %p on %d %B %Y")
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
@@ -322,12 +378,34 @@ def session_batches(conv: dict) -> list[tuple[int, list[tuple[str, dict]]]]:
     return batches
 
 
+def evidence_ids(raw: list) -> list[str]:
+    """The turn ids a question's evidence names, in order: LoCoMo packs several into one string
+    for a few questions ("D8:6; D9:17") and zero-pads one ("D30:05")."""
+    ids = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        for session, turn in EVIDENCE_ID.findall(item):
+            dia_id = f"D{session}:{turn}"
+            if dia_id not in ids:
+                ids.append(dia_id)
+    return ids
+
+
+def in_retrieval_set(raw: list, turn_ids: set) -> bool:
+    """Whether tests/recall/locomo_cases.jsonl holds the question: an evidence entry names a turn
+    exactly."""
+    return any(isinstance(item, str) and item in turn_ids for item in raw)
+
+
 def conversation_questions(conv: dict) -> list[dict]:
+    turn_ids = {turn["dia_id"] for _, turns, _ in conversation_sessions(conv) for turn in turns}
     questions = []
     for index, qa in enumerate(conv["qa"]):
         code = qa.get("category")
         if code in EXCLUDED_CATEGORIES:
             continue
+        raw = qa.get("evidence") or []
         questions.append({
             "qid": f"{conv['sample_id']}_q{index}",
             "conversation": conv["sample_id"],
@@ -336,7 +414,9 @@ def conversation_questions(conv: dict) -> list[dict]:
             "category": CATEGORY[code],
             "question": qa["question"],
             "gold": str(qa["answer"]),
-            "evidence": [e for e in qa.get("evidence") or [] if isinstance(e, str)],
+            "evidence": evidence_ids(raw),
+            "evidence_raw": [e for e in raw if isinstance(e, str)],
+            "in_retrieval_set": in_retrieval_set(raw, turn_ids),
         })
     return questions
 
@@ -610,24 +690,76 @@ def retrieve(client: VeldClient, question: dict, k: int, memory_turns: dict) -> 
             "score": m.get("score"),
             "content": content,
         })
-    retrieved_dia = {d for item in retrieved for d in item["dia_ids"]}
+
+
+
     return {
         "retrieved": retrieved,
         "retrieved_ids": [item["id"] for item in retrieved],
-        "evidence_hit": bool(retrieved_dia & set(question["evidence"]))
-        if question["evidence"] else None,
         "recall_ms": round(recall_ms, 2),
     }
+
+
+def context_line(item: dict) -> str:
+    return f"[{memory_date(item['created_at'])}] {item['content']}"
+
+
+def token_counter():
+    """One token count for every system's context: tiktoken's o200k_base. Its encoding file is
+    fetched once into TOKEN_CACHE_DIR, and tiktoken checks it against its own hash."""
+    os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(TOKEN_CACHE_DIR))
+    import tiktoken
+
+    encoding = tiktoken.get_encoding(TOKENIZER)
+    return lambda text: len(encoding.encode(text, disallowed_special=()))
+
+
+def fit_context(items: list[dict], budget: int | None, count) -> list[int]:
+    """Token counts of the longest prefix of the ranked lines that fits budget (all, when None).
+    A prefix, not the best-fitting subset: the reader sees what the system ranked first."""
+    sizes = []
+    for item in items:
+        n = count(context_line(item))
+        if budget is not None and sum(sizes) + n > budget:
+            break
+        sizes.append(n)
+    return sizes
+
+
+def settle_context(row: dict, budget: int | None, count, maps_turns: bool):
+    """The lines the reader will see, their tokens, and whether they hold an evidence turn
+    (None when the system's memories do not map to turns, or the question names none)."""
+    sizes = fit_context(row["retrieved"], budget, count)
+    row["context_n"] = len(sizes)
+    row["context_tokens"] = sum(sizes)
+    row["retrieved_tokens"] = sum(count(context_line(item)) for item in row["retrieved"])
+    shown = {d for item in row["retrieved"][:len(sizes)] for d in item["dia_ids"]}
+    row["evidence_hit"] = (bool(shown & set(row["evidence"]))
+                           if maps_turns and row["evidence"] else None)
+
+
+def visible(row: dict) -> list[dict]:
+    return row["retrieved"][:row.get("context_n", len(row["retrieved"]))]
+
+
+def wilson(p: float, n: float, z: float = WILSON_Z) -> list[float] | None:
+    """Wilson score interval for a share p over n questions; n may be a mean over runs."""
+    if not n:
+        return None
+    denominator = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denominator
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denominator
+    return [max(0.0, centre - half), min(1.0, centre + half)]
 
 
 def reader_prompt(row: dict, speakers: tuple[str, str]) -> str:
     first, second = speakers
     lines = {first: [], second: []}
-    for item in row["retrieved"]:
+    for item in visible(row):
         if item["speaker"] not in lines:
             raise ValueError(f"{row['qid']}: retrieved memory {item['id']} has speaker "
                              f"{item['speaker']!r}, not {first} or {second}")
-        lines[item["speaker"]].append(f"[{memory_date(item['created_at'])}] {item['content']}")
+        lines[item["speaker"]].append(context_line(item))
     values = {
         "speaker_1_user_id": first,
         "speaker_2_user_id": second,
@@ -643,7 +775,7 @@ def judge_prompt(row: dict, answer: str) -> str:
                                   generated_answer=answer)
 
 
-def comparability_note(llm: dict) -> str:
+def comparability_note(llm: dict, system: dict | None = None) -> str:
     reader, judge = llm["reader"], llm["judge"]
     if reader["model"] == judge["model"]:
         models = (f"{reader['model']} as both reader and judge (reader effort "
@@ -651,9 +783,17 @@ def comparability_note(llm: dict) -> str:
     else:
         models = (f"{reader['model']} as reader (effort {reader['effort']}) and "
                   f"{judge['model']} as judge (effort {judge['effort']})")
+    memory = ""
+    if system and system.get("name") == "mem0":
+        memory = (f" mem0 {system['version']} extracted facts with {system['llm_model']} "
+                  f"(reasoning {system['llm_reasoning_effort']}) and embedded with "
+                  f"{system['embedder_model']}.")
+    elif system and system.get("name") == "veld":
+        memory = f" veld embedded with {system.get('embedder') or 'its configured embedder'}."
     return (f"Not comparable with published LoCoMo J figures: this run uses {models}, while "
             "every published J figure (Mem0 and the systems its paper compares) uses gpt-4o-mini "
-            "for both. Compare only runs of this harness made with the same model settings.")
+            f"for both.{memory} Compare only runs of this harness made with the same model "
+            "settings.")
 
 
 def keychain_secret(name: str) -> str:
@@ -765,12 +905,28 @@ def retry_after_s(error) -> float | None:
     return None
 
 
-def rate_limit_terminal(error) -> str | None:
+def quota_wait_s(message: str) -> float | None:
+    """The wait a 429 body names ("Please try again in 3m18.72s"), in seconds."""
+    match = QUOTA_WAIT.search(message)
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (float(g) if g else 0.0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def rate_limit_wait_s(error) -> float | None:
     wait = retry_after_s(error)
+    return wait if wait is not None else quota_wait_s(error.message)
+
+
+def rate_limit_terminal(error) -> str | None:
+    wait = rate_limit_wait_s(error)
     if "Request too large" in error.message:
         return ("max tokens exceed a per-minute limit; lower --reader-max-tokens or "
                 "--judge-max-tokens")
-    if "per day" in error.message:
+    # Groq's daily token limits refill continuously, so a spent day usually names a wait of
+    # minutes; only an unnamed or long wait ends the run.
+    if ("per day" in error.message or "(TPD)" in error.message) and wait is None:
         return "a per-day quota is spent; rerun with --resume once it refills"
     if wait is not None and wait > RATE_LIMIT_MAX_WAIT_S:
         return f"retry-after {wait:.0f}s exceeds the {RATE_LIMIT_MAX_WAIT_S}s wait cap"
@@ -788,13 +944,20 @@ def create_completion(client, request: dict):
                 raise
             # The SDK's retries run out under contention, and it gives up on any retry-after
             # above its own ceiling of one or two minutes.
-            wait = retry_after_s(e)
-            time.sleep(wait if wait is not None else 5 * 2 ** attempt)
+            wait = rate_limit_wait_s(e)
+            time.sleep(wait + 1 if wait is not None else 5 * 2 ** attempt)
     return client.chat.completions.create(**request)
 
 
+def judge_format(provider: str) -> dict:
+    if provider == "lmstudio":
+        return {"type": "json_schema",
+                "json_schema": {"name": "judge_label", "strict": True, "schema": JUDGE_SCHEMA}}
+    return {"type": "json_object"}
+
+
 def call_openai_compatible(client, prompt: str, role: dict,
-                           json_mode: bool) -> tuple[dict, str | None]:
+                           response_format: dict | None) -> tuple[dict, str | None]:
     import openai
 
     extra = {"reasoning_effort": role["effort"], "reasoning_format": role["reasoning_format"]}
@@ -805,8 +968,9 @@ def call_openai_compatible(client, prompt: str, role: dict,
         "max_completion_tokens": role["max_tokens"],
         "extra_body": {k: v for k, v in extra.items() if v is not None},
     }
+    json_mode = response_format is not None
     if json_mode:
-        request["response_format"] = {"type": "json_object"}
+        request["response_format"] = response_format
     record = {"model": role["model"], "served_model": None, "request_id": None,
               "stop_reason": None, "fallback": False, "input_tokens": 0, "output_tokens": 0,
               "reasoning_tokens": 0, "cached_input_tokens": 0, "rate_limited": 0,
@@ -875,7 +1039,8 @@ def call_model(client, llm: dict, kind: str, prompt: str) -> tuple[dict, str | N
     if llm["provider"] == "anthropic":
         return call_claude(client, prompt, role["effort"], role["max_tokens"],
                            schema=JUDGE_SCHEMA if kind == "judge" else None, model=role["model"])
-    return call_openai_compatible(client, prompt, role, json_mode=kind == "judge")
+    return call_openai_compatible(client, prompt, role,
+                                  judge_format(llm["provider"]) if kind == "judge" else None)
 
 
 def call_cost(record: dict, prices: dict) -> float:
@@ -953,13 +1118,44 @@ def aggregate(results: dict, qids: list[str], runs: int) -> dict:
     j = {}
     for c in keys:
         values = [pr["j"][c] for pr in per_run if pr["j"][c] is not None]
+        judged = [pr["judged"][c] for pr in per_run if pr["j"][c] is not None]
+        mean = statistics.mean(values) if values else None
         j[c] = {
             "n": n[c],
-            "mean": statistics.mean(values) if values else None,
+            "mean": mean,
             "sd": statistics.stdev(values) if len(values) > 1 else (0.0 if values else None),
+            "ci95": wilson(mean, statistics.mean(judged)) if values else None,
             "per_run": [pr["j"][c] for pr in per_run],
             "judged_per_run": [pr["judged"][c] for pr in per_run],
         }
+
+    reasons = {}
+    examples = []
+    for row in rows:
+        for run in row.get("runs", [])[:runs]:
+            state = unit_state(run)
+            if state == "judged":
+                continue
+            reasons[state] = reasons.get(state, 0) + 1
+            if len(examples) < 20:
+                last = run["calls"][-1] if run["calls"] else {}
+                examples.append({"qid": row["qid"], "run": run["run"], "state": state,
+                                 "kind": last.get("kind"), "error": last.get("error")})
+    missing_runs = sum(max(0, runs - len(row.get("runs", []))) for row in rows)
+    if missing_runs:
+        reasons["not_attempted"] = reasons.get("not_attempted", 0) + missing_runs
+
+    context = [r["context_tokens"] for r in rows if r.get("context_tokens") is not None]
+    retrieved = [r["retrieved_tokens"] for r in rows if r.get("retrieved_tokens") is not None]
+    lines = [r["context_n"] for r in rows if r.get("context_n") is not None]
+    context_tokens = {
+        "tokenizer": TOKENIZER, "n": len(context),
+        "mean": statistics.mean(context) if context else None,
+        "p50": percentile(context, 0.50), "p95": percentile(context, 0.95),
+        "max": max(context) if context else None,
+        "mean_lines": statistics.mean(lines) if lines else None,
+        "mean_retrieved_tokens": statistics.mean(retrieved) if retrieved else None,
+    }
 
     evidence = {}
     for c in keys:
@@ -989,6 +1185,9 @@ def aggregate(results: dict, qids: list[str], runs: int) -> dict:
         "categories": keys,
         "j": j,
         "unjudged_per_run": [pr["unjudged"] for pr in per_run],
+        "unjudged_reasons": reasons,
+        "unjudged_examples": examples,
+        "context_tokens": context_tokens,
         "evidence_hit_at_k": evidence,
         "recall_latency_ms": {"p50": percentile(latencies, 0.50),
                               "p95": percentile(latencies, 0.95), "n": len(latencies)},
@@ -1011,24 +1210,59 @@ def price_text(prices: dict) -> str:
         for model, price in prices.items()) + " per MTok"
 
 
+def summarise(results: dict, qids: list[str], runs: int) -> dict:
+    """The aggregate, J on the retrieval harness's 1,531-question set, and the run's status."""
+    agg = aggregate(results, qids, runs)
+    subset = [q for q in qids if results["rows"][q].get("in_retrieval_set", True)]
+    excluded = [q for q in qids if not results["rows"][q].get("in_retrieval_set", True)]
+    agg["retrieval_set"] = {"questions": len(subset), "excluded": excluded,
+                            "j": aggregate(results, subset, runs)["j"].get("overall")
+                            if excluded and subset else agg["j"]["overall"]}
+    unjudged = sum(agg["unjudged_reasons"].values())
+    results["status"] = "incomplete" if unjudged else "complete"
+    results["unjudged"] = unjudged
+    return agg
+
+
+def system_line(results: dict) -> str:
+    system = results.get("system") or {"name": "veld"}
+    if system["name"] == "mem0":
+        return (f"mem0 {system['version']} ({system['llm_model']} extraction, reasoning "
+                f"{system['llm_reasoning_effort']}; {system['embedder_model']} embeddings; "
+                f"features {json.dumps(system['features'])})")
+    return f"veld {results['veld'].get('binary_version')} (repo {results['veld'].get('git')})"
+
+
 def print_summary(results: dict, agg: dict):
     cfg = results["config"]
     print("\n## LoCoMo QA accuracy (J)\n")
-    print(f"veld {results['veld'].get('binary_version')} (repo {results['veld'].get('git')}), "
-          f"top-k {cfg['top_k']}, {cfg['provider']} reader {cfg['reader_model']} "
-          f"(effort {cfg['reader_effort']}), judge {cfg['judge_model']} "
+    budget = cfg.get("context_budget")
+    print(f"{system_line(results)}, top-k {cfg['top_k']}, context budget "
+          f"{f'{budget} tokens' if budget else 'none'}, {cfg['provider']} reader "
+          f"{cfg['reader_model']} (effort {cfg['reader_effort']}), judge {cfg['judge_model']} "
           f"(effort {cfg['judge_effort']}), runs {cfg['runs']}, scoring clock "
           f"{cfg.get('eval_now') or 'live'}\n")
     print(f"> {results['comparability_note']}\n")
-    print("| Category | n | J mean | J sd | J per run | evidence hit@k |")
-    print("|---|---:|---:|---:|---|---:|")
+    print("| Category | n | J mean | 95% CI | J sd | J per run | evidence hit@k |")
+    print("|---|---:|---:|---|---:|---|---:|")
     for c in agg["categories"]:
         row = agg["j"][c]
         per_run = ", ".join(fmt(v) for v in row["per_run"])
-        print(f"| {c} | {row['n']} | {fmt(row['mean'])} | {fmt(row['sd'])} | {per_run} | "
+        ci = "-" if not row.get("ci95") else f"{row['ci95'][0]:.3f}-{row['ci95'][1]:.3f}"
+        print(f"| {c} | {row['n']} | {fmt(row['mean'])} | {ci} | {fmt(row['sd'])} | {per_run} | "
               f"{fmt(agg['evidence_hit_at_k'][c])} |")
+    subset = agg.get("retrieval_set")
+    if subset and subset["excluded"]:
+        print(f"\nOn the retrieval harness's question set ({subset['questions']} here; "
+              f"{len(subset['excluded'])} have no evidence id naming a turn: "
+              f"{', '.join(subset['excluded'])}): J {fmt((subset['j'] or {}).get('mean'))}")
+    ctx = agg["context_tokens"]
+    print(f"\nContext per question ({ctx['tokenizer']} tokens): mean {fmt(ctx['mean'], '{:.0f}')}, "
+          f"p50 {fmt(ctx['p50'], '{:.0f}')}, p95 {fmt(ctx['p95'], '{:.0f}')}, max "
+          f"{fmt(ctx['max'], '{:.0f}')}, mean lines {fmt(ctx['mean_lines'], '{:.1f}')} "
+          f"(retrieved before the budget: {fmt(ctx['mean_retrieved_tokens'], '{:.0f}')})")
     lat = agg["recall_latency_ms"]
-    print(f"\nRecall latency: p50 {fmt(lat['p50'], '{:.1f}')} ms, "
+    print(f"Recall latency: p50 {fmt(lat['p50'], '{:.1f}')} ms, "
           f"p95 {fmt(lat['p95'], '{:.1f}')} ms (n={lat['n']})")
     for kind, c in agg["calls"].items():
         print(f"{kind.capitalize()} calls: {c['calls']}, errors {c['errors']} "
@@ -1038,15 +1272,20 @@ def print_summary(results: dict, agg: dict):
     if cfg["provider"] == "anthropic":
         print(f"Judged answers written by a fallback model, not {cfg['reader_model']}: "
               f"{agg['judged_answers_served_by_fallback']}")
-    if any(agg["unjudged_per_run"]):
-        print(f"Unjudged questions per run: {agg['unjudged_per_run']} (excluded from J; "
-              "rerun with --resume to retry them)")
     t = agg["tokens"]
     print(f"Tokens: input {t['input_tokens']:,} (cached {t['cached_input_tokens']:,}), output "
           f"{t['output_tokens']:,} (reasoning {t['reasoning_tokens']:,}), cache read "
           f"{t['cache_read_input_tokens']:,}; estimated cost ${agg['estimated_cost_usd']:.2f} at "
           f"{price_text(cfg['price_per_mtok'])}"
           + (", cached input at the full input price" if t["cached_input_tokens"] else ""))
+    if agg["unjudged_reasons"]:
+        reasons = ", ".join(f"{k} {v}" for k, v in sorted(agg["unjudged_reasons"].items()))
+        print(f"\nINCOMPLETE: {sum(agg['unjudged_reasons'].values())} (question, run) pairs "
+              f"unjudged ({reasons}); J above is over judged pairs only and is not a result. "
+              "Rerun with --resume.")
+        for e in agg["unjudged_examples"][:5]:
+            print(f"  {e['qid']} run {e['run']} {e['state']} {e['kind'] or ''}: "
+                  f"{(e['error'] or 'never sent')[:160]}")
 
 
 def save_results(results: dict, path: Path):
@@ -1125,7 +1364,11 @@ def project(rows: list[dict], speakers: dict, runs: int, full_questions: int, ll
             "full_locomo_cost_usd": cost_per_question * full_questions * runs}
 
 
-def retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out_path: Path):
+def retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out_path: Path,
+                    llm: dict, count, api_key: str | None = None):
+    if args.system == "mem0":
+        return mem0_retrieval_phase(args, data_by_id, results, todo, out_path, llm, count,
+                                    api_key)
     convs = sorted({q["conversation"] for q in todo})
     server = None
     if args.no_spawn:
@@ -1168,10 +1411,13 @@ def retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out
                 print(f"    not stored: {e['dia_id']} ({e['error']})")
         embedder = client.health().get("embedder")
         results["veld"]["embedder"] = embedder
+        results["system"] = {"name": "veld", "embedder": embedder.get("model")
+                             if isinstance(embedder, dict) else embedder}
         print(f"  primary embedder after ingest: {json.dumps(embedder)}")
         for q in todo:
             row = results["rows"].setdefault(q["qid"], {**q, "runs": []})
             row.update(retrieve(client, q, args.top_k, turns_by_conv[q["conversation"]]))
+            settle_context(row, args.context_budget, count, maps_turns=True)
         print(f"Retrieved top-{args.top_k} for {len(todo)} questions.")
         for cid in convs:
             cov = client.index_coverage(user_for(cid))
@@ -1186,25 +1432,78 @@ def retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out
             print(f"  scratch server log kept at {log_copy}")
 
 
-def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Path, client,
-              llm: dict):
+def mem0_retrieval_phase(args, data_by_id: dict, results: dict, todo: list[dict], out_path: Path,
+                         llm: dict, count, api_key: str | None, system=None):
+    if system is None:
+        from locomo_qa_mem0 import Mem0System
+
+        system = Mem0System(
+            provider=llm["provider"], base_url=llm["base_url"], api_key=api_key,
+            llm_model=args.mem0_llm_model or llm["reader"]["model"],
+            llm_effort=None if args.mem0_llm_effort == "default" else args.mem0_llm_effort,
+            llm_max_tokens=args.mem0_llm_max_tokens, embedder_model=args.mem0_embedder_model,
+            embedding_dims=args.mem0_embedding_dims, batch_turns=args.mem0_batch_turns)
+    stored = results.get("system") or {}
+    described = system.describe()
+    if stored.get("version") not in (None, described["version"]):
+        raise SystemExit(f"{out_path} retrieved with mem0 {stored['version']}; this venv has "
+                         f"{described['version']}")
+    results["system"] = described
+    print(f"mem0 {described['version']}: extraction {described['llm_model']} (reasoning "
+          f"{described['llm_reasoning_effort']}), embedder {described['embedder_model']} at "
+          f"{described['base_url']}, features {json.dumps(described['features'])}")
+    try:
+        for cid in sorted({q["conversation"] for q in todo}):
+            conv = data_by_id[cid]
+            c = conv["conversation"]
+            speakers = (c["speaker_a"], c["speaker_b"])
+            user_id = user_for(cid)
+            stats = system.ingest(user_id, conversation_sessions(conv), turn_content)
+            results["ingest"][cid] = stats
+            calls = stats["calls"]["llm"]
+            print(f"  {cid}: {stats['turns']} turns in {stats['sessions']} sessions, "
+                  f"{stats['adds']} adds -> {stats['stored_memories']} memories "
+                  f"({stats['ingest_s']}s); extraction calls {calls['calls']}, errors "
+                  f"{calls['errors']}, truncated {calls['truncated']}, unparseable "
+                  f"{calls['unparseable']}, empty {calls['empty']}, nothing extracted "
+                  f"{calls['nothing_extracted']}")
+            if calls["truncated"] or calls["unparseable"] or calls["empty"]:
+                print(f"    mem0 dropped the facts of {calls['truncated'] + calls['unparseable']}"
+                      f" + {calls['empty']} extraction replies; raise --mem0-llm-max-tokens if "
+                      "they were truncated", file=sys.stderr)
+            unattributed = 0
+            mine = [q for q in todo if q["conversation"] == cid]
+            for q in mine:
+                row = results["rows"].setdefault(q["qid"], {**q, "runs": []})
+                row.update(system.search(user_id, q["question"], args.top_k, speakers))
+                unattributed += row["unattributed"]
+                settle_context(row, args.context_budget, count, maps_turns=False)
+            stats["unattributed_memories"] = unattributed
+            print(f"  {cid}: retrieved top-{args.top_k} for {len(mine)} questions; "
+                  f"{unattributed} retrieved facts named neither speaker")
+            save_results(results, out_path)
+    finally:
+        system.close()
+
+
+def unit_state(run: dict) -> str:
+    """judged, not_attempted (a fatal error stopped the run first), fatal, persistent (would
+    recur on a resend: truncation, refusal) or retryable."""
+    if run["label"] is not None:
+        return "judged"
+    if not run["calls"]:
+        return "not_attempted"
+    last = run["calls"][-1]
+    if last.get("fatal"):
+        return "fatal"
+    if NOT_RETRIED.match(last.get("error") or ""):
+        return "persistent"
+    return "retryable"
+
+
+def run_round(args, results: dict, qids: list[str], speakers: dict, out_path: Path, client,
+              llm: dict, units: list, abort: threading.Event) -> int:
     rows = results["rows"]
-    units = []
-    for qid in qids:
-        row = rows[qid]
-        while len(row["runs"]) < args.runs:
-            row["runs"].append({"run": len(row["runs"]), "answer": None, "label": None,
-                                "calls": []})
-        units.extend((qid, r) for r in range(args.runs) if row["runs"][r]["label"] is None)
-    if not units:
-        print("Every (question, run) pair is already judged.")
-        return
-    print(f"Running reader + judge for {len(units)} (question, run) pairs: reader "
-          f"{llm['reader']['model']}, judge {llm['judge']['model']}, concurrency "
-          f"{args.concurrency}")
-    abort = threading.Event()
-    started_at = datetime.now(timezone.utc).isoformat()
-    started = time.perf_counter()
     pool = ThreadPoolExecutor(max_workers=args.concurrency)
     futures = {}
     done = 0
@@ -1245,11 +1544,50 @@ def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Pa
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+    return done
+
+
+def api_phase(args, results: dict, qids: list[str], speakers: dict, out_path: Path, client,
+              llm: dict, pause=time.sleep):
+    rows = results["rows"]
+    units = []
+    for qid in qids:
+        row = rows[qid]
+        while len(row["runs"]) < args.runs:
+            row["runs"].append({"run": len(row["runs"]), "answer": None, "label": None,
+                                "calls": []})
+        units.extend((qid, r) for r in range(args.runs) if row["runs"][r]["label"] is None)
+    if not units:
+        print("Every (question, run) pair is already judged.")
+        return
+    print(f"Running reader + judge for {len(units)} (question, run) pairs: reader "
+          f"{llm['reader']['model']}, judge {llm['judge']['model']}, concurrency "
+          f"{args.concurrency}, up to {args.attempts} attempts each")
+    abort = threading.Event()
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
+    done = 0
+    rounds = 0
+    pending = units
+    try:
+        while pending and rounds < args.attempts and not abort.is_set():
+            if rounds:
+                wait = RETRY_PAUSE_S * rounds
+                print(f"Attempt {rounds + 1} of {args.attempts}: {len(pending)} (question, run) "
+                      f"pairs failed with a retryable error; sending them again in {wait}s")
+                pause(wait)
+            done += run_round(args, results, qids, speakers, out_path, client, llm, pending,
+                              abort)
+            rounds += 1
+            pending = [(qid, r) for qid, r in pending
+                       if unit_state(rows[qid]["runs"][r]) == "retryable"]
+    finally:
         wall_s = round(time.perf_counter() - started, 1)
         results.setdefault("api_phase", []).append({
             "started_at": started_at, "wall_s": wall_s, "units": len(units),
-            "completed": done, "concurrency": args.concurrency})
-        print(f"API phase: {done}/{len(units)} (question, run) pairs in {wall_s}s")
+            "completed": done, "rounds": rounds, "concurrency": args.concurrency})
+        print(f"API phase: {done} sends over {rounds} round(s) for {len(units)} (question, run) "
+              f"pairs in {wall_s}s")
         save_results(results, out_path)
 
 
@@ -1262,14 +1600,22 @@ def default_output(dry_run: bool) -> Path:
 def build_llm(args) -> dict:
     anthropic = args.provider == "anthropic"
     if not anthropic and not (args.model or (args.reader_model and args.judge_model)):
-        raise SystemExit("--provider openai-compatible needs --model, or both --reader-model "
+        raise SystemExit(f"--provider {args.provider} needs --model, or both --reader-model "
                          "and --judge-model")
+    if args.provider == "lmstudio" and not args.base_url:
+        raise SystemExit("--provider lmstudio needs --base-url, e.g. spine's tunnel "
+                         "http://127.0.0.1:11234/v1")
     llm = {"provider": args.provider, "base_url": args.base_url, "prices": {}}
     for kind, model, effort, max_tokens in (
             ("reader", args.reader_model, args.reader_effort, args.reader_max_tokens),
             ("judge", args.judge_model, args.judge_effort, args.judge_max_tokens)):
         model = model or args.model or MODEL
-        known = {} if anthropic else MODEL_DEFAULTS.get(model, {})
+        if anthropic:
+            known = {}
+        elif args.provider == "lmstudio":
+            known = LMSTUDIO_DEFAULTS
+        else:
+            known = MODEL_DEFAULTS.get(model, {})
         if anthropic:
             default_effort = READER_EFFORT if kind == "reader" else JUDGE_EFFORT
         else:
@@ -1302,7 +1648,7 @@ def llm_config(llm: dict, price_overridden: bool) -> dict:
     if llm["provider"] == "anthropic":
         config["fallbacks"] = f"default ({FALLBACK_BETA})"
     else:
-        config.update(temperature=0, judge_response_format="json_object",
+        config.update(temperature=0, judge_response_format=judge_format(llm["provider"])["type"],
                       reader_reasoning_format=llm["reader"]["reasoning_format"],
                       judge_reasoning_format=llm["judge"]["reasoning_format"],
                       max_retries=OPENAI_MAX_RETRIES)
@@ -1335,18 +1681,27 @@ def resolve_eval_now(raw: str | None, convs: list[dict]) -> str | None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LoCoMo end-to-end QA accuracy (J) for veld")
+    ap = argparse.ArgumentParser(description="LoCoMo end-to-end QA accuracy (J) for veld and mem0")
+    ap.add_argument("--system", default="veld", choices=["veld", "mem0"],
+                    help="Memory system under test (mem0 runs from its own venv)")
+    ap.add_argument("--label", default=None,
+                    help="Free text recorded with the results, e.g. before or after a fix")
     ap.add_argument("--conversations", default=None,
                     help="Comma-separated sample ids, e.g. conv-26,conv-30 (default: all 10)")
     ap.add_argument("--limit-questions", type=int, default=0,
                     help="First N non-adversarial questions per conversation (0 = all)")
     ap.add_argument("--top-k", type=int, default=10, help="Memories recalled per question")
+    ap.add_argument("--context-budget", type=int, default=None, metavar="TOKENS",
+                    help=f"Keep the ranked prefix of the retrieved lines that fits this many "
+                         f"{TOKENIZER} tokens (default: keep all top-k)")
     ap.add_argument("--runs", type=int, default=3,
                     help="Reader + judge repetitions over the same retrieved contexts")
     ap.add_argument("--concurrency", type=int, default=8, help="Parallel API calls")
+    ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS,
+                    help="Sends per (question, run) before a retryable error is left unjudged")
     ap.add_argument("--dry-run", action="store_true",
                     help="Spawn, ingest, retrieve and print the assembled prompts and a cost "
-                         "projection; no API calls")
+                         "projection; no reader or judge calls (mem0 ingest still calls its LLM)")
     ap.add_argument("--show-prompts", type=int, default=2,
                     help="Dry run: questions whose prompts are printed")
     ap.add_argument("--output", default=None,
@@ -1372,8 +1727,9 @@ def main():
                     help="Pin the scratch server's scoring clock (VELD_EVAL_NOW); auto is one "
                          "day after the latest session of the selected conversations (default: "
                          "unset, the live clock)")
-    ap.add_argument("--provider", default="anthropic", choices=["anthropic", "openai-compatible"],
-                    help="Reader and judge API")
+    ap.add_argument("--provider", default="anthropic",
+                    choices=["anthropic", "openai-compatible", "lmstudio"],
+                    help="Reader and judge API (and, for mem0, its extraction LLM and embedder)")
     ap.add_argument("--base-url", default=None,
                     help="API base URL, e.g. https://api.groq.com/openai/v1")
     ap.add_argument("--model", default=None,
@@ -1395,11 +1751,28 @@ def main():
                     help="USD per MTok of input, for every model (default: list price)")
     ap.add_argument("--price-out", type=float, default=None,
                     help="USD per MTok of output, for every model (default: list price)")
+    mem0 = ap.add_argument_group("--system mem0")
+    mem0.add_argument("--mem0-llm-model", default=None,
+                      help="mem0's extraction LLM on the reader's host (default: the reader)")
+    mem0.add_argument("--mem0-llm-effort", default="none",
+                      help="reasoning_effort sent with every mem0 LLM call; 'default' sends none")
+    mem0.add_argument("--mem0-llm-max-tokens", type=int, default=6000)
+    mem0.add_argument("--mem0-embedder-model", default="text-embedding-nomic-embed-text-v1.5",
+                      help="mem0's embedder on the reader's host (default: nomic-embed-text "
+                           "v1.5, the model veld embeds with on this machine)")
+    mem0.add_argument("--mem0-embedding-dims", type=int, default=768)
+    mem0.add_argument("--mem0-batch-turns", type=int, default=0,
+                      help="Turns per mem0 add() within a session (0 = the whole session)")
     args = ap.parse_args()
     llm = build_llm(args)
     if args.eval_now and args.no_spawn:
         raise SystemExit("--eval-now sets the spawned server's clock; with --no-spawn, start "
                          "that server with VELD_EVAL_NOW instead")
+    if args.system == "mem0" and args.provider == "anthropic":
+        raise SystemExit("--system mem0 points mem0's extraction LLM and embedder at the "
+                         "reader's host; use --provider lmstudio or openai-compatible")
+    if args.attempts < 1:
+        raise SystemExit("--attempts must be at least 1")
 
     sys.stdout.reconfigure(line_buffering=True)
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -1416,11 +1789,13 @@ def main():
     for cid in wanted:
         qs = conversation_questions(data_by_id[cid])
         questions.extend(qs[:args.limit_questions] if args.limit_questions > 0 else qs)
-    full_questions = sum(len(conversation_questions(conv)) for conv in data)
+    every = [q for conv in data for q in conversation_questions(conv)]
+    full_questions = len(every)
     speakers = {cid: (data_by_id[cid]["conversation"]["speaker_a"],
                       data_by_id[cid]["conversation"]["speaker_b"]) for cid in data_by_id}
     print(f"LoCoMo {dataset_path} sha256 {dataset_sha}: {len(questions)} questions selected "
-          f"from {len(wanted)} conversations ({full_questions} non-adversarial in the dataset)")
+          f"from {len(wanted)} conversations ({full_questions} non-adversarial in the dataset, "
+          f"{sum(q['in_retrieval_set'] for q in every)} of them in the retrieval harness's set)")
     eval_now = resolve_eval_now(args.eval_now, [data_by_id[c] for c in wanted])
 
     out_path = Path(args.output).expanduser() if args.output else default_output(args.dry_run)
@@ -1430,36 +1805,47 @@ def main():
     if args.resume and out_path.exists():
         with open(out_path, encoding="utf-8") as f:
             results = json.load(f)
+        cfg = results["config"]
         if results["dataset"]["sha256"] != dataset_sha:
             raise SystemExit(f"{out_path} was made from a different locomo10.json")
-        if results["config"]["top_k"] != args.top_k:
-            raise SystemExit(f"{out_path} retrieved top-{results['config']['top_k']}; "
-                             f"rerun with --top-k {results['config']['top_k']}")
-        stored = stored_llm_identity(results["config"])
+        if cfg["top_k"] != args.top_k:
+            raise SystemExit(f"{out_path} retrieved top-{cfg['top_k']}; "
+                             f"rerun with --top-k {cfg['top_k']}")
+        if cfg.get("system", "veld") != args.system:
+            raise SystemExit(f"{out_path} measured --system {cfg.get('system', 'veld')}")
+        if cfg.get("context_budget") != args.context_budget:
+            raise SystemExit(f"{out_path} kept a context budget of {cfg.get('context_budget')}; "
+                             f"rerun with --context-budget {cfg.get('context_budget')}")
+        stored = stored_llm_identity(cfg)
         current = stored_llm_identity(llm_config(llm, False))
         if stored != current:
             raise SystemExit(f"{out_path} was judged with {dict(zip(LLM_IDENTITY, stored))}; "
                              f"this command asks for {dict(zip(LLM_IDENTITY, current))}")
-        if results["config"].get("eval_now") != eval_now:
-            raise SystemExit(f"{out_path} retrieved with --eval-now "
-                             f"{results['config'].get('eval_now')}; this command resolves to "
-                             f"{eval_now}")
-        results["config"]["runs"] = max(results["config"]["runs"], args.runs)
+        if cfg.get("eval_now") != eval_now:
+            raise SystemExit(f"{out_path} retrieved with --eval-now {cfg.get('eval_now')}; this "
+                             f"command resolves to {eval_now}")
+        cfg["runs"] = max(cfg["runs"], args.runs)
         results["dry_run"] = results.get("dry_run", False) and args.dry_run
+        results.setdefault("system", {"name": "veld"})
         print(f"Resuming {out_path}")
     else:
         results = {
             "benchmark": "LoCoMo end-to-end QA accuracy (J)",
+            "label": args.label,
             "comparability_note": comparability_note(llm),
             "dataset": {"url": DATASET_URL, "path": str(dataset_path), "sha256": dataset_sha},
             "config": {
-                "top_k": args.top_k,
-                "recall_mode": "hybrid (server default)", "runs": args.runs,
+                "system": args.system, "top_k": args.top_k,
+                "context_budget": args.context_budget, "tokenizer": TOKENIZER,
+                "recall_mode": ("hybrid (server default)" if args.system == "veld"
+                                else "Memory.search (mem0 default)"),
+                "runs": args.runs,
                 "categories": {str(k): v for k, v in CATEGORY.items()},
                 "excluded_categories": sorted(EXCLUDED_CATEGORIES),
                 "answer_prompt": ANSWER_PROMPT_SOURCE, "judge_prompt": ACCURACY_PROMPT_SOURCE,
                 "session_timezone": "UTC",
             },
+            "system": {"name": args.system},
             "veld": {"git": git_describe()},
             "ingest": {},
             "rows": {},
@@ -1467,18 +1853,32 @@ def main():
         }
     results["config"].update(llm_config(llm, args.price_in is not None
                                         or args.price_out is not None))
-    results["config"].update(eval_now=eval_now, eval_now_arg=args.eval_now)
-    results["config"]["conversations"] = wanted
-    results["config"]["limit_questions"] = args.limit_questions
-    client = None if args.dry_run else make_client(llm, llm_api_key(args))
+    results["config"].update(eval_now=eval_now, eval_now_arg=args.eval_now,
+                             attempts=args.attempts, conversations=wanted,
+                             limit_questions=args.limit_questions)
+    if args.label is not None:
+        results["label"] = args.label
+    needs_key = not args.dry_run or args.system == "mem0"
+    api_key = llm_api_key(args) if needs_key else None
+    client = None if args.dry_run else make_client(llm, api_key)
     qids = [q["qid"] for q in questions]
+    count = token_counter()
+
+    for q in questions:
+        row = results["rows"].get(q["qid"])
+        if row is None:
+            continue
+        row.update({k: q[k] for k in ("evidence", "evidence_raw", "in_retrieval_set")})
+        if row.get("retrieved") is not None and "context_n" not in row:
+            settle_context(row, args.context_budget, count, maps_turns=args.system == "veld")
 
     todo = [q for q in questions if results["rows"].get(q["qid"], {}).get("retrieved") is None]
     if todo:
-        retrieval_phase(args, data_by_id, results, todo, out_path)
+        retrieval_phase(args, data_by_id, results, todo, out_path, llm, count, api_key)
         save_results(results, out_path)
     else:
         print("All selected questions already carry their retrieval; no server needed.")
+    results["comparability_note"] = comparability_note(llm, results.get("system"))
 
     if args.dry_run:
         rows = [results["rows"][q] for q in qids]
@@ -1493,10 +1893,12 @@ def main():
         return
 
     api_phase(args, results, qids, speakers, out_path, client, llm)
-    results["aggregate"] = aggregate(results, qids, results["config"]["runs"])
+    results["aggregate"] = summarise(results, qids, results["config"]["runs"])
     save_results(results, out_path)
     print_summary(results, results["aggregate"])
     print(f"\nResults: {out_path}")
+    if results["status"] != "complete":
+        sys.exit(EXIT_INCOMPLETE)
 
 
 if __name__ == "__main__":
