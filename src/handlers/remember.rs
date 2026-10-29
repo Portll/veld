@@ -1302,8 +1302,13 @@ pub async fn remember(
         .await
         .map_err(AppError::Internal)?;
 
+    // Store and journal in one blocking task: a blocking task runs to completion even when
+    // the request is dropped, so a client that gives up mid-write cannot leave a stored
+    // memory without its frame (followers would never see it).
     let store_start = std::time::Instant::now();
-    let outcome = {
+    let (outcome, stored_in) = {
+        let state = state.clone();
+        let user_id = req.user_id.clone();
         let memory = memory.clone();
         let exp_clone = experience.clone();
         let created_at = req.created_at;
@@ -1312,30 +1317,42 @@ pub async fn remember(
         let external_id = req.external_id.clone();
 
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
             // Fast path: persist only (~10ms), embedding deferred to background.
-            // BM25 indexing comes from the Remember journaled below.
-            if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent_deferred_detailed_journaled(
-                    exp_clone,
-                    created_at,
-                    agent_id,
-                    run_id,
-                    external_id,
-                )
-            } else {
-                memory_guard.remember_deferred_detailed_journaled(
-                    exp_clone,
-                    created_at,
-                    external_id,
-                )
-            }
+            // BM25 indexing comes from the Remember journaled in this task.
+            let outcome = {
+                let memory_guard = memory.read();
+                if agent_id.is_some() || run_id.is_some() {
+                    memory_guard.remember_with_agent_deferred_detailed_journaled(
+                        exp_clone,
+                        created_at,
+                        agent_id,
+                        run_id,
+                        external_id,
+                    )?
+                } else {
+                    memory_guard.remember_deferred_detailed_journaled(
+                        exp_clone,
+                        created_at,
+                        external_id,
+                    )?
+                }
+            };
+            let stored_in = store_start.elapsed();
+            journal_stored(
+                &state,
+                &memory,
+                &user_id,
+                std::slice::from_ref(&outcome.id),
+                SnapshotKind::Remember,
+            );
+            anyhow::Ok((outcome, stored_in))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         .map_err(AppError::Internal)?
     };
-    stage_timer.record("store", store_start);
+    stage_timer.record_elapsed("store", stored_in);
+    stage_timer.record("journal", store_start + stored_in);
     let memory_id = outcome.id.clone();
     // A merge that added entities left the episode built from the old set, and every
     // downstream pass runs on the merged experience, not the request's.
@@ -1351,82 +1368,6 @@ pub async fn remember(
     )
     .await;
     stage_timer.record("tag_sources", tag_sources_start);
-
-    // W5: journal the write to the intent log + SQLite projection.
-    //
-    // RocksDB is the source of truth and has already been written above.
-    // The journal is a *derived* record so the SQLite slow store (and
-    // future projections — Vamana, BM25, Postgres) can stay in sync via
-    // replay. The spawn_blocking is AWAITED before responding — a
-    // detached task left a crash window as wide as the task queue (memory
-    // durable in RocksDB, no journal frame until C2 reconcile on next
-    // open) and made LSN order nondeterministic with respect to request
-    // completion. The journal-then-apply primitive is fast (~ one fsync +
-    // projection applies; embeddings are not present yet, so the vector
-    // applies are no-ops at this point).
-    //
-    // Per-projection apply errors are swallowed inside `journal_and_apply`
-    // — the intent log frame is durable regardless, so a future restart's
-    // replay will retry. A failure to journal at all (log I/O error,
-    // payload encode error) is logged at warn level and does NOT fail
-    // the request: RocksDB already holds the canonical write and the
-    // operator can replay manually once the underlying issue is fixed.
-    {
-        let journal_start = std::time::Instant::now();
-        let state = state.clone();
-        let user_id = req.user_id.clone();
-        let memory_for_journal = memory.clone();
-        let mid = memory_id.clone();
-        let journal_join = tokio::task::spawn_blocking(move || {
-            let bincode = {
-                let guard = memory_for_journal.read();
-                match guard.get_memory(&mid) {
-                    Ok(mem) => {
-                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(
-                                    memory_id = %mid.0,
-                                    error = %e,
-                                    "skipping intent-log journal: failed to bincode memory snapshot",
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            memory_id = %mid.0,
-                            error = %e,
-                            "skipping intent-log journal: memory not retrievable from primary store",
-                        );
-                        return;
-                    }
-                }
-            };
-            let payload = crate::intent_log::IntentPayload::Remember {
-                user_id: user_id.clone(),
-                memory_id: mid.0.to_string(),
-                memory_bincode: bincode,
-                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
-            };
-            if let Err(e) = state.journal_and_apply(&user_id, &payload) {
-                tracing::warn!(
-                    user_id = %user_id,
-                    memory_id = %mid.0,
-                    error = %e,
-                    "intent-log journal_and_apply failed (RocksDB write already durable; SQLite projection will catch up on next replay)",
-                );
-            }
-        });
-        if let Err(e) = journal_join.await {
-            tracing::warn!(
-                error = %e,
-                "intent-log journal task panicked (RocksDB write already durable; C2 reconcile will backfill)",
-            );
-        }
-        stage_timer.record("journal", journal_start);
-    }
 
     // Background: complete embedding + vector indexing; vector search follows
     // in ~150ms. Spawned after the journal so a write-gate Forget follows the

@@ -886,39 +886,67 @@ fn journaled_ids(h: &Harness, user: &str) -> Vec<String> {
         .collect()
 }
 
-/// A client that gives up once the memory is stored must still leave it journaled, or a
-/// follower never receives it (redb soak 9.6: 39 memories stored without a frame).
-#[tokio::test]
-async fn an_upsert_dropped_after_its_store_is_still_journaled() {
-    let h = Harness::new();
-    let user = "upsert-dropped";
-    let external_id = "ext-dropped";
+/// Send `body` to `uri`, drop the request the moment the memory carrying `external_id` is in
+/// the store, and require its intent-log frame anyway: a client that gives up once the memory
+/// is stored must still leave it journaled, or a follower never receives it (redb soak 9.6:
+/// 39 memories stored without a frame).
+async fn assert_dropped_write_is_journaled(
+    h: &Harness,
+    user: &str,
+    external_id: &str,
+    uri: &str,
+    body: serde_json::Value,
+) {
     h.mgr.get_user_memory(user).expect("open tenant");
-
-    let mut request = Box::pin(h.app().oneshot(authed_post(
-        "/api/upsert",
-        json!({"user_id": user, "external_id": external_id, "content": "The ferry left early."}),
-    )));
+    let mut request = Box::pin(h.app().oneshot(authed_post(uri, body)));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     // Checked before every poll, so the handler is polled at most once after the store
     // lands: never far enough to reach a journal step that follows it.
-    while upserted(&h, user, external_id).is_empty() {
-        assert!(std::time::Instant::now() < deadline, "upsert never stored");
+    while upserted(h, user, external_id).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "{uri} never stored");
         if futures::poll!(request.as_mut()).is_ready() {
-            panic!("upsert answered before its store was observed");
+            panic!("{uri} answered before its store was observed");
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
     drop(request);
 
-    let id = the_one(&h, user, external_id).id.0.to_string();
+    let id = the_one(h, user, external_id).id.0.to_string();
     for _ in 0..100 {
-        if journaled_ids(&h, user).contains(&id) {
+        if journaled_ids(h, user).contains(&id) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("stored memory {id} has no intent-log frame after its request was dropped");
+    panic!("{uri}: stored memory {id} has no intent-log frame after its request was dropped");
+}
+
+#[tokio::test]
+async fn an_upsert_dropped_after_its_store_is_still_journaled() {
+    let h = Harness::new();
+    let (user, external_id) = ("upsert-dropped", "ext-dropped");
+    assert_dropped_write_is_journaled(
+        &h,
+        user,
+        external_id,
+        "/api/upsert",
+        json!({"user_id": user, "external_id": external_id, "content": "The ferry left early."}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_remember_dropped_after_its_store_is_still_journaled() {
+    let h = Harness::new();
+    let (user, external_id) = ("remember-dropped", "ext-remember-dropped");
+    assert_dropped_write_is_journaled(
+        &h,
+        user,
+        external_id,
+        "/api/remember",
+        json!({"user_id": user, "external_id": external_id, "content": "The pilot boat waited."}),
+    )
+    .await;
 }
 
 /// Every memory carrying `external_id`, read from the store rather than from the response.
