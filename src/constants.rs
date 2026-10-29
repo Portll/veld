@@ -2846,7 +2846,10 @@ pub const CE_TOP_ORDER_COUNT: usize = 3;
 /// +0.001. Yet it preferred gold over that rank 1 in 60 of 135 near misses, and the second
 /// result over a correct rank 1 in 19 of 157 hits. Letting it order the top three, offline on
 /// the same run: p@1 +0.060 on the gate conversation (16 up, 4 down of 199), +0.066 on the
-/// earlier spent cases; at margin 0.2, +0.040 and +0.066.
+/// earlier spent cases; at margin 0.2, +0.040 and +0.066. On the 1,137 hold-out cases against
+/// the same tree with `ce_top_order` disabled (runs 40910643178 and 40910648322), paired: p@1
+/// +0.019 on redb (95% +0.005 to +0.033, 43 up, 21 down) and +0.019 on RocksDB (+0.004 to
+/// +0.033), MRR +0.011, recall@10 unchanged.
 pub const CE_TOP_MARGIN: f32 = 1.0;
 
 /// Minimum distinct query stems before coverage applies. With one term coverage is all or
