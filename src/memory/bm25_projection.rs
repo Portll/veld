@@ -1024,6 +1024,9 @@ mod tests {
         done()
     }
 
+    /// Copy what is on disk now, as a crash would leave it. A file Tantivy
+    /// deletes during the copy is garbage no committed meta names, so a
+    /// vanished file is skipped.
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -1031,8 +1034,12 @@ mod tests {
             let target = to.join(entry.file_name());
             if entry.file_type().unwrap().is_dir() {
                 copy_dir(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).unwrap();
+                continue;
+            }
+            match std::fs::copy(entry.path(), target) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("copy {:?}: {e}", entry.path()),
             }
         }
     }
