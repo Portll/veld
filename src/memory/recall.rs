@@ -5774,96 +5774,71 @@ impl super::MemorySystem {
             }
         }
 
-        // CACHE COHERENT IMPORTANCE UPDATES:
-        // 1. First try to find memory in caches (working, session)
-        // 2. If found in cache, modify through the cached Arc (interior mutability)
-        //    This updates ALL holders of this Arc reference
-        // 3. Then persist to storage for durability
-        // 4. If not in cache, get from storage, modify, and persist
+        // CACHE COHERENT IMPORTANCE UPDATES: the change is applied to the cached Arc, so every
+        // holder of it sees the change, and to the stored record, which is what is persisted.
+        // The cached copy can predate a store-side rewrite, such as the vector a deferred embed
+        // stored after the memory was cached, and persisting it would erase that rewrite.
         let mut persist_failures: Vec<(MemoryId, String)> = Vec::new();
+        let rewrites_importance = matches!(
+            outcome,
+            RetrievalOutcome::Helpful | RetrievalOutcome::Misleading
+        );
+        let reinforce = |memory: &Memory| {
+            memory.record_access();
+            match outcome {
+                RetrievalOutcome::Helpful => memory.boost_importance(HEBBIAN_BOOST_HELPFUL),
+                RetrievalOutcome::Misleading => memory.decay_importance(HEBBIAN_DECAY_MISLEADING),
+                // I8: Abstained/Ignored are shadow-neutral for live reinforcement
+                // (access-only); they carry their negative label to the trace store.
+                RetrievalOutcome::Neutral
+                | RetrievalOutcome::Abstained
+                | RetrievalOutcome::Ignored => {}
+            }
+        };
 
         for id in memory_ids {
-            // Try working memory cache first
-            let cached_memory = {
-                let working = self.working_memory.read();
-                working.get(id)
-            };
-
-            // Try session memory cache if not in working
-            let cached_memory = cached_memory.or_else(|| {
-                let session = self.session_memory.read();
-                session.get(id)
-            });
-
-            if let Some(memory) = cached_memory {
-                // CACHE HIT: Modify through cached Arc (updates all references)
-                memory.record_access();
-                match &outcome {
-                    RetrievalOutcome::Helpful => {
-                        memory.boost_importance(HEBBIAN_BOOST_HELPFUL);
-                        stats.importance_boosts += 1;
-                    }
-                    RetrievalOutcome::Misleading => {
-                        memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
-                        stats.importance_decays += 1;
-                    }
-                    // I8: Abstained/Ignored are shadow-neutral for live reinforcement
-                    // (access-only); they carry their negative label to the trace store.
-                    RetrievalOutcome::Neutral
-                    | RetrievalOutcome::Abstained
-                    | RetrievalOutcome::Ignored => {
-                        // Just access recorded
-                    }
+            let cached = self
+                .working_memory
+                .read()
+                .get(id)
+                .or_else(|| self.session_memory.read().get(id));
+            if let Some(cached) = &cached {
+                reinforce(cached);
+            }
+            let persisted = match self.long_term_memory.get(id) {
+                Ok(stored) => {
+                    reinforce(&stored);
+                    stored
                 }
-                // PERSIST: Write updated memory to durable storage
-                // Track failures instead of silently ignoring
-                if let Err(e) = self.long_term_memory.update(&memory) {
+                Err(e) => match cached {
+                    Some(cached) => (*cached).clone(),
+                    None => {
+                        tracing::debug!(
+                            memory_id = %id.0,
+                            error = %e,
+                            "Memory not found during reinforcement - may have been deleted"
+                        );
+                        continue;
+                    }
+                },
+            };
+            match outcome {
+                RetrievalOutcome::Helpful => stats.importance_boosts += 1,
+                RetrievalOutcome::Misleading => stats.importance_decays += 1,
+                RetrievalOutcome::Neutral
+                | RetrievalOutcome::Abstained
+                | RetrievalOutcome::Ignored => {}
+            }
+            match self.long_term_memory.update(&persisted) {
+                Ok(()) if rewrites_importance => stats.rewritten.push(id.clone()),
+                Ok(()) => {}
+                Err(e) => {
                     persist_failures.push((id.clone(), e.to_string()));
                     tracing::warn!(
                         memory_id = %id.0,
                         error = %e,
                         "Failed to persist reinforcement update - Hebbian feedback may be lost on restart"
                     );
-                }
-            } else {
-                // CACHE MISS: Get from storage, modify, and persist
-                match self.long_term_memory.get(id) {
-                    Ok(memory) => {
-                        memory.record_access();
-                        match &outcome {
-                            RetrievalOutcome::Helpful => {
-                                memory.boost_importance(HEBBIAN_BOOST_HELPFUL);
-                                stats.importance_boosts += 1;
-                            }
-                            RetrievalOutcome::Misleading => {
-                                memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
-                                stats.importance_decays += 1;
-                            }
-                            // I8: shadow-neutral live behaviour; negative label captured
-                            // to the trace store, not to importance/confidence.
-                            RetrievalOutcome::Neutral
-                            | RetrievalOutcome::Abstained
-                            | RetrievalOutcome::Ignored => {
-                                // Just access recorded
-                            }
-                        }
-                        // PERSIST: Write to durable storage
-                        if let Err(e) = self.long_term_memory.update(&memory) {
-                            persist_failures.push((id.clone(), e.to_string()));
-                            tracing::warn!(
-                                memory_id = %id.0,
-                                error = %e,
-                                "Failed to persist reinforcement update - Hebbian feedback may be lost on restart"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            memory_id = %id.0,
-                            error = %e,
-                            "Memory not found during reinforcement - may have been deleted"
-                        );
-                    }
                 }
             }
         }

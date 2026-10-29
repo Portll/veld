@@ -96,13 +96,24 @@ pub async fn retire_space(
     let memory = state
         .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
-    let report = tokio::task::spawn_blocking(move || memory.read().retire_space(&space))
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("retire task failed: {e}")))?
-        .map_err(|e| AppError::InvalidInput {
-            field: "space".to_string(),
-            reason: format!("{e:#}"),
-        })?;
+    let manager = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        let report = memory.read().retire_space(&space)?;
+        super::remember::journal_stored(
+            &manager,
+            &memory,
+            &user_id,
+            &report.rewritten,
+            super::remember::SnapshotKind::Update,
+        );
+        Ok::<_, anyhow::Error>(report)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("retire task failed: {e}")))?
+    .map_err(|e| AppError::InvalidInput {
+        field: "space".to_string(),
+        reason: format!("{e:#}"),
+    })?;
     Ok(Json(report))
 }
 
