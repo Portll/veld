@@ -18,8 +18,8 @@ use tracing::{info, warn};
 
 use super::embedding_backlog::{BacklogKey, EmbeddingBacklogStore};
 use super::introspection::ConsolidationEventBuffer;
-pub(crate) use super::space_index::IdMapping;
 use super::recall::order_score_ties_by_content;
+pub(crate) use super::space_index::IdMapping;
 use super::space_index::{ExactVectors, SpaceCodec, SpaceIndex, SpaceIndexHealth};
 use super::space_legs::{self, Leg, LegDepth, LegHits, LegIndex, LegKind};
 use super::space_migration::{MigrationKind, MigrationStep, SpaceMigration, SpaceMigrationStore};
