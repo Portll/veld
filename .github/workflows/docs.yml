@@ -49,6 +49,13 @@ jobs:
           cargo install --locked mdbook --version "^0.4"
           cargo install --locked mdbook-mermaid mdbook-toc
 
+      - name: Install LLVM
+        # The default build links RocksDB, whose bindgen step needs libclang; without it
+        # clang-sys's build script panics and the veld build below fails.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
       - name: Build veld (for gen-cli-ref + smoke test)
         # Builds the main binary so gen-cli-ref can `veld --help` it.
         # Restricted to `--bin veld` to keep the cargo step cheap and
