@@ -1025,6 +1025,7 @@ fn test_reinforcement_stats_structure() {
         importance_decays: 2,
         outcome: RetrievalOutcome::Helpful,
         persist_failures: 0,
+        rewritten: Vec::new(),
     };
 
     assert_eq!(stats.memories_processed, 5);
