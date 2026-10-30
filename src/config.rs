@@ -564,6 +564,7 @@ fn load_config_path_into_env(path: &std::path::Path) {
         ("mcp", "VELD_MCP_ENABLED"),
         ("auto_compress", "VELD_AUTO_COMPRESS"),
         ("graph_mirror_sync_secs", "VELD_GRAPH_MIRROR_SYNC_SECS"),
+        ("bm25_commit_interval_ms", "VELD_BM25_COMMIT_INTERVAL_MS"),
         ("gap_worker_nice", "VELD_GAP_WORKER_NICE"),
         ("gap_worker_chunk_rows", "VELD_GAP_WORKER_CHUNK_ROWS"),
         ("gap_worker_cpu_pct", "VELD_GAP_WORKER_CPU_PCT"),
@@ -950,6 +951,12 @@ pub struct ServerConfig {
     /// Env `VELD_GRAPH_MIRROR_SYNC_SECS`, config.toml key `graph_mirror_sync_secs`.
     pub graph_mirror_sync_secs: u64,
 
+    /// Milliseconds between background commits of a tenant's BM25 index
+    /// (default: 5000, maximum: 60000). 0 commits on the write path instead, on
+    /// the first write 200 ms after the last commit or every 100th write.
+    /// Env `VELD_BM25_COMMIT_INTERVAL_MS`, config.toml key `bm25_commit_interval_ms`.
+    pub bm25_commit_interval_ms: u64,
+
     /// Nice value of the gap analysis worker thread, 0 to 19 (default: 10).
     /// Env `VELD_GAP_WORKER_NICE`, config.toml key `gap_worker_nice`.
     pub gap_worker_nice: i32,
@@ -1012,6 +1019,9 @@ impl Default for ServerConfig {
             log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
             auto_compress: true,
             graph_mirror_sync_secs: crate::memory::slow_store::MIRROR_SYNC_TTL.as_secs(),
+            bm25_commit_interval_ms:
+                crate::memory::bm25_projection::DEFAULT_BACKGROUND_COMMIT_INTERVAL.as_millis()
+                    as u64,
             gap_worker_nice: GapWorkerConfig::default().nice,
             gap_worker_chunk_rows: GapWorkerConfig::default().chunk_rows,
             gap_worker_cpu_pct: GapWorkerConfig::default().cpu_pct,
@@ -1023,6 +1033,9 @@ impl Default for ServerConfig {
 
 /// Default [`ServerConfig::intent_log_segment_mb`].
 pub const INTENT_LOG_SEGMENT_MB_DEFAULT: u64 = 256;
+
+/// Largest [`ServerConfig::bm25_commit_interval_ms`].
+pub const BM25_COMMIT_INTERVAL_MS_MAX: u64 = 60_000;
 
 /// Smallest [`ServerConfig::gap_worker_chunk_rows`].
 pub const GAP_WORKER_CHUNK_ROWS_MIN: usize = 64;
@@ -1054,6 +1067,11 @@ impl ServerConfig {
     /// The graph-mirror TTL as a `Duration`, for `SlowStore::begin_sync`.
     pub fn graph_mirror_sync_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.graph_mirror_sync_secs)
+    }
+
+    /// How each tenant's BM25 projection commits its index.
+    pub fn bm25_commit_mode(&self) -> crate::memory::bm25_projection::CommitMode {
+        crate::memory::bm25_projection::CommitMode::from_interval_ms(self.bm25_commit_interval_ms)
     }
 
     /// How the gap analysis worker thread runs.
@@ -1312,6 +1330,13 @@ impl ServerConfig {
             }
         }
 
+        config.bm25_commit_interval_ms = env_clamped(
+            "VELD_BM25_COMMIT_INTERVAL_MS",
+            env::var("VELD_BM25_COMMIT_INTERVAL_MS"),
+            config.bm25_commit_interval_ms,
+            0,
+            BM25_COMMIT_INTERVAL_MS_MAX,
+        );
         config.gap_worker_nice = env_clamped(
             "VELD_GAP_WORKER_NICE",
             env::var("VELD_GAP_WORKER_NICE"),

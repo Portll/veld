@@ -483,6 +483,30 @@ pub struct HybridSearchResult {
     pub graph_rank: Option<usize>,
 }
 
+/// A write that found the index writer held by a commit.
+enum QueuedOp {
+    Upsert {
+        id_term: tantivy::Term,
+        doc: TantivyDocument,
+    },
+    Delete(tantivy::Term),
+}
+
+impl QueuedOp {
+    fn apply(self, writer: &IndexWriter) -> Result<()> {
+        match self {
+            Self::Upsert { id_term, doc } => {
+                writer.delete_term(id_term);
+                writer.add_document(doc)?;
+            }
+            Self::Delete(id_term) => {
+                writer.delete_term(id_term);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// BM25 Index using Tantivy
 pub struct BM25Index {
     index: Index,
@@ -495,9 +519,15 @@ pub struct BM25Index {
     stemmed_content_field: Field,
     /// Held in RAM only (an encrypted tenant): nothing of it is on disk.
     in_memory: bool,
-    /// Upserts and deletes buffered in the writer since its last commit. Only
-    /// changed while the writer lock is held, so it agrees with the writer.
+    /// Upserts and deletes since the last commit, in the writer or queued.
+    /// Only changed under the `queued` lock, so a commit reading it there
+    /// knows exactly how many operations it covers.
     uncommitted: AtomicU64,
+    /// Operations that arrived while a commit held the writer. A commit holds
+    /// it for the whole flush, and a write waiting there would hold the
+    /// tenant's journal mutex with it; queued, the write returns at once and
+    /// the operations reach the writer in arrival order.
+    queued: parking_lot::Mutex<Vec<QueuedOp>>,
     /// When the writer last committed, from any caller.
     last_commit: parking_lot::Mutex<Instant>,
 }
@@ -629,6 +659,7 @@ impl BM25Index {
             stemmed_content_field,
             in_memory,
             uncommitted: AtomicU64::new(0),
+            queued: parking_lot::Mutex::new(Vec::new()),
             last_commit: parking_lot::Mutex::new(Instant::now()),
         })
     }
@@ -641,31 +672,35 @@ impl BM25Index {
         tags: &[String],
         entities: &[String],
     ) -> Result<()> {
-        let writer = self.writer.write();
-
-        // Delete existing document with this ID
         let id_term = tantivy::Term::from_field_text(self.id_field, &memory_id.0.to_string());
-        writer.delete_term(id_term);
-
-        // Create new document
         let mut doc = TantivyDocument::new();
         doc.add_text(self.id_field, memory_id.0.to_string());
         doc.add_text(self.content_field, content);
         doc.add_text(self.stemmed_content_field, stem_text(content));
         doc.add_text(self.tags_field, tags.join(" "));
         doc.add_text(self.entities_field, entities.join(" "));
-
-        writer.add_document(doc)?;
-        self.uncommitted.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.submit(QueuedOp::Upsert { id_term, doc })
     }
 
     /// Remove a document from the index
     pub fn delete(&self, memory_id: &MemoryId) -> Result<()> {
-        let writer = self.writer.write();
         let id_term = tantivy::Term::from_field_text(self.id_field, &memory_id.0.to_string());
-        writer.delete_term(id_term);
+        self.submit(QueuedOp::Delete(id_term))
+    }
+
+    /// Hand an operation to the writer, or queue it behind earlier queued
+    /// operations when the writer is busy committing.
+    fn submit(&self, op: QueuedOp) -> Result<()> {
+        let mut queued = self.queued.lock();
+        match self.writer.try_read() {
+            Some(writer) => {
+                for earlier in queued.drain(..) {
+                    earlier.apply(&writer)?;
+                }
+                op.apply(&writer)?;
+            }
+            None => queued.push(op),
+        }
         self.uncommitted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -673,17 +708,20 @@ impl BM25Index {
     /// Commit pending changes to disk
     pub fn commit(&self) -> Result<()> {
         let mut writer = self.writer.write();
-        Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)
+        self.commit_locked(&mut writer)
     }
 
-    fn commit_locked(
-        writer: &mut IndexWriter,
-        uncommitted: &AtomicU64,
-        last_commit: &parking_lot::Mutex<Instant>,
-    ) -> Result<()> {
+    fn commit_locked(&self, writer: &mut IndexWriter) -> Result<()> {
+        let covered = {
+            let mut queued = self.queued.lock();
+            for op in queued.drain(..) {
+                op.apply(writer)?;
+            }
+            self.uncommitted.load(Ordering::Relaxed)
+        };
         writer.commit().context("Failed to commit BM25 index")?;
-        uncommitted.store(0, Ordering::Relaxed);
-        *last_commit.lock() = Instant::now();
+        self.uncommitted.fetch_sub(covered, Ordering::Relaxed);
+        *self.last_commit.lock() = Instant::now();
         Ok(())
     }
 
@@ -691,6 +729,11 @@ impl BM25Index {
     /// visible to searches.
     pub fn has_uncommitted(&self) -> bool {
         self.uncommitted.load(Ordering::Relaxed) > 0
+    }
+
+    /// Upserts and deletes buffered since the last commit.
+    pub fn uncommitted_count(&self) -> u64 {
+        self.uncommitted.load(Ordering::Relaxed)
     }
 
     /// Time since the writer last committed.
@@ -710,7 +753,7 @@ impl BM25Index {
             if self.uncommitted.load(Ordering::Relaxed) == 0 {
                 return Ok(false);
             }
-            Self::commit_locked(&mut writer, &self.uncommitted, &self.last_commit)?;
+            self.commit_locked(&mut writer)?;
         }
         self.reload()?;
         Ok(true)
@@ -1966,6 +2009,60 @@ impl HybridSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write that finds a commit holding the writer is queued instead of
+    /// waiting, and the next commit applies the queue in arrival order.
+    #[test]
+    fn writes_during_a_commit_queue_and_land_in_order() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let index = BM25Index::new(temp_dir.path()).unwrap();
+        let kept = MemoryId(uuid::Uuid::new_v4());
+        let dropped = MemoryId(uuid::Uuid::new_v4());
+        index
+            .upsert(&kept, "first draft about quinces", &[], &[])
+            .unwrap();
+        index.commit().unwrap();
+        index.reload().unwrap();
+
+        {
+            let _commit_in_progress = index.writer.write();
+            index
+                .upsert(&kept, "final copy about medlars", &[], &[])
+                .unwrap();
+            index
+                .upsert(&dropped, "short-lived medlars note", &[], &[])
+                .unwrap();
+            index.delete(&dropped).unwrap();
+            assert_eq!(index.queued.lock().len(), 3, "nothing waited on the writer");
+            assert_eq!(index.uncommitted_count(), 3);
+        }
+
+        assert!(index.commit_pending().unwrap());
+        assert!(index.queued.lock().is_empty());
+        assert!(!index.has_uncommitted());
+        assert!(index.search("quinces", 10).unwrap().is_empty());
+        let hits = index.search("medlars", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, kept);
+    }
+
+    /// Once the writer is free again, the next write drains the queue ahead
+    /// of itself, so a later operation never overtakes an earlier one.
+    #[test]
+    fn a_free_writer_drains_the_queue_before_the_next_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let index = BM25Index::new(temp_dir.path()).unwrap();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        {
+            let _commit_in_progress = index.writer.write();
+            index.upsert(&id, "queued loquat entry", &[], &[]).unwrap();
+        }
+        index.delete(&id).unwrap();
+        assert!(index.queued.lock().is_empty());
+        index.commit_pending().unwrap();
+        assert!(index.search("loquat", 10).unwrap().is_empty());
+        assert_eq!(index.len(), 0);
+    }
 
     struct LengthEmbedder;
 

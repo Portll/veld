@@ -463,6 +463,61 @@ async fn remember_basic() {
     );
 }
 
+/// A recall right after a remember finds the memory through BM25 although the
+/// background committer has not run: recall commits what the write buffered.
+/// The interval is the maximum, so only the recall can have committed it.
+#[tokio::test]
+async fn recall_reads_a_buffered_bm25_write() {
+    init_env();
+    let dir = TempDir::new().expect("create temp dir");
+    let cfg = ServerConfig {
+        storage_path: dir.path().to_path_buf(),
+        backup_enabled: false,
+        bm25_commit_interval_ms: veld::config::BM25_COMMIT_INTERVAL_MS_MAX,
+        ..ServerConfig::default()
+    };
+    let h = Harness {
+        mgr: Arc::new(
+            MultiUserMemoryManager::new(dir.path().to_path_buf(), cfg)
+                .expect("create MultiUserMemoryManager"),
+        ),
+        _dir: dir,
+    };
+    let user = "ryw-user";
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({ "user_id": user, "content": "Replaced the qorvexite gasket on pump three." }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+
+    let bm25 = h.mgr.get_user_bm25_index(user).expect("bm25 index");
+    assert!(
+        bm25.has_uncommitted(),
+        "the write is buffered, not committed"
+    );
+    assert!(bm25.search("qorvexite", 10).unwrap().is_empty());
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall",
+            json!({ "user_id": user, "query": "qorvexite", "limit": 5 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recall failed: {body}");
+    assert!(
+        body.to_string().contains("qorvexite gasket"),
+        "recall returns the memory: {body}"
+    );
+    assert!(!bm25.has_uncommitted());
+    assert_eq!(bm25.search("qorvexite", 10).unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn remember_with_tags_and_type() {
     let h = Harness::new();

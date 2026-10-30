@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **123** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **124** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -27,6 +27,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_BACKUP_ENABLED` | — | `src/config.rs` |
 | `VELD_BACKUP_INTERVAL` | — | `src/config.rs` |
 | `VELD_BACKUP_MAX_COUNT` | — | `src/config.rs` |
+| `VELD_BM25_COMMIT_INTERVAL_MS` | — | `src/config.rs` |
 | `VELD_COLLECTIVE_STORE_DIR` | — | `src/config.rs` |
 | `VELD_CORS_CREDENTIALS` | — | `src/config.rs` |
 | `VELD_CORS_HEADERS` | — | `src/config.rs` |

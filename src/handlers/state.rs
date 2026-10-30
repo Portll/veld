@@ -2593,7 +2593,8 @@ impl MultiUserMemoryManager {
             )
         } else {
             crate::memory::Bm25Projection::new(bm25_index.clone(), checkpoint_store.clone())
-        };
+        }
+        .with_commit_mode(self.server_config.bm25_commit_mode());
         // Fourth projection (default-OFF, gated by VELD_WIKI_RENDER): the
         // wiki render. Init or replay failure is non-fatal — the other
         // projections and the write path are unaffected; the wiki is simply
