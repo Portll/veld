@@ -577,9 +577,15 @@ struct LazyOnnx {
     has_token_type_ids: bool,
     /// Output head strategy, detected from `session.outputs[0]`'s shape.
     output_head: OutputHead,
+    /// The model id its sessions are counted under in `veld_cross_encoder_sessions`.
+    metric_id: String,
 }
 
 impl LazyOnnx {
+    fn open_sessions(&self) -> usize {
+        1 + self.extra.iter().filter(|s| s.get().is_some()).count()
+    }
+
     /// A session to run on: a free open one, else a newly opened one while the pool has
     /// room, else the primary once it frees.
     fn checkout(&self, id: &str) -> Result<parking_lot::MutexGuard<'_, Session>> {
@@ -608,10 +614,10 @@ impl LazyOnnx {
         match build_session(&self.model_path, self.threading) {
             Ok(session) => {
                 let _ = slot.set(Mutex::new(session));
-                let open = 1 + self.extra.iter().filter(|s| s.get().is_some()).count();
+                let open = self.open_sessions();
                 crate::metrics::CROSS_ENCODER_SESSIONS
                     .with_label_values(&[id])
-                    .set(open as i64);
+                    .inc();
                 tracing::info!(
                     "cross-encoder `{id}`: opened session {open} for concurrent reranks"
                 );
@@ -932,7 +938,7 @@ impl OnnxCrossEncoder {
             let sessions = env_count("VELD_CROSS_ENCODER_SESSIONS", DEFAULT_SESSIONS, 8).max(1);
             crate::metrics::CROSS_ENCODER_SESSIONS
                 .with_label_values(&[self.config.id.as_str()])
-                .set(1);
+                .inc();
             Ok(LazyOnnx {
                 primary: Mutex::new(session),
                 extra: (1..sessions).map(|_| OnceLock::new()).collect(),
@@ -943,6 +949,7 @@ impl OnnxCrossEncoder {
                 tokenizer,
                 has_token_type_ids,
                 output_head,
+                metric_id: self.config.id.clone(),
             })
         });
 
@@ -950,6 +957,15 @@ impl OnnxCrossEncoder {
             Ok(model) => Ok(model),
             Err(msg) => Err(anyhow::anyhow!("{}", msg)),
         }
+    }
+}
+
+/// An idle unload drops the sessions, so they leave the gauge with it.
+impl Drop for LazyOnnx {
+    fn drop(&mut self) {
+        crate::metrics::CROSS_ENCODER_SESSIONS
+            .with_label_values(&[self.metric_id.as_str()])
+            .sub(self.open_sessions() as i64);
     }
 }
 

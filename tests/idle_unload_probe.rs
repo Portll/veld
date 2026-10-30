@@ -5,6 +5,7 @@
 //! ```text
 //! VELD_MODEL_IDLE_UNLOAD_SECS=120 <test binary> --ignored --exact idle_rss_profile --nocapture
 //! VELD_MODEL_IDLE_UNLOAD_SECS=4   <test binary> --ignored --exact first_query_after_idle --nocapture
+//! VELD_MODEL_IDLE_UNLOAD_SECS=1   <test binary> --ignored --exact unloaded_sessions_leave_the_gauge
 //! ```
 //!
 //! `VELD_IDLE_PROBE_MINUTES` (default `0,5,30`) sets when `idle_rss_profile` samples RSS;
@@ -175,4 +176,31 @@ fn first_query_after_idle() {
             values[values.len() - 1]
         );
     }
+}
+
+#[test]
+#[ignore = "needs the cached cross-encoder and VELD_MODEL_IDLE_UNLOAD_SECS"]
+fn unloaded_sessions_leave_the_gauge() {
+    let unload: u64 = env_or("VELD_MODEL_IDLE_UNLOAD_SECS", "0")
+        .parse()
+        .expect("VELD_MODEL_IDLE_UNLOAD_SECS");
+    assert!(unload > 0, "set VELD_MODEL_IDLE_UNLOAD_SECS");
+    let reranker = default_cross_encoder();
+    let sessions = || {
+        veld::metrics::CROSS_ENCODER_SESSIONS
+            .with_label_values(&[reranker.id()])
+            .get()
+    };
+    reranker
+        .score_pairs("query", &["a document"])
+        .expect("rerank");
+    assert_eq!(sessions(), 1, "loaded");
+
+    std::thread::sleep(Duration::from_secs(unload + 3));
+    assert_eq!(sessions(), 0, "unloaded");
+
+    reranker
+        .score_pairs("query", &["a document"])
+        .expect("rerank");
+    assert_eq!(sessions(), 1, "reloaded");
 }
