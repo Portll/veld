@@ -315,7 +315,18 @@ pub struct RecallMemory {
     pub id: String,
     pub experience: RecallExperience,
     pub importance: f32,
+    /// When the memory was written: the date its content was mentioned.
     pub created_at: String,
+    /// Dates the content says something happened, resolved against `created_at` ("last
+    /// Saturday" in a memory written on 2023-05-08 reads `2023-05-06`). A day is `YYYY-MM-DD`, a
+    /// month `YYYY-MM`, a year `YYYY`; an open or fuzzy one is prefixed `after `, `before ` or
+    /// `around `. Resolved when the memory is returned and never stored or indexed, so it does
+    /// not move ranking. Absent when the content names no date that resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurred: Option<Vec<String>>,
+    /// Dates the content says something is planned for, in the same form as `occurred`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned: Option<Vec<String>>,
     /// The pipeline's unified score divided by the top result's, so it sits in `[0, 1]`,
     /// falls with rank, and the gap between two results means something. Rank-based when
     /// the pipeline attached no score.

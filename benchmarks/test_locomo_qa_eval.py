@@ -89,6 +89,51 @@ class BudgetTests(unittest.TestCase):
         self.assertNotIn("dropped", prompt)
 
 
+class EventDateTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, qa, "RENDER_EVENT_DATES", qa.RENDER_EVENT_DATES)
+
+    def dated(self):
+        line = item("Melanie: I ran a charity race last Saturday.")
+        line.update(occurred=["2023-05-06"], planned=["2023-06"])
+        return line
+
+    def test_lines_are_unchanged_without_the_flag(self):
+        qa.RENDER_EVENT_DATES = False
+        self.assertEqual(qa.context_line(self.dated()),
+                         "[2023-05-08] Melanie: I ran a charity race last Saturday.")
+
+    def test_the_flag_shows_mention_occurred_and_planned_dates(self):
+        qa.RENDER_EVENT_DATES = True
+        self.assertEqual(qa.context_line(self.dated()),
+                         "[mention 2023-05-08, occurred 2023-05-06, planned 2023-06] "
+                         "Melanie: I ran a charity race last Saturday.")
+        self.assertEqual(qa.context_line(item("Caroline: hi")), "[mention 2023-05-08] Caroline: hi")
+
+    def source(self, retrieved):
+        return {"rows": {"q1": {"qid": "q1", "question": "When?", "category": "temporal",
+                                "retrieved": retrieved, "retrieved_ids": ["a"],
+                                "recall_ms": 3.0, "context_n": 1, "runs": [{"answer": "x"}]}},
+                "veld": {"git": "abc"}, "ingest": {"conv-1": {}}, "system": {"name": "veld"}}
+
+    def test_seeding_copies_retrieval_and_drops_the_source_answers(self):
+        qa.RENDER_EVENT_DATES = True
+        results = {"rows": {}, "veld": {}, "ingest": {}}
+        qa.seed_retrieval(results, self.source([self.dated()]), ["q1"], Path("a.json"))
+        row = results["rows"]["q1"]
+        self.assertEqual(row["retrieved"][0]["occurred"], ["2023-05-06"])
+        self.assertEqual((row["runs"], "context_n" in row), ([], False))
+        self.assertEqual(results["veld"], {"git": "abc"})
+
+    def test_seeding_refuses_a_source_without_event_dates_or_a_question(self):
+        qa.RENDER_EVENT_DATES = True
+        results = {"rows": {}}
+        with self.assertRaises(SystemExit):
+            qa.seed_retrieval(results, self.source([item("old")]), ["q1"], Path("a.json"))
+        with self.assertRaises(SystemExit):
+            qa.seed_retrieval(results, self.source([self.dated()]), ["q2"], Path("a.json"))
+
+
 class WilsonTests(unittest.TestCase):
     def test_known_values(self):
         lo, hi = qa.wilson(0.5, 100)

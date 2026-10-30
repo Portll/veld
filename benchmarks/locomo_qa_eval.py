@@ -18,8 +18,12 @@ Protocol (--system veld, the default):
      until GET /api/embeddings/backlog reports nothing pending and GET /api/health/index reports
      the vector and lexical indexes covering every stored memory.
   4. Retrieval: POST /api/recall {user_id, query, limit: k} once per question; context lines are
-     "[<created_at date>] <content>". --eval-now pins the server's scoring clock (VELD_EVAL_NOW);
-     unset, recency is scored against the wall clock.
+     "[<created_at date>] <content>". With --event-dates they are
+     "[mention <created_at date>, occurred <date>, planned <date>] <content>", from the recall
+     response's occurred and planned fields (dates the server resolves from the content at read
+     time). --retrieval-from reuses another results file's retrieval unchanged, so two runs can
+     differ only in how the same memories are shown. --eval-now pins the server's scoring clock
+     (VELD_EVAL_NOW); unset, recency is scored against the wall clock.
   5. Context: each question's retrieved lines are counted in tokens (tiktoken o200k_base, the
      same count for every system). --context-budget N keeps the longest prefix of the ranked
      lines that fits N tokens, so systems can be compared at one budget; unset, all k are kept.
@@ -203,6 +207,8 @@ EST_ANSWER_CHARS = 400
 
 CATEGORY = {1: "multi_hop", 2: "temporal", 3: "open_domain", 4: "single_hop", 5: "adversarial"}
 EXCLUDED_CATEGORIES = {5}
+# Set from --event-dates: context lines carry the dates a memory's content resolves to.
+RENDER_EVENT_DATES = False
 CATEGORY_ORDER = ["single_hop", "multi_hop", "temporal", "open_domain"]
 
 EMBEDDER_ENV_NAMES = {
@@ -689,6 +695,8 @@ def retrieve(client: VeldClient, question: dict, k: int, memory_turns: dict) -> 
             "created_at": m.get("created_at"),
             "score": m.get("score"),
             "content": content,
+            "occurred": m.get("occurred") or [],
+            "planned": m.get("planned") or [],
         })
 
 
@@ -701,7 +709,38 @@ def retrieve(client: VeldClient, question: dict, k: int, memory_turns: dict) -> 
 
 
 def context_line(item: dict) -> str:
-    return f"[{memory_date(item['created_at'])}] {item['content']}"
+    date = memory_date(item["created_at"])
+    if not RENDER_EVENT_DATES:
+        return f"[{date}] {item['content']}"
+    stamp = [f"mention {date}"]
+    stamp += [f"occurred {d}" for d in item.get("occurred") or []]
+    stamp += [f"planned {d}" for d in item.get("planned") or []]
+    return f"[{', '.join(stamp)}] {item['content']}"
+
+
+RETRIEVAL_FIELDS = ("retrieved", "retrieved_ids", "recall_ms")
+
+
+def seed_retrieval(results: dict, source: dict, qids: list[str], source_path: Path):
+    """Copy source's retrieval for qids into results, with the server and ingest it came from,
+    so this run reads and judges exactly the memories that run retrieved."""
+    missing = [q for q in qids if (source["rows"].get(q) or {}).get("retrieved") is None]
+    if missing:
+        raise SystemExit(f"{source_path} holds no retrieval for {len(missing)} selected "
+                         f"questions, e.g. {missing[:3]}")
+    if RENDER_EVENT_DATES and any("occurred" not in item for q in qids
+                                  for item in source["rows"][q]["retrieved"]):
+        raise SystemExit(f"{source_path} was retrieved before the harness recorded occurred and "
+                         "planned dates; --event-dates needs a run that did")
+    for qid in qids:
+        row = results["rows"].setdefault(qid, {k: v for k, v in source["rows"][qid].items()
+                                                if k not in ("runs", "context_n")})
+        row.update({k: source["rows"][qid][k] for k in RETRIEVAL_FIELDS})
+        row["runs"] = []
+        row.pop("context_n", None)
+    for key in ("veld", "ingest", "system"):
+        if key in source:
+            results[key] = source[key]
 
 
 def token_counter():
@@ -1690,6 +1729,14 @@ def main():
                     help="Comma-separated sample ids, e.g. conv-26,conv-30 (default: all 10)")
     ap.add_argument("--limit-questions", type=int, default=0,
                     help="First N non-adversarial questions per conversation (0 = all)")
+    ap.add_argument("--categories", default=None,
+                    help=f"Comma-separated categories to ask, of {','.join(CATEGORY_ORDER)} "
+                         "(default: all)")
+    ap.add_argument("--event-dates", action="store_true",
+                    help="Show each memory's mention date and the dates its content resolves "
+                         "to (the recall response's occurred and planned)")
+    ap.add_argument("--retrieval-from", default=None, metavar="RESULTS",
+                    help="Reuse this results file's retrieval instead of spawning a server")
     ap.add_argument("--top-k", type=int, default=10, help="Memories recalled per question")
     ap.add_argument("--context-budget", type=int, default=None, metavar="TOKENS",
                     help=f"Keep the ranked prefix of the retrieved lines that fits this many "
@@ -1773,6 +1820,14 @@ def main():
                          "reader's host; use --provider lmstudio or openai-compatible")
     if args.attempts < 1:
         raise SystemExit("--attempts must be at least 1")
+    if args.system == "mem0" and (args.event_dates or args.retrieval_from):
+        raise SystemExit("--event-dates and --retrieval-from read veld recall responses")
+    categories = args.categories.split(",") if args.categories else list(CATEGORY_ORDER)
+    unknown_categories = sorted(set(categories) - set(CATEGORY_ORDER))
+    if unknown_categories:
+        raise SystemExit(f"Unknown categories {unknown_categories}; known: {CATEGORY_ORDER}")
+    global RENDER_EVENT_DATES
+    RENDER_EVENT_DATES = args.event_dates
 
     sys.stdout.reconfigure(line_buffering=True)
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -1788,6 +1843,7 @@ def main():
     questions = []
     for cid in wanted:
         qs = conversation_questions(data_by_id[cid])
+        qs = [q for q in qs if q["category"] in categories]
         questions.extend(qs[:args.limit_questions] if args.limit_questions > 0 else qs)
     every = [q for conv in data for q in conversation_questions(conv)]
     full_questions = len(every)
@@ -1824,6 +1880,9 @@ def main():
         if cfg.get("eval_now") != eval_now:
             raise SystemExit(f"{out_path} retrieved with --eval-now {cfg.get('eval_now')}; this "
                              f"command resolves to {eval_now}")
+        if cfg.get("event_dates", False) != args.event_dates:
+            raise SystemExit(f"{out_path} was read with --event-dates "
+                             f"{cfg.get('event_dates', False)}; rerun to match")
         cfg["runs"] = max(cfg["runs"], args.runs)
         results["dry_run"] = results.get("dry_run", False) and args.dry_run
         results.setdefault("system", {"name": "veld"})
@@ -1844,6 +1903,7 @@ def main():
                 "excluded_categories": sorted(EXCLUDED_CATEGORIES),
                 "answer_prompt": ANSWER_PROMPT_SOURCE, "judge_prompt": ACCURACY_PROMPT_SOURCE,
                 "session_timezone": "UTC",
+                "event_dates": args.event_dates,
             },
             "system": {"name": args.system},
             "veld": {"git": git_describe()},
@@ -1855,7 +1915,23 @@ def main():
                                         or args.price_out is not None))
     results["config"].update(eval_now=eval_now, eval_now_arg=args.eval_now,
                              attempts=args.attempts, conversations=wanted,
-                             limit_questions=args.limit_questions)
+                             limit_questions=args.limit_questions, categories_asked=categories)
+    if args.retrieval_from and not results["rows"]:
+        source_path = Path(args.retrieval_from).expanduser()
+        with open(source_path, encoding="utf-8") as f:
+            source = json.load(f)
+        source_cfg = source["config"]
+        if source["dataset"]["sha256"] != dataset_sha:
+            raise SystemExit(f"{source_path} was made from a different locomo10.json")
+        for key, mine in (("top_k", args.top_k), ("eval_now", eval_now),
+                          ("system", args.system)):
+            if source_cfg.get(key) != mine:
+                raise SystemExit(f"{source_path} has {key} {source_cfg.get(key)!r}, this run "
+                                 f"{mine!r}")
+        seed_retrieval(results, source, [q["qid"] for q in questions], source_path)
+        results["config"]["retrieval_from"] = {"path": str(source_path),
+                                               "label": source.get("label")}
+        print(f"Retrieval reused from {source_path}")
     if args.label is not None:
         results["label"] = args.label
     needs_key = not args.dry_run or args.system == "mem0"

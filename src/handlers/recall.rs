@@ -148,6 +148,7 @@ pub(crate) fn recall_memory_view(
                 | crate::memory::types::SourceType::System
         )
     });
+    let (occurred, planned) = event_dates(m);
     RecallMemory {
         id: m.id.0.to_string(),
         experience: RecallExperience {
@@ -157,6 +158,8 @@ pub(crate) fn recall_memory_view(
         },
         importance: m.importance(),
         created_at: m.created_at.to_rfc3339(),
+        occurred,
+        planned,
         score,
         raw_score,
         tier: format!("{:?}", m.tier),
@@ -196,6 +199,44 @@ pub(crate) fn recall_memory_view(
     }
 }
 
+/// The dates a memory's content says something occurred and is planned for, resolved against
+/// its `created_at` by the same extractor the write path uses for temporal facts. Relative
+/// phrases that name no date ("the week before") and past intentions, which may never have
+/// happened, are left out.
+fn event_dates(m: &Memory) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    use crate::memory::temporal_facts::{extract_temporal_facts, EventType, ResolvedTime};
+
+    let mut occurred: Vec<String> = Vec::new();
+    let mut planned: Vec<String> = Vec::new();
+    let facts = extract_temporal_facts(
+        &m.experience.content,
+        &m.id,
+        m.created_at,
+        &m.experience.entities,
+    );
+    for fact in facts {
+        let date = match fact.resolved_time {
+            ResolvedTime::ExactDate(d) => d.format("%Y-%m-%d").to_string(),
+            ResolvedTime::MonthYear { month, year } => format!("{year:04}-{month:02}"),
+            ResolvedTime::Year(year) => format!("{year:04}"),
+            ResolvedTime::After(d) => format!("after {}", d.format("%Y-%m-%d")),
+            ResolvedTime::Before(d) => format!("before {}", d.format("%Y-%m-%d")),
+            ResolvedTime::Around { centre, .. } => format!("around {}", centre.format("%Y-%m-%d")),
+            ResolvedTime::RelativeDescription(_) | ResolvedTime::Unknown => continue,
+        };
+        let dates = match fact.event_type {
+            EventType::Occurred | EventType::Historical => &mut occurred,
+            EventType::Planned => &mut planned,
+            EventType::PastIntent => continue,
+        };
+        if !dates.contains(&date) {
+            dates.push(date);
+        }
+    }
+    let present = |dates: Vec<String>| (!dates.is_empty()).then_some(dates);
+    (present(occurred), present(planned))
+}
+
 #[cfg(test)]
 mod recall_memory_view_tests {
     use super::recall_memory_view;
@@ -224,6 +265,55 @@ mod recall_memory_view_tests {
             None,
             None,
         )
+    }
+
+    fn written_on(content: &str, rfc3339: &str) -> Memory {
+        let mut memory = memory_from(content, Some(SourceType::User));
+        memory.created_at = chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        memory
+    }
+
+    #[test]
+    fn a_relative_date_is_resolved_against_when_the_memory_was_written() {
+        let content = "Melanie: I ran a charity race last Saturday.";
+        let memory = written_on(content, "2023-05-08T13:00:00Z");
+        let view = recall_memory_view(&memory, 0, 1, None);
+        assert_eq!(view.occurred, Some(vec!["2023-05-06".to_string()]));
+        assert_eq!(view.planned, None);
+        assert_eq!(
+            view.experience.content, content,
+            "content is returned as stored"
+        );
+        assert_eq!(
+            memory.experience.content, content,
+            "the memory is not rewritten"
+        );
+    }
+
+    #[test]
+    fn a_plan_is_reported_apart_from_what_happened() {
+        let memory = written_on(
+            "Caroline: We're planning to go camping next month.",
+            "2023-05-08T13:00:00Z",
+        );
+        let view = recall_memory_view(&memory, 0, 1, None);
+        assert_eq!(view.planned, Some(vec!["2023-06".to_string()]));
+        assert_eq!(view.occurred, None);
+    }
+
+    #[test]
+    fn content_without_a_date_carries_no_event_dates() {
+        let memory = written_on(
+            "Melanie: I really enjoy hiking in the mountains.",
+            "2023-05-08T13:00:00Z",
+        );
+        let view = recall_memory_view(&memory, 0, 1, None);
+        assert_eq!(view.occurred, None);
+        assert_eq!(view.planned, None);
+        let wire = serde_json::to_value(&view).unwrap();
+        assert!(wire.get("occurred").is_none() && wire.get("planned").is_none());
     }
 
     #[test]
