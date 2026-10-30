@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **124** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **144** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -17,10 +17,10 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_ALIGNMENT_PATH` | — | `src/embeddings/alignment.rs` |
 | `VELD_ALIGN_WHITEN` | — | `src/embeddings/alignment_config.rs` |
 | `VELD_ALLOW_INSECURE_REMOTE_EMBEDDER` | — | `src/embeddings/http_embedder.rs` |
-| `VELD_ALLOW_KEYSTORE_ROLLBACK` | — | `src/memory/storage.rs` |
+| `VELD_ALLOW_KEYSTORE_ROLLBACK` | — | `src/keystore.rs` |
 | `VELD_ALLOW_UNSIGNED_WEBHOOKS` | — | `src/handlers/integrations.rs` |
-| `VELD_API_KEY` | — | `src/auth.rs` |
-| `VELD_API_KEYS` | — | `src/auth.rs` |
+| `VELD_ARCTIC_MODEL_PATH` | — | `src/embeddings/arctic.rs` |
+| `VELD_ARCTIC_USE_QUANTIZED` | — | `src/embeddings/arctic.rs` |
 | `VELD_AUDIT_MAX_ENTRIES` | — | `src/config.rs` |
 | `VELD_AUDIT_RETENTION_DAYS` | — | `src/config.rs` |
 | `VELD_AUTO_COMPRESS` | — | `src/config.rs` |
@@ -37,16 +37,26 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_CORS_WARN` | — | `src/config.rs` |
 | `VELD_CROSS_ENCODER` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_CROSS_ENCODERS` | — | `src/embeddings/cross_encoder.rs` |
+| `VELD_CROSS_ENCODER_BATCH` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_DERIVED_TAG_BUDGET` | — | `src/config.rs` |
 | `VELD_DEV_API_KEY` | — | `src/auth.rs` |
 | `VELD_DIALS_DISABLE_SIGNALS` | — | `src/memory/dials.rs` |
+| `VELD_DIALS_FUSION` | — | `src/memory/dials.rs` |
+| `VELD_DIALS_GRAPH_CANDIDATES_ONLY` | — | `src/memory/dials.rs` |
+| `VELD_DIALS_RERANK_MODEL` | — | `src/memory/dials.rs` |
 | `VELD_DOCS_DIR` | — | `src/handlers/docs.rs` |
 | `VELD_EMBEDDER` | — | `src/memory/mod.rs` |
+| `VELD_EMBEDDING_API_FALLBACK_URL` | — | `src/embeddings/http_embedder.rs` |
 | `VELD_EMBEDDING_API_KEY` | — | `src/embeddings/http_embedder.rs` |
+| `VELD_EMBEDDING_API_MAX_TOKENS` | — | `src/embeddings/http_embedder.rs` |
 | `VELD_EMBEDDING_API_MODEL` | — | `src/embeddings/http_embedder.rs` |
 | `VELD_EMBEDDING_API_TASK_PREFIXES` | — | `src/embeddings/http_embedder.rs` |
 | `VELD_EMBEDDING_API_TIMEOUT_MS` | — | `src/embeddings/http_embedder.rs` |
-| `VELD_EMBEDDING_API_URL` | — | `src/memory/mod.rs` |
+| `VELD_EMBEDDING_API_URL` | — | `src/embeddings/http_embedder.rs` |
+| `VELD_EMBED_BACKLOG_BATCH` | — | `src/server.rs` |
+| `VELD_EMBED_BACKLOG_INTERVAL_SECS` | — | `src/server.rs` |
+| `VELD_EMBED_BATCH` | — | `src/server.rs` |
+| `VELD_EMBED_QUEUE_INTERVAL_MS` | — | `src/server.rs` |
 | `VELD_EMBED_TIMEOUT_MS` | — | `src/embeddings/minilm.rs` |
 | `VELD_ENFORCE_HTTPS` | — | `src/integrations/mod.rs` |
 | `VELD_ENV` | — | `src/config.rs` |
@@ -65,6 +75,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_KMS_WRAP_KEY` | — | `src/keystore.rs` |
 | `VELD_LAZY_CROSS_ENCODER` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_LAZY_LOAD` | — | `src/embeddings/minilm.rs` |
+| `VELD_LIVE_ARCTIC` | — | `src/embeddings/arctic.rs` |
 | `VELD_LIVE_EMBEDDER` | — | `src/memory/mod.rs` |
 | `VELD_LLM_API_KEY` | — | `src/memory/llm.rs` |
 | `VELD_LLM_ENDPOINT` | — | `src/memory/llm.rs` |
@@ -76,7 +87,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_LLM_URL` | `_\| {` | `src/query_parsing/llm_parser.rs` |
 | `VELD_LOG_PERIODIC_SCALES` | — | `src/config.rs` |
 | `VELD_MAINTENANCE_INTERVAL` | — | `src/config.rs` |
-| `VELD_MASTER_PASSPHRASE` | — | `src/memory/storage.rs` |
+| `VELD_MASTER_PASSPHRASE` | — | `src/keystore.rs` |
 | `VELD_MAX_CONCURRENT` | — | `src/config.rs` |
 | `VELD_MAX_ENTITIES` | — | `src/config.rs` |
 | `VELD_MAX_USERS` | — | `src/config.rs` |
@@ -93,6 +104,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_NOMIC_MODEL_PATH` | — | `src/embeddings/nomic.rs` |
 | `VELD_NOMIC_POOL_SIZE` | — | `src/embeddings/nomic.rs` |
 | `VELD_NOMIC_USE_QUANTIZED` | — | `src/embeddings/nomic.rs` |
+| `VELD_NOW` | — | `src/keyring.rs` |
 | `VELD_OFFLINE` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_ONNX_THREADS` | — | `src/embeddings/minilm.rs` |
 | `VELD_PACKAGE_DIR` | — | `src/embeddings/minilm.rs` |
@@ -109,11 +121,18 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_RELATIONAL_SQLITE_PATH` | — | `src/config.rs` |
 | `VELD_REQUEST_TIMEOUT` | — | `src/config.rs` |
 | `VELD_RERANK_DEPTH` | — | `src/embeddings/cross_encoder.rs` |
+| `VELD_SECONDARY_EMBEDDER` | — | `src/memory/mod.rs` |
+| `VELD_SELECTIVE_REINFORCE_CYCLES` | — | `src/bin/recall_eval.rs` |
+| `VELD_SIMILARITY_SCALE` | — | `src/similarity/scale.rs` |
 | `VELD_SLEEP_TIME_PROFILE` | — | `src/server.rs` |
+| `VELD_SPACE_CODEC` | — | `src/memory/space_index.rs` |
+| `VELD_SPACE_MIGRATION_BATCH` | — | `src/memory/mod.rs` |
+| `VELD_SPACE_MIGRATION_TICK_SECS` | — | `src/memory/mod.rs` |
 | `VELD_STORAGE_BACKEND` | — | `src/config.rs` |
 | `VELD_SUPABASE_DB_PASSWORD` | — | `src/config.rs` |
 | `VELD_SUPABASE_PROJECT_REF` | — | `src/config.rs` |
 | `VELD_TLS_ACK` | — | `src/server.rs` |
+| `VELD_TLS_PORT` | — | `src/config.rs` |
 | `VELD_USE_QUANTIZED_MODEL` | — | `src/embeddings/minilm.rs` |
 | `VELD_WIKI_DIR` | — | `src/wiki/mod.rs` |
 | `VELD_WIKI_RENDER` | — | `src/wiki/mod.rs` |
@@ -123,7 +142,6 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_WRITE_LATCH_MAX_ATTEMPTS` | — | `src/storage/write_latch.rs` |
 | `VELD_WRITE_LATCH_MIN_FREE_BYTES` | — | `src/storage/write_latch.rs` |
 | `VELD_WRITE_LATCH_RESTART` | — | `src/storage/write_latch.rs` |
-| `VELD_WRITE_MODE` | — | `src/memory/storage.rs` |
 | `VELD_ZENOH_API_KEY` | — | `src/embeddings/zenoh_embedder.rs` |
 | `VELD_ZENOH_AUTO_TOPICS` | — | `src/zenoh_transport/config.rs` |
 | `VELD_ZENOH_CONNECT` | — | `src/embeddings/zenoh_embedder.rs` |

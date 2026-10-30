@@ -6,7 +6,7 @@
 
 # HTTP API
 
-Veld exposes **273** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
+Veld exposes **277** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
 
 > Warning: 1 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
 
@@ -415,6 +415,12 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `POST` | `/api/reminders/{reminder_id}/delete` | `todos::delete_reminder` |
 | `POST` | `/api/reminders/{reminder_id}/dismiss` | `todos::dismiss_reminder` |
 
+## /replication
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/replication/role` | `replica::role` |
+
 ## /search
 
 | Method | Path | Handler |
@@ -452,6 +458,14 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | Method | Path | Handler |
 |---|---|---|
 | `POST` | `/api/sleight/dimensions` | `external_dimensions::push_dimensions` |
+
+## /spaces
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/spaces` | `spaces::list_spaces` |
+| `POST` | `/api/spaces/align` | `spaces::align_spaces` |
+| `POST` | `/api/spaces/retire` | `spaces::retire_space` |
 
 ## /spine
 

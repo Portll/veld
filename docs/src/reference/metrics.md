@@ -6,7 +6,7 @@
 
 # Metrics Reference
 
-Veld exposes **39** Prometheus metrics on the `/metrics` endpoint. Visibility is configured by `VELD_METRICS_PUBLIC` — when `true`, `/metrics` is unauthenticated; otherwise it requires an API key.
+Veld exposes **48** Prometheus metrics on the `/metrics` endpoint. Visibility is configured by `VELD_METRICS_PUBLIC` — when `true`, `/metrics` is unauthenticated; otherwise it requires an API key.
 
 | Name | Kind | Help | Source |
 |---|---|---|---|
@@ -15,7 +15,10 @@ Veld exposes **39** Prometheus metrics on the `/metrics` endpoint. Visibility is
 | `veld_checkpoint_persist_total` | IntCounterVec | Total projection checkpoint persist operations | `src/metrics.rs` |
 | `veld_consolidate_duration_seconds` | Histogram | Memory consolidation operation duration | `src/metrics.rs` |
 | `veld_consolidate_total` | IntCounterVec | Total memory consolidation operations | `src/metrics.rs` |
+| `veld_cross_encoder_pairs_total` | IntCounter | Cross-encoder pairs scored, by source (model or cache) | `src/metrics.rs` |
+| `veld_cross_encoder_sessions` | IntGaugeVec | Open ONNX sessions per cross-encoder model | `src/metrics.rs` |
 | `veld_embed_background_duration_seconds` | Histogram | Background embed_and_index operation duration | `src/metrics.rs` |
+| `veld_embedding_backlog_pending` | IntGaugeVec | Memories stored without a vector, awaiting the embedder | `src/metrics.rs` |
 | `veld_embedding_cache_content_total` | IntCounterVec | Content embedding cache operations | `src/metrics.rs` |
 | `veld_embedding_cache_query_total` | IntCounter | Query embedding cache operations | `src/metrics.rs` |
 | `veld_embedding_generate_duration_seconds` | HistogramVec | Embedding generation duration | `src/metrics.rs` |
@@ -23,6 +26,7 @@ Veld exposes **39** Prometheus metrics on the `/metrics` endpoint. Visibility is
 | `veld_errors_total` | IntCounterVec | Total errors by type | `src/metrics.rs` |
 | `veld_hebbian_reinforce_duration_seconds` | HistogramVec | Hebbian reinforcement operation duration | `src/metrics.rs` |
 | `veld_hebbian_reinforce_total` | IntGauge | Total Hebbian reinforcement operations | `src/metrics.rs` |
+| `veld_hebbian_strengthen_events_total` | IntCounterVec | Synapse strengthening events by evidential outcome | `src/metrics.rs` |
 | `veld_http_request_duration_seconds` | HistogramVec | HTTP request duration in seconds | `src/metrics.rs` |
 | `veld_http_requests_total` | IntCounterVec | Total HTTP requests | `src/metrics.rs` |
 | `veld_intent_log_append_duration_seconds` | Histogram | Intent log append duration | `src/metrics.rs` |
@@ -46,9 +50,14 @@ Veld exposes **39** Prometheus metrics on the `/metrics` endpoint. Visibility is
 | `veld_retrieve_results` | HistogramVec | Number of results returned per query | `src/metrics.rs` |
 | `veld_retrieve_total` | IntCounterVec | Total memory retrieve operations | `src/metrics.rs` |
 | `veld_rocksdb_ops_total` | Histogram | Total RocksDB operations | `src/metrics.rs` |
+| `veld_similarity_bar_evaluated_total` | IntCounterVec | Mapped-cosine comparisons against each similarity bar | `src/metrics.rs` |
+| `veld_similarity_bar_fired_total` | IntCounterVec | Mapped-cosine comparisons that crossed each similarity bar | `src/metrics.rs` |
 | `veld_store_duration_seconds` | Histogram | Memory store operation duration | `src/metrics.rs` |
 | `veld_store_total` | IntCounterVec | Total memory store operations | `src/metrics.rs` |
 | `veld_vector_search_total` | IntGauge | Total vector search operations | `src/metrics.rs` |
+| `veld_write_gate_duplicates_total` | IntCounter | Memories kept and tagged as duplicates by the write gate, by kind | `src/metrics.rs` |
+| `veld_write_stage_duration_seconds` | HistogramVec | Duration of each stage of the memory write path | `src/metrics.rs` |
+| `veld_write_stage_timeouts_total` | IntCounterVec | Write-path stages that exceeded 30 seconds | `src/metrics.rs` |
 
 ---
 
