@@ -4857,7 +4857,7 @@ impl super::MemorySystem {
         // constants::CE_TOP_MARGIN). Here it orders the leading results within the margin of
         // rank 1. An ordinal pin is left alone: time decides those, and the pin is re-asserted
         // at the end of recall.
-        // [signal: ce_top_order] Gated by the disabled_signals dial; on by default.
+        // [signal: ce_top_order] Gated by the disabled_signals dial; off while the margin is 0.
         let ce_top_margin = dials_snapshot
             .ce_top_margin
             .unwrap_or(crate::constants::CE_TOP_MARGIN);

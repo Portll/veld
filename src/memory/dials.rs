@@ -551,7 +551,7 @@ pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
         id: "ce_top_margin",
         group: "Rerank",
         label: "CE orders the top three",
-        default: 1.0,
+        default: 0.0,
         rec_lo: 0.2,
         rec_hi: 1.0,
         abs_lo: 0.0,

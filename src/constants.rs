@@ -2838,7 +2838,7 @@ pub const CE_TOP_ORDER_COUNT: usize = 3;
 
 /// Layer 5.97: a leading result joins the cross-encoder's ordering when its score is within
 /// this fraction of rank 1's. At 1.0 the cross-encoder orders the whole top
-/// [`CE_TOP_ORDER_COUNT`].
+/// [`CE_TOP_ORDER_COUNT`]; at 0 the layer is off, the default.
 ///
 /// At the Layer 5.3 share (0.18) the cross-encoder carries little of the final order under
 /// reciprocal-rank fusion: on the 394 LoCoMo cases outside the hold-out (run 40900902746) the
@@ -2849,8 +2849,11 @@ pub const CE_TOP_ORDER_COUNT: usize = 3;
 /// earlier spent cases; at margin 0.2, +0.040 and +0.066. On the 1,137 hold-out cases against
 /// the same tree with `ce_top_order` disabled (runs 40910643178 and 40910648322), paired: p@1
 /// +0.019 on redb (95% +0.005 to +0.033, 43 up, 21 down) and +0.019 on RocksDB (+0.004 to
-/// +0.033), MRR +0.011, recall@10 unchanged.
-pub const CE_TOP_MARGIN: f32 = 1.0;
+/// +0.033), MRR +0.011, recall@10 unchanged. On the train C3 tree (0886a28a: graph leg,
+/// mxbai-rerank-xsmall at 20) the gain no longer clears zero: margin 1.0 against the layer
+/// disabled (runs 40926734533 and 40981795041), p@1 +0.010 on both engines (95% -0.004 to
+/// +0.023, 36 up, 25 down), open-domain -0.043 (n = 70). Off until a hold-out shows a gain.
+pub const CE_TOP_MARGIN: f32 = 0.0;
 
 /// Minimum distinct query stems before coverage applies. With one term coverage is all or
 /// nothing and would punish every synonym match.
