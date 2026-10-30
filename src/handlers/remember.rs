@@ -145,6 +145,23 @@ pub(crate) fn snapshot_payload(
     })
 }
 
+/// Frames per writer-lock acquisition and fsync when journaling many.
+const JOURNAL_CHUNK: usize = 256;
+
+fn log_apply_errors(user_id: &str, outcomes: &[crate::intent_log::WriteOutcome]) {
+    for outcome in outcomes {
+        for err in &outcome.apply_errors {
+            tracing::warn!(
+                user_id = %user_id,
+                projection = %err.projection,
+                lsn = outcome.lsn.0,
+                error = %err.source,
+                "projection apply failed during journaled batch (log durable; replay will retry)",
+            );
+        }
+    }
+}
+
 /// Journal many frames for one tenant: one writer-lock acquisition and one
 /// fsync per chunk instead of per frame. Failure handling as
 /// [`journal_memory_snapshot`]: the store already holds the writes, so a
@@ -155,7 +172,6 @@ pub(crate) fn journal_batch(
     user_id: &str,
     payloads: &[crate::intent_log::IntentPayload],
 ) {
-    const CHUNK: usize = 256;
     if payloads.is_empty() {
         return;
     }
@@ -171,22 +187,10 @@ pub(crate) fn journal_batch(
             return;
         }
     };
-    for chunk in payloads.chunks(CHUNK) {
+    for chunk in payloads.chunks(JOURNAL_CHUNK) {
         let outcomes = writer.lock().record_and_apply_batch(chunk);
         match outcomes {
-            Ok(outcomes) => {
-                for outcome in &outcomes {
-                    for err in &outcome.apply_errors {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            projection = %err.projection,
-                            lsn = outcome.lsn.0,
-                            error = %err.source,
-                            "projection apply failed during journaled batch (log durable; replay will retry)",
-                        );
-                    }
-                }
-            }
+            Ok(outcomes) => log_apply_errors(user_id, &outcomes),
             Err(e) => tracing::warn!(
                 user_id = %user_id,
                 frames = chunk.len(),
@@ -206,22 +210,51 @@ pub(crate) fn journal_stored(
     ids: &[crate::memory::MemoryId],
     kind: SnapshotKind,
 ) {
-    let payloads: Vec<_> = {
-        let guard = memory.read();
-        ids.iter()
-            .filter_map(|id| match guard.get_memory(id) {
-                Ok(stored) => snapshot_payload(user_id, &stored, kind),
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %id.0,
-                        "snapshot not journaled, memory unreadable: {e}"
-                    );
-                    None
-                }
-            })
-            .collect()
+    if ids.is_empty() {
+        return;
+    }
+    let writer = match state.get_user_journaled_writer(user_id) {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                frames = ids.len(),
+                error = %e,
+                "intent-log journal unavailable; snapshots not journaled (store writes already durable)",
+            );
+            return;
+        }
     };
-    journal_batch(state, user_id, &payloads);
+    let store = memory.read().primary_store();
+    // Read under the journal's lock: a forget deletes from the store before it journals its
+    // Forget under this lock, so a snapshot read here either lands before that Forget or
+    // finds the memory gone. Read outside it, a snapshot of a memory forgotten meanwhile
+    // landed after its Forget, and replay and every follower brought the memory back.
+    let mut writer = writer.lock();
+    let payloads: Vec<_> = ids
+        .iter()
+        .filter_map(|id| match store.get(id) {
+            Ok(stored) => snapshot_payload(user_id, &stored, kind),
+            Err(e) => {
+                tracing::debug!(
+                    memory_id = %id.0,
+                    "snapshot not journaled, memory no longer stored: {e}"
+                );
+                None
+            }
+        })
+        .collect();
+    for chunk in payloads.chunks(JOURNAL_CHUNK) {
+        match writer.record_and_apply_batch(chunk) {
+            Ok(outcomes) => log_apply_errors(user_id, &outcomes),
+            Err(e) => tracing::warn!(
+                user_id = %user_id,
+                frames = chunk.len(),
+                error = %e,
+                "intent-log batch could not be journaled (store writes already durable)",
+            ),
+        }
+    }
 }
 
 /// Complete a journaled write's deferred embedding and journal a snapshot of

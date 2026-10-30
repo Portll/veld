@@ -2922,7 +2922,7 @@ impl MemorySystem {
                 // Persist so restarts retain the secondary embedding (parity with
                 // the primary, which is persisted above). No-op for the no-secondary
                 // common case since this branch is skipped entirely.
-                match self.long_term_memory.update(&memory) {
+                match self.rewrite_stored(&memory) {
                     Ok(()) => outcome.note_rewritten(memory_id),
                     Err(e) => {
                         tracing::warn!("Failed to persist background secondary embedding: {e}")
@@ -3063,7 +3063,7 @@ impl MemorySystem {
                                 {
                                     let before = old_memory.importance();
                                     old_memory.decay_importance(*decay_amount);
-                                    if self.long_term_memory.update(&old_memory).is_ok() {
+                                    if self.rewrite_stored(&old_memory).is_ok() {
                                         outcome.note_rewritten(&old_memory.id);
                                         if !old_memory.is_forgotten() {
                                             self.note_importance_change(
@@ -3079,7 +3079,7 @@ impl MemorySystem {
                         if interference_result.proactive_decay > 0.0 {
                             let before = memory_arc.importance();
                             memory_arc.decay_importance(interference_result.proactive_decay);
-                            if self.long_term_memory.update(&memory_arc).is_ok() {
+                            if self.rewrite_stored(&memory_arc).is_ok() {
                                 outcome.note_rewritten(memory_id);
                                 self.note_importance_change(before, memory_arc.importance());
                             }
@@ -3096,7 +3096,7 @@ impl MemorySystem {
                             );
                             let before = memory_arc.importance();
                             memory_arc.decay_importance(0.99);
-                            if self.long_term_memory.update(&memory_arc).is_ok() {
+                            if self.rewrite_stored(&memory_arc).is_ok() {
                                 outcome.note_rewritten(memory_id);
                                 self.note_importance_change(before, memory_arc.importance());
                             }
@@ -3137,6 +3137,33 @@ impl MemorySystem {
     /// importance and any tag it lacked, and the copy is soft-forgotten rather than
     /// deleted. Its id was returned when it was remembered, so the record stays
     /// readable, marked `absorbed_by`, while recall, listing and the indexes drop it.
+    /// Write back a record read before a slow step, only while the store still holds it.
+    /// A forget removes records under the same gate, so a deferred writer's copy cannot
+    /// bring back a memory forgotten meanwhile.
+    fn rewrite_stored(&self, memory: &Memory) -> Result<()> {
+        self.rewrite_stored_with(&memory.id, |stored| *stored = memory.clone())?
+            .map(drop)
+            .with_context(|| format!("memory {} is no longer stored", memory.id.0))
+    }
+
+    /// Read, change and write back a stored record under the write gate, so `apply` sees
+    /// every write that landed before it. `None` when the store no longer holds the record,
+    /// which a forget removed: nothing is written. `apply` runs inside the gate, so it must
+    /// not write, journal or forget.
+    pub(crate) fn rewrite_stored_with(
+        &self,
+        id: &MemoryId,
+        apply: impl FnOnce(&mut Memory),
+    ) -> Result<Option<Memory>> {
+        let _write_guard = self.write_lock.enter()?;
+        let Ok(mut memory) = self.long_term_memory.get(id) else {
+            return Ok(None);
+        };
+        apply(&mut memory);
+        self.long_term_memory.update(&memory)?;
+        Ok(Some(memory))
+    }
+
     fn absorb_redundant_memory(
         &self,
         absorbed: &Memory,
@@ -3152,7 +3179,7 @@ impl MemorySystem {
                 survivor.experience.tags.push(tag.clone());
             }
         }
-        match self.long_term_memory.update(&survivor) {
+        match self.rewrite_stored(&survivor) {
             Ok(()) => self.note_importance_change(survivor_importance, survivor.importance()),
             Err(e) => tracing::warn!(
                 survivor = %survivor.id.0,
@@ -3165,7 +3192,7 @@ impl MemorySystem {
         metadata.insert("forgotten".to_string(), "true".to_string());
         metadata.insert("forgotten_at".to_string(), chrono::Utc::now().to_rfc3339());
         metadata.insert("absorbed_by".to_string(), survivor.id.0.to_string());
-        if let Err(e) = self.long_term_memory.update(&forgotten) {
+        if let Err(e) = self.rewrite_stored(&forgotten) {
             tracing::warn!(
                 memory_id = %absorbed.id.0,
                 "Write gate: could not mark the absorbed memory forgotten, so it stays: {e}"
@@ -3228,7 +3255,7 @@ impl MemorySystem {
             duplicates::DUPLICATE_KIND_KEY.to_string(),
             duplicates::DuplicateKind::NearExact.label().to_string(),
         );
-        if let Err(e) = self.long_term_memory.update(&tagged) {
+        if let Err(e) = self.rewrite_stored(&tagged) {
             tracing::warn!(
                 memory_id = %duplicate.id.0,
                 "Write gate: could not tag a near-exact duplicate, so it stays untagged: {e}"
@@ -3255,7 +3282,7 @@ impl MemorySystem {
 
         let original_importance = original.importance();
         original.boost_importance(crate::constants::WRITE_GATE_ABSORPTION_BOOST);
-        match self.long_term_memory.update(&original) {
+        match self.rewrite_stored(&original) {
             Ok(()) => self.note_importance_change(original_importance, original.importance()),
             Err(e) => tracing::warn!(
                 original = %original.id.0,
@@ -3973,6 +4000,9 @@ impl MemorySystem {
     }
 
     fn forget_with(&self, criteria: ForgetCriteria, bm25: Bm25Sync) -> Result<usize> {
+        // Under the write gate, so a writer that re-reads a record under it before writing
+        // it back finds it gone instead of storing it again.
+        let _write_guard = self.write_lock.enter()?;
         let forgotten_count = match criteria {
             ForgetCriteria::ById(memory_id) => {
                 // Delete a single memory by ID from all tiers, tracking which tiers had it
@@ -5940,6 +5970,11 @@ impl MemorySystem {
     /// Get memory by ID from long-term storage
     pub fn get_memory(&self, id: &MemoryId) -> Result<Memory> {
         self.long_term_memory.get(id)
+    }
+
+    /// The tenant's primary store, for a reader that must not hold this system's lock.
+    pub fn primary_store(&self) -> Arc<dyn crate::storage::PrimaryMemoryStore> {
+        Arc::clone(&self.long_term_memory)
     }
 
     /// Get all memory IDs from long-term storage.
@@ -11434,6 +11469,56 @@ mod lifecycle_tests {
     fn stored_truth(system: &MemorySystem) -> (usize, f32) {
         let s = system.long_term_memory.get_stats().unwrap();
         (s.total_count, s.average_importance)
+    }
+
+    /// A deferred writer (embedding write-back, the write gate, interference) writes back a
+    /// copy it read before a slow step. A forget in between must not be undone by it.
+    #[test]
+    fn a_deferred_rewrite_does_not_store_a_forgotten_memory_again() {
+        for (backend, system, _tmp) in systems() {
+            let id = remember_text(&system, "The breakwater lights are tested each dusk.");
+            let changed = system
+                .rewrite_stored_with(&id, |m| m.set_importance(0.8))
+                .unwrap()
+                .expect("a stored memory is rewritten");
+            assert_eq!(
+                system.get_memory(&id).unwrap().importance(),
+                changed.importance(),
+                "{backend}"
+            );
+            let copy = system.get_memory(&id).unwrap();
+            system.forget(ForgetCriteria::ById(id.clone())).unwrap();
+            assert!(system.rewrite_stored(&copy).is_err(), "{backend}");
+            let applied = system
+                .rewrite_stored_with(&id, |m| m.set_importance(0.9))
+                .unwrap();
+            assert!(applied.is_none(), "{backend}");
+            assert!(
+                system.get_memory(&id).is_err(),
+                "{backend}: the forgotten memory was stored again"
+            );
+        }
+    }
+
+    /// A forget removes records under the write gate, so a writer inside it, which re-reads a
+    /// record before writing it back, never sees it vanish between the read and the write.
+    #[test]
+    fn a_forget_waits_for_the_writer_inside_the_gate() {
+        for (backend, system, _tmp) in systems() {
+            let id = remember_text(&system, "The slipway winch is greased in autumn.");
+            std::thread::scope(|scope| {
+                let gate = system.write_lock.enter().unwrap();
+                let forget = scope.spawn(|| system.forget(ForgetCriteria::ById(id.clone())));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                assert!(
+                    system.get_memory(&id).is_ok(),
+                    "{backend}: the forget ran while a writer held the gate"
+                );
+                drop(gate);
+                assert_eq!(forget.join().unwrap().unwrap(), 1, "{backend}");
+            });
+            assert!(system.get_memory(&id).is_err(), "{backend}");
+        }
     }
 
     #[test]

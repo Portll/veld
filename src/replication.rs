@@ -30,7 +30,7 @@
 //! the filesystem without opening the user's store, so an idle poll costs one
 //! `stat` per user on the leader.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -700,6 +700,11 @@ pub fn divergence(progress: &UserProgress, page: &FeedPage) -> Option<String> {
 /// after it. Earlier snapshots of the same id are superseded, so applying only the
 /// last one is the same final state at a fraction of the writes; logs are
 /// Update-heavy because every access and consolidation re-journals a memory.
+///
+/// A `Forget` wins over every later `Update` of its memory: an update rewrites a
+/// stored record and cannot bring back one the leader removed, so such a frame is a
+/// deferred write that raced the forget and is dropped. A later `Remember` stores the
+/// memory again.
 pub fn coalesce(frames: Vec<(u64, IntentPayload)>) -> Vec<(u64, IntentPayload)> {
     let mut order: Vec<String> = Vec::new();
     let mut by_id: HashMap<String, Vec<(u64, IntentPayload)>> = HashMap::new();
@@ -712,7 +717,24 @@ pub fn coalesce(frames: Vec<(u64, IntentPayload)>) -> Vec<(u64, IntentPayload)> 
     }
     let mut out = Vec::new();
     for id in order {
-        let mut frames = by_id.remove(&id).unwrap_or_default();
+        let mut forgotten = false;
+        let mut frames: Vec<_> = by_id
+            .remove(&id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, p)| match p {
+                IntentPayload::Forget { .. } => {
+                    forgotten = true;
+                    true
+                }
+                IntentPayload::Remember { .. } => {
+                    forgotten = false;
+                    true
+                }
+                IntentPayload::Update { .. } => !forgotten,
+                _ => true,
+            })
+            .collect();
         let last_snapshot = frames.iter().rposition(|(_, p)| {
             matches!(
                 p,
@@ -725,6 +747,24 @@ pub fn coalesce(frames: Vec<(u64, IntentPayload)>) -> Vec<(u64, IntentPayload)> 
         out.extend(frames);
     }
     out
+}
+
+/// The memories a page stores for the first time: those with a `Remember` frame that
+/// no `Forget` follows. Coalescing can leave such a memory with only its last `Update`.
+fn remembered_in(frames: &[(u64, IntentPayload)]) -> HashSet<String> {
+    let mut remembered = HashSet::new();
+    for (_, payload) in frames {
+        match payload {
+            IntentPayload::Remember { memory_id, .. } => {
+                remembered.insert(memory_id.clone());
+            }
+            IntentPayload::Forget { memory_id, .. } => {
+                remembered.remove(memory_id);
+            }
+            _ => {}
+        }
+    }
+    remembered
 }
 
 /// Refuse a page whose frames name a different tenant than the page they came in.
@@ -758,11 +798,37 @@ pub fn apply_replicated_page(
     leader: Option<&SlotSpaces>,
 ) -> Result<u64> {
     check_tenant(user_id, &frames)?;
-    let mut frames = coalesce(frames);
     if frames.is_empty() {
         return Ok(0);
     }
+    let remembered = remembered_in(&frames);
     let memory_sys = manager.get_user_memory(user_id)?;
+    // An update of a memory this follower does not hold, and the page does not store, is
+    // one a Forget in an earlier page removed: the race `coalesce` drops within a page.
+    let mut frames: Vec<_> = coalesce(frames)
+        .into_iter()
+        .filter(|(lsn, payload)| {
+            let IntentPayload::Update { memory_id, .. } = payload else {
+                return true;
+            };
+            if remembered.contains(memory_id) {
+                return true;
+            }
+            let held = uuid::Uuid::parse_str(memory_id)
+                .is_ok_and(|uuid| memory_sys.read().get_memory(&MemoryId(uuid)).is_ok());
+            if !held {
+                tracing::debug!(
+                    lsn,
+                    memory_id = %memory_id,
+                    "replication: dropped an update of a memory this follower does not hold"
+                );
+            }
+            held
+        })
+        .collect();
+    if frames.is_empty() {
+        return Ok(0);
+    }
     let mut snapshots: Vec<crate::memory::types::Memory> = Vec::new();
     let mut arrived: BTreeMap<SpaceId, usize> = BTreeMap::new();
     for (lsn, payload) in &mut frames {
@@ -2299,6 +2365,219 @@ mod tests {
         }
     }
 
+    fn logged_frames(
+        leader: &crate::handlers::test_helpers::TestHarness,
+        user: &str,
+    ) -> Vec<(u64, IntentPayload)> {
+        let writer = leader.state().get_user_journaled_writer(user).unwrap();
+        let writer = writer.lock();
+        writer
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| {
+                let (lsn, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                (lsn.0, payload)
+            })
+            .collect()
+    }
+
+    /// A remembered memory on the leader, then its log once a bulk forget removed it.
+    async fn remembered_then_forgotten(
+        leader: &crate::handlers::test_helpers::TestHarness,
+        user: &str,
+    ) -> (MemoryId, Vec<(u64, IntentPayload)>) {
+        use crate::handlers::test_helpers::{post_json, send};
+        use axum::http::StatusCode;
+
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/remember",
+                &serde_json::json!({
+                    "user_id": user,
+                    "content": "the tide gauge on the north mole is recalibrated",
+                    "tags": ["sweep"],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = MemoryId(uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap());
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/memories/bulk",
+                &serde_json::json!({ "user_id": user, "tags": ["sweep"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (id, logged_frames(leader, user))
+    }
+
+    /// The frame a deferred writer journaled when it read the memory before the forget and
+    /// appended after it: an `Update` of the remembered snapshot, after the `Forget`.
+    fn raced_update(frames: &[(u64, IntentPayload)], id: &MemoryId) -> (u64, IntentPayload) {
+        let id = id.0.to_string();
+        let (user_id, memory_bincode) = frames
+            .iter()
+            .find_map(|(_, p)| match p {
+                IntentPayload::Remember {
+                    user_id,
+                    memory_id,
+                    memory_bincode,
+                    ..
+                } if *memory_id == id => Some((user_id.clone(), memory_bincode.clone())),
+                _ => None,
+            })
+            .expect("the memory's Remember frame");
+        assert!(
+            frames.iter().any(
+                |(_, p)| matches!(p, IntentPayload::Forget { memory_id, .. } if *memory_id == id)
+            ),
+            "the bulk forget journaled a Forget"
+        );
+        let lsn = frames.last().map_or(0, |(lsn, _)| lsn + 1);
+        (
+            lsn,
+            IntentPayload::Update {
+                user_id,
+                memory_id: id,
+                memory_bincode,
+                schema_version: Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+    }
+
+    async fn follower_applies(
+        user: &'static str,
+        pages: Vec<Vec<(u64, IntentPayload)>>,
+    ) -> (Arc<MultiUserMemoryManager>, tempfile::TempDir) {
+        let (follower, tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        let follower = Arc::new(follower);
+        for page in pages {
+            let follower = Arc::clone(&follower);
+            tokio::task::spawn_blocking(move || apply_replicated_page(&follower, user, page, None))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        (follower, tmp)
+    }
+
+    /// An `Update` journaled after its memory's `Forget` (a deferred write racing a bulk
+    /// forget, as C2's red verdict caught) does not store the memory again on a follower,
+    /// whether the two frames arrive in one page or in two.
+    #[tokio::test]
+    async fn an_update_journaled_after_a_forget_does_not_bring_the_memory_back() {
+        let leader = crate::handlers::test_helpers::TestHarness::new();
+        let user = "replica-user";
+        let (id, frames) = remembered_then_forgotten(&leader, user).await;
+        let raced = raced_update(&frames, &id);
+
+        let mut one_page = frames.clone();
+        one_page.push(raced.clone());
+        let (follower, _tmp) = follower_applies(user, vec![one_page]).await;
+        assert!(
+            follower
+                .get_user_memory(user)
+                .unwrap()
+                .read()
+                .get_memory(&id)
+                .is_err(),
+            "one page: the forgotten memory came back"
+        );
+
+        let (follower, _tmp) = follower_applies(user, vec![frames, vec![raced]]).await;
+        assert!(
+            follower
+                .get_user_memory(user)
+                .unwrap()
+                .read()
+                .get_memory(&id)
+                .is_err(),
+            "two pages: the forgotten memory came back"
+        );
+    }
+
+    /// A deferred writer journals the record as the store holds it. When a forget removes it
+    /// between the writer's read and its append, the snapshot must not land after the
+    /// `Forget`. The test holds the journal while the writer starts, so a writer that reads
+    /// before taking the journal reads the memory before the forget.
+    #[tokio::test]
+    async fn a_snapshot_journaled_as_its_memory_is_forgotten_lands_before_the_forget() {
+        use crate::handlers::remember::{journal_stored, SnapshotKind};
+        use crate::handlers::test_helpers::{post_json, send};
+        use axum::http::StatusCode;
+
+        let leader = crate::handlers::test_helpers::TestHarness::new();
+        let user = "replica-user";
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/remember",
+                &serde_json::json!({
+                    "user_id": user,
+                    "content": "the pilot boat moorings were moved to the inner basin",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = MemoryId(uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap());
+
+        let state = leader.state();
+        let memory = state.get_user_memory(user).unwrap();
+        let writer = state.get_user_journaled_writer(user).unwrap();
+        let mut journal = writer.lock();
+        let deferred = {
+            let (state, memory, id) = (Arc::clone(&state), memory.clone(), id.clone());
+            std::thread::spawn(move || {
+                journal_stored(
+                    &state,
+                    &memory,
+                    user,
+                    std::slice::from_ref(&id),
+                    SnapshotKind::Update,
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (_, removed) = memory
+            .read()
+            .forget_collecting_removed(ForgetCriteria::ById(id.clone()))
+            .unwrap();
+        assert_eq!(removed, vec![id.clone()]);
+        journal
+            .record_and_apply_batch(&[IntentPayload::Forget {
+                user_id: user.to_string(),
+                memory_id: id.0.to_string(),
+                schema_version: Some(payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+            }])
+            .unwrap();
+        drop(journal);
+        deferred.join().unwrap();
+
+        let id = id.0.to_string();
+        let frames = logged_frames(&leader, user);
+        let forget = frames
+            .iter()
+            .position(
+                |(_, p)| matches!(p, IntentPayload::Forget { memory_id, .. } if *memory_id == id),
+            )
+            .expect("the Forget frame");
+        let late: Vec<u64> = frames[forget..]
+            .iter()
+            .filter(|(_, p)| p.memory_id() == id && !matches!(p, IntentPayload::Forget { .. }))
+            .map(|(lsn, _)| *lsn)
+            .collect();
+        assert!(
+            late.is_empty(),
+            "snapshots after the Forget at lsns {late:?}"
+        );
+    }
+
     /// A redb follower, as the live replica is.
     #[cfg(feature = "storage-redb")]
     fn redb_follower() -> (MultiUserMemoryManager, tempfile::TempDir) {
@@ -2540,6 +2819,24 @@ mod tests {
         ];
         let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
         assert_eq!(out, vec![2]);
+    }
+
+    #[test]
+    fn coalesce_drops_an_update_that_follows_a_forget() {
+        let page = vec![
+            frame(0, "a", "remember"),
+            frame(1, "a", "forget"),
+            frame(2, "a", "update"),
+            frame(3, "b", "forget"),
+            frame(4, "b", "update"),
+            frame(5, "c", "forget"),
+            frame(6, "c", "remember"),
+            frame(7, "c", "update"),
+        ];
+        let out: Vec<u64> = coalesce(page).into_iter().map(|(l, _)| l).collect();
+        // a: its snapshot and the forget, not the update; b: the forget alone; c: stored
+        // again, so its last update stands.
+        assert_eq!(out, vec![0, 1, 3, 7]);
     }
 
     #[test]
