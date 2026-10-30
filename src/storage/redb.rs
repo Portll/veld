@@ -2778,6 +2778,34 @@ mod redb_domain_tests {
         assert!(store.get_memory(&id).unwrap().is_some());
     }
 
+    /// A record in the value envelope, as the writer that follows this reader stores it, reads
+    /// back next to a plain one and survives cleanup.
+    #[test]
+    fn an_enveloped_record_reads_and_survives_cleanup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = RedbPrimaryMemoryStore::open(tmp.path()).expect("open");
+        let body = "the harbour crane is serviced in spring. ".repeat(40);
+        let enveloped = memory_with(&body, &["Veld"], &[]);
+        let value = crate::storage::value_envelope::wrap(encode(&enveloped).unwrap());
+        assert!(crate::storage::value_envelope::is_enveloped(&value));
+        table_put(
+            &store.database,
+            store.durability(),
+            MEMORIES_TABLE,
+            enveloped.id.0.as_bytes(),
+            &value,
+        )
+        .unwrap();
+        let plain = memory_with(&body, &["Veld"], &[]);
+        store.store(&plain).unwrap();
+
+        for memory in [&enveloped, &plain] {
+            assert_eq!(store.get(&memory.id).unwrap().experience.content, body);
+        }
+        assert_eq!(store.cleanup_corrupted().unwrap(), 0);
+        assert!(store.get_memory(&enveloped.id).unwrap().is_some());
+    }
+
     fn found_by_tag(store: &RedbPrimaryMemoryStore, tag: &str) -> Vec<MemoryId> {
         store
             .search(SearchCriteria::ByTags(vec![tag.to_string()]))

@@ -465,7 +465,7 @@ fn open_sealed(
             .decrypt_record(value, key)
             .map_err(|e| format!("does not open under the keystore: {e}"))?,
     );
-    if !crate::memory::storage::is_current_memory_encoding(&plaintext) {
+    if !crate::memory::storage::is_current_memory_value(&plaintext) {
         return Err("opens, but not to a memory in the current layout".to_string());
     }
     Ok(())

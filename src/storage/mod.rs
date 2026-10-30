@@ -20,6 +20,7 @@ pub mod relational;
 mod stored_enums;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod value_envelope;
 pub mod write_latch;
 
 use anyhow::Result;
