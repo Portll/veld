@@ -3,6 +3,8 @@
 // lane-veld-<track> (route 'veld', so spine's own workers leave it alone), a job is claimed through
 // spine's conditional update so two runners never take the same one, and each status the runner
 // records is mirrored onto its task. Jobs finished before this stay in the files only.
+// sweep returns this machine's veld jobs whose claiming runner died, through spine's lane/reload.mjs;
+// it is null on a spine without it.
 import { join } from 'node:path';
 import { hostname } from 'node:os';
 import * as PATHS from '../paths.mjs';
@@ -14,6 +16,7 @@ export const planFor = (job) => `lane-veld-${job.track || 'pli'}`;
 export async function spineQueue({ path, spineRepo = PATHS.SPINE_REPO } = {}) {
   const store = await import(join(spineRepo, 'db.mjs'));
   const lane = await import(join(spineRepo, 'lane', 'bank.mjs'));
+  const reload = await import(join(spineRepo, 'lane', 'reload.mjs')).catch(() => ({}));
   const db = path ? store.open(path) : store.open();
   let index = new Map();
 
@@ -71,5 +74,10 @@ export async function spineQueue({ path, spineRepo = PATHS.SPINE_REPO } = {}) {
     }
   };
 
-  return { db, sync, claim, mirror, reindex };
+  /** Requeues every veld lane's jobs claimed on this machine by a dead pid, logging each; returns their ids. */
+  const sweep = reload.sweepVeld && reload.veldLanes
+    ? (log, { agents } = {}) => reload.sweepVeld(db, reload.veldLanes(agents), { log })
+    : null;
+
+  return { db, sync, claim, mirror, reindex, sweep };
 }

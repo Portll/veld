@@ -671,12 +671,22 @@ async function once() {
   return true;
 }
 
+// A runner that dies mid-job leaves its claim active; a host with no spine lane has nothing else to return it.
+function sweepStranded() {
+  try { SQ.sweep(log); } catch (e) { log(`veld sweep failed: ${e.message}`); }
+}
+
 const STOP = join(ROOT, 'STOP');
 const RESTART = join(ROOT, 'RESTART');
+const VELD_SWEEP_MS = 10 * 60 * 1000;
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   log(`runner up on ${HOST}, pid ${process.pid}`);
   const { spineQueue } = await import('./spine-queue.mjs');
   SQ = await spineQueue().catch((e) => { log(`spine queue unavailable, the files are the queue: ${e.message}`); return null; });
+  if (SQ?.sweep) {
+    sweepStranded();
+    setInterval(sweepStranded, VELD_SWEEP_MS).unref();
+  } else if (SQ) log(`spine at ${PATHS.SPINE_REPO} has no veld sweep; a stranded job waits for a deploy`);
   for (;;) {
     if (existsSync(STOP) || existsSync(`${STOP}-${HOST}`)) { log('STOP file present; exiting'); break; }
     if (existsSync(`${RESTART}-${HOST}`)) { rmSync(`${RESTART}-${HOST}`, { force: true }); log('RESTART file present; exiting for the supervisor to restart'); break; }
