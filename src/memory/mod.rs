@@ -8628,6 +8628,13 @@ impl MemorySystem {
             duration_ms
         );
 
+        let mut rewritten = std::mem::take(&mut *self.unjournaled_rewrites.lock());
+        for id in self.retriever.take_unjournaled_stamps() {
+            if !rewritten.contains(&id) {
+                rewritten.push(id);
+            }
+        }
+
         Ok(MaintenanceResult {
             decayed_count,
             edge_boosts: replay_result.edge_boosts,
@@ -8636,7 +8643,7 @@ impl MemorySystem {
             total_priority_score: replay_result.total_priority_score,
             facts_extracted: facts_extracted_count,
             facts_reinforced: facts_reinforced_count,
-            rewritten: std::mem::take(&mut *self.unjournaled_rewrites.lock()),
+            rewritten,
         })
     }
 

@@ -102,6 +102,9 @@ pub struct RetrievalEngine {
     secondary_index_space: Option<SpaceId>,
     /// Where a refusal is recorded: the ledger the memory system drains, over the same store.
     backlog: EmbeddingBacklogStore,
+    /// Memories the open-time space stamp rewrote. The stamp runs before any maintenance
+    /// cycle, so they wait here for the first one to hand them to its journaling caller.
+    stamped_unjournaled: parking_lot::Mutex<Vec<MemoryId>>,
     /// The distribution of each space's best search similarity, learned from its searches and
     /// seeded from the space registry at start.
     score_stats: RwLock<std::collections::HashMap<SpaceId, space::ScoreStats>>,
@@ -131,6 +134,9 @@ pub struct RetireReport {
     pub space: SpaceId,
     pub vectors_dropped: usize,
     pub maps_removed: usize,
+    /// The memories whose stored record lost a vector, for the caller to journal.
+    #[serde(skip)]
+    pub rewritten: Vec<MemoryId>,
 }
 
 /// Put `vector` in the memory's primary slot, keeping the vector it replaces beside it.
@@ -304,6 +310,7 @@ impl RetrievalEngine {
             index_space,
             secondary_index_space,
             backlog,
+            stamped_unjournaled: parking_lot::Mutex::new(Vec::new()),
             storage_path,
             consolidation_events,
         };
@@ -496,7 +503,7 @@ impl RetrievalEngine {
     /// Stamp every vector that has no space, now: the one case a stamp cannot wait for the
     /// drain. No embedding, a rewrite of each record that changes.
     fn stamp_now(&self, corpus: Option<&SpaceId>, ids: &[MemoryId]) {
-        let mut stamped = 0usize;
+        let mut stamped = Vec::new();
         for id in ids {
             let Ok(mut memory) = self.storage.get(id) else {
                 continue;
@@ -520,12 +527,21 @@ impl RetrievalEngine {
                 .stamp_vector_spaces(primary.as_ref(), secondary.as_ref())
             {
                 match self.storage.update(&memory) {
-                    Ok(()) => stamped += 1,
+                    Ok(()) => stamped.push(id.clone()),
                     Err(e) => warn!("Failed to stamp embedding spaces for {}: {}", id.0, e),
                 }
             }
         }
-        info!(stamped, "Stamped embedding spaces before the markers moved");
+        info!(
+            stamped = stamped.len(),
+            "Stamped embedding spaces before the markers moved"
+        );
+        self.stamped_unjournaled.lock().extend(stamped);
+    }
+
+    /// The memories the open-time space stamp rewrote and no caller has journaled yet.
+    pub fn take_unjournaled_stamps(&self) -> Vec<MemoryId> {
+        std::mem::take(&mut *self.stamped_unjournaled.lock())
     }
 
     /// The corpus's space migration, finished or not, when one was ever recorded.
@@ -1695,7 +1711,7 @@ impl RetrievalEngine {
                 "{sole} memories hold a vector only in {space}; they need a vector in another space before it can be retired"
             );
         }
-        let mut dropped = 0usize;
+        let mut rewritten = Vec::with_capacity(holders.len());
         for mut memory in holders {
             let experience = &mut memory.experience;
             if experience.primary_space(Some(&self.index_space)).as_ref() == Some(space) {
@@ -1710,7 +1726,7 @@ impl RetrievalEngine {
             }
             experience.forget_kept_vector(space);
             match self.storage.update(&memory) {
-                Ok(()) => dropped += 1,
+                Ok(()) => rewritten.push(memory.id.clone()),
                 Err(e) => warn!("Retiring {space}: cannot persist {}: {e}", memory.id.0),
             }
         }
@@ -1730,11 +1746,12 @@ impl RetrievalEngine {
         if self.space_indexes.write().remove(space).is_some() {
             let _ = fs::remove_dir_all(super::space_index::dir_for(&self.storage_path, space));
         }
-        info!(space = %space, dropped, maps_removed, "Retired an embedding space");
+        info!(space = %space, dropped = rewritten.len(), maps_removed, "Retired an embedding space");
         Ok(RetireReport {
             space: space.clone(),
-            vectors_dropped: dropped,
+            vectors_dropped: rewritten.len(),
             maps_removed,
+            rewritten,
         })
     }
 
@@ -3187,6 +3204,7 @@ impl RetrievalEngine {
                         // PERSIST: Write updated memory back to durable storage
                         if self.storage.update(&memory).is_ok() {
                             stats.importance_boosts += 1;
+                            stats.rewritten.push(id.clone());
                         }
                     }
                 }
@@ -3203,6 +3221,7 @@ impl RetrievalEngine {
                         // PERSIST: Write updated memory back to durable storage
                         if self.storage.update(&memory).is_ok() {
                             stats.importance_decays += 1;
+                            stats.rewritten.push(id.clone());
                         }
                     }
                 }
@@ -3280,6 +3299,10 @@ pub struct ReinforcementStats {
     pub outcome: RetrievalOutcome,
     /// How many persistence operations failed (non-zero indicates data loss risk)
     pub persist_failures: usize,
+    /// Memories whose importance or confidence was rewritten in the store, for the caller to
+    /// journal. An access-only reinforcement rewrites nothing a follower is sent, as recall's
+    /// own access stamps are not.
+    pub rewritten: Vec<MemoryId>,
 }
 
 // NOTE: MemoryGraph has been consolidated into GraphMemory (src/graph_memory.rs)
@@ -4154,6 +4177,25 @@ mod space_tests {
     }
 
     #[test]
+    fn the_open_time_stamp_hands_back_what_it_rewrote_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let a = Stub::new("model-a", DIM);
+        let legacy = memory("written before spaces", Some(a.encode("x").unwrap()));
+        store.store(&legacy).unwrap();
+        markers(tmp.path(), &a.id, DIM);
+
+        let b = engine(&store, tmp.path(), Stub::new("model-b", DIM), None);
+        assert_eq!(
+            store.get(&legacy.id).unwrap().experience.embedding_space,
+            Some(SpaceId::new("model-a", DIM)),
+            "an embedder change stamps the old vectors at open"
+        );
+        assert_eq!(b.take_unjournaled_stamps(), vec![legacy.id.clone()]);
+        assert!(b.take_unjournaled_stamps().is_empty());
+    }
+
+    #[test]
     fn an_embedder_change_keeps_the_old_space_on_what_it_could_not_re_embed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store(tmp.path());
@@ -4472,6 +4514,11 @@ mod space_tests {
 
         let report = engine.retire_space(&old).unwrap();
         assert_eq!(report.vectors_dropped, 1);
+        assert_eq!(
+            report.rewritten,
+            vec![both.id.clone()],
+            "the rewritten record is handed back to be journaled"
+        );
         assert!(store
             .get(&both.id)
             .unwrap()

@@ -1597,29 +1597,53 @@ pub async fn proactive_context(
             let graph_for_reinforce = graph_memory.clone();
             let helpful_ids_for_graph = helpful_ids.clone();
             let evidence_source_for_feedback = evidence_source.clone();
+            let state_for_journal = state.clone();
+            let user_id_for_journal = req.user_id.clone();
             tokio::task::spawn_blocking(move || {
-                let memory_guard = memory_sys_for_reinforce.read();
+                let mut rewritten = Vec::new();
+                {
+                    let memory_guard = memory_sys_for_reinforce.read();
 
-                // Reinforce helpful memories (importance boost)
-                if !helpful_ids.is_empty() {
-                    if let Err(e) = memory_guard.reinforce_recall_from(
-                        &helpful_ids,
-                        crate::memory::RetrievalOutcome::Helpful,
-                        &evidence_source_for_feedback,
-                    ) {
-                        tracing::warn!("Failed to reinforce helpful memories: {}", e);
+                    // Reinforce helpful memories (importance boost)
+                    if !helpful_ids.is_empty() {
+                        match memory_guard.reinforce_recall_from(
+                            &helpful_ids,
+                            crate::memory::RetrievalOutcome::Helpful,
+                            &evidence_source_for_feedback,
+                        ) {
+                            Ok(stats) => rewritten.extend(stats.rewritten),
+                            Err(e) => tracing::warn!("Failed to reinforce helpful memories: {}", e),
+                        }
+                    }
+
+                    // Weaken misleading memories (importance decay)
+                    if !misleading_ids.is_empty() {
+                        match memory_guard.reinforce_recall_from(
+                            &misleading_ids,
+                            crate::memory::RetrievalOutcome::Misleading,
+                            &evidence_source_for_feedback,
+                        ) {
+                            Ok(stats) => rewritten.extend(stats.rewritten),
+                            Err(e) => tracing::warn!("Failed to weaken misleading memories: {}", e),
+                        }
                     }
                 }
-
-                // Weaken misleading memories (importance decay)
-                if !misleading_ids.is_empty() {
-                    if let Err(e) = memory_guard.reinforce_recall_from(
-                        &misleading_ids,
-                        crate::memory::RetrievalOutcome::Misleading,
-                        &evidence_source_for_feedback,
-                    ) {
-                        tracing::warn!("Failed to weaken misleading memories: {}", e);
-                    }
+                // This route answers every prompt, so the journal fsync runs after the reply,
+                // tracked so shutdown waits for it.
+                if !rewritten.is_empty() {
+                    let memory = memory_sys_for_reinforce.clone();
+                    state_for_journal
+                        .clone()
+                        .task_tracker
+                        .spawn_blocking(move || {
+                            super::remember::journal_stored(
+                                &state_for_journal,
+                                &memory,
+                                &user_id_for_journal,
+                                &rewritten,
+                                super::remember::SnapshotKind::Update,
+                            )
+                        });
                 }
 
                 // Strengthen graph edges for helpful memories (Hebbian: "what fires together, wires together")
@@ -2976,9 +3000,21 @@ pub async fn reinforce_feedback(
         .to_string();
     let stats = {
         let memory = memory.clone();
+        let state = state.clone();
+        let user_id = req.user_id.clone();
         tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            memory_guard.reinforce_recall_from(&memory_ids, outcome, &evidence_source)
+            let stats =
+                memory
+                    .read()
+                    .reinforce_recall_from(&memory_ids, outcome, &evidence_source)?;
+            super::remember::journal_stored(
+                &state,
+                &memory,
+                &user_id,
+                &stats.rewritten,
+                super::remember::SnapshotKind::Update,
+            );
+            Ok::<_, anyhow::Error>(stats)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?

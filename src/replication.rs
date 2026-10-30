@@ -3319,7 +3319,101 @@ mod tests {
                 "after {after}: metadata of {}",
                 id.0
             );
+            assert_eq!(
+                got.importance().to_bits(),
+                want.importance().to_bits(),
+                "after {after}: importance of {}",
+                id.0
+            );
+            assert_eq!(
+                got.calibrated_confidence().to_bits(),
+                want.calibrated_confidence().to_bits(),
+                "after {after}: calibrated confidence of {}",
+                id.0
+            );
         }
+    }
+
+    /// Feedback rewrote a stored memory's importance and journaled nothing, so a follower
+    /// ranked it on the importance it had before the feedback (redb-equivalence 9.9). It also
+    /// persisted the working-memory copy cached before the deferred embed, which erased the
+    /// stored vector.
+    #[tokio::test]
+    async fn reinforcement_reaches_the_follower() {
+        use crate::handlers::test_helpers::{post_json, send, TestHarness};
+        use axum::http::StatusCode;
+
+        let leader = TestHarness::new();
+        let state = leader.state();
+        let user = "reinforce-user";
+        let ids: Vec<MemoryId> = {
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                let memory = state.get_user_memory(user).unwrap();
+                [
+                    "the harbour crane is serviced every second Tuesday",
+                    "the lighthouse keeper logs the wind at dawn",
+                ]
+                .into_iter()
+                .map(|content| {
+                    let id = crate::handlers::remember::remember_journaled(
+                        &state,
+                        &memory,
+                        user,
+                        crate::memory::types::Experience {
+                            content: content.to_string(),
+                            ..Default::default()
+                        },
+                        None,
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .id;
+                    crate::handlers::remember::embed_journaled(&state, &memory, user, &id);
+                    id
+                })
+                .collect()
+            })
+            .await
+            .unwrap()
+        };
+        assert_follower_matches(&state, user, &ids, "remember");
+        let memory = state.get_user_memory(user).unwrap();
+        let before: Vec<f32> = ids
+            .iter()
+            .map(|id| memory.read().get_memory(id).unwrap().importance())
+            .collect();
+
+        for (id, outcome) in ids.iter().zip(["helpful", "misleading"]) {
+            let (status, body) = send(
+                leader.router(),
+                post_json(
+                    "/api/reinforce",
+                    &serde_json::json!({
+                        "user_id": user,
+                        "ids": [id.0.to_string()],
+                        "outcome": outcome,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        for (id, was) in ids.iter().zip(before) {
+            let stored = memory.read().get_memory(id).unwrap();
+            assert_ne!(
+                stored.importance().to_bits(),
+                was.to_bits(),
+                "feedback left the importance of {} unchanged",
+                id.0
+            );
+            assert!(
+                stored.experience.embeddings.is_some(),
+                "feedback wrote back a cached copy of {} that predates its vector",
+                id.0
+            );
+        }
+        assert_follower_matches(&state, user, &ids, "reinforcement");
     }
 
     /// The leader's own rewrites of stored records (a full re-embed, compression in a heavy
