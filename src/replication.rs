@@ -3269,6 +3269,134 @@ mod tests {
         }
     }
 
+    /// Every frame in `user`'s log on `leader`, oldest first.
+    fn leader_log(leader: &MultiUserMemoryManager, user: &str) -> Vec<(u64, IntentPayload)> {
+        let writer = leader.get_user_journaled_writer(user).unwrap();
+        let writer = writer.lock();
+        writer
+            .log()
+            .iter()
+            .unwrap()
+            .map(|record| {
+                let (lsn, payload) = payload::decode_record(&record.unwrap()).unwrap();
+                (lsn.0, payload)
+            })
+            .collect()
+    }
+
+    /// A fresh follower replays the leader's whole log, and each of `ids` holds what the
+    /// leader's store holds.
+    fn assert_follower_matches(
+        leader: &MultiUserMemoryManager,
+        user: &str,
+        ids: &[MemoryId],
+        after: &str,
+    ) {
+        let (follower, _tmp) = crate::handlers::test_helpers::TestHarness::fresh_manager();
+        apply_replicated_page(&follower, user, leader_log(leader, user), None).unwrap();
+        let leader_sys = leader.get_user_memory(user).unwrap();
+        let follower_sys = follower.get_user_memory(user).unwrap();
+        for id in ids {
+            let want = leader_sys.read().get_memory(id).unwrap();
+            let got = follower_sys.read().get_memory(id).unwrap();
+            assert_eq!(
+                got.experience.content, want.experience.content,
+                "after {after}: content of {}",
+                id.0
+            );
+            assert_eq!(
+                got.experience.embeddings, want.experience.embeddings,
+                "after {after}: vector of {}",
+                id.0
+            );
+            assert_eq!(
+                got.compressed, want.compressed,
+                "after {after}: compressed flag of {}",
+                id.0
+            );
+            assert_eq!(
+                got.experience.metadata, want.experience.metadata,
+                "after {after}: metadata of {}",
+                id.0
+            );
+        }
+    }
+
+    /// The leader's own rewrites of stored records (a full re-embed, compression in a heavy
+    /// maintenance cycle) changed content and vectors without a frame, so the live replica
+    /// kept the old copies (redb soak 9.7). Each now journals an `Update`.
+    #[tokio::test]
+    async fn leader_rewrites_reach_the_follower_with_content_and_vectors() {
+        use crate::handlers::test_helpers::{post_json, send, TestHarness};
+        use axum::http::StatusCode;
+
+        let leader = TestHarness::new();
+        let state = leader.state();
+        let user = "rewrite-user";
+        let aged = chrono::Utc::now() - chrono::Duration::days(400);
+        let ids: Vec<MemoryId> = {
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                let memory = state.get_user_memory(user).unwrap();
+                [
+                    "the breakwater lights were rewired after the storm",
+                    "the ferry timetable changes in the first week of October",
+                ]
+                .into_iter()
+                .map(|content| {
+                    crate::handlers::remember::remember_journaled(
+                        &state,
+                        &memory,
+                        user,
+                        crate::memory::types::Experience {
+                            content: content.to_string(),
+                            ..Default::default()
+                        },
+                        Some(aged),
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .id
+                })
+                .collect()
+            })
+            .await
+            .unwrap()
+        };
+        assert_follower_matches(&state, user, &ids, "remember");
+
+        let (status, body) = send(
+            leader.router(),
+            post_json(
+                "/api/index/reembed",
+                &serde_json::json!({ "user_id": user }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["reembedded"], 2, "{body}");
+        assert_follower_matches(&state, user, &ids, "reembed_all");
+
+        let memory = state.get_user_memory(user).unwrap();
+        let result = {
+            let state = state.clone();
+            let memory = memory.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::handlers::consolidation::run_maintenance_journaled(
+                    &state, &memory, user, 1.0,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        for id in &ids {
+            assert!(result.rewritten.contains(id), "{} not compressed", id.0);
+            assert!(memory.read().get_memory(id).unwrap().compressed);
+        }
+        assert_follower_matches(&state, user, &ids, "compression");
+    }
+
     /// A redb follower, as the live replica is.
     #[cfg(feature = "storage-redb")]
     fn redb_follower() -> (MultiUserMemoryManager, tempfile::TempDir) {

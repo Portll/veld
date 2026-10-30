@@ -3495,6 +3495,22 @@ impl MultiUserMemoryManager {
                 break;
             }
 
+            // After the read guard above is dropped: journaling reads the tenant again.
+            if let Some(result) = maintenance_result
+                .as_ref()
+                .filter(|r| !r.rewritten.is_empty())
+            {
+                if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                    crate::handlers::remember::journal_stored(
+                        self,
+                        &memory_lock,
+                        &user_id,
+                        &result.rewritten,
+                        crate::handlers::remember::SnapshotKind::Update,
+                    );
+                }
+            }
+
             // Direction 1: Edge strengthening + promotion boost propagation
             if let Some(ref result) = maintenance_result {
                 if !result.edge_boosts.is_empty() {

@@ -464,6 +464,11 @@ pub struct MemorySystem {
     /// Memories a request stored without embedding, waiting for the next batch.
     embed_queue: parking_lot::Mutex<embed_queue::EmbedQueue>,
 
+    /// Stored records compression rewrote since the last maintenance cycle took them. They
+    /// reach the intent log through [`MaintenanceResult::rewritten`]; until then a follower
+    /// holds the uncompressed copy.
+    unjournaled_rewrites: parking_lot::Mutex<Vec<MemoryId>>,
+
     /// Vectors replicated in spaces this corpus does not index, by space, and when the next
     /// map into each is tried.
     replica_spaces: parking_lot::Mutex<std::collections::HashMap<SpaceId, ReplicaTally>>,
@@ -1761,6 +1766,7 @@ impl MemorySystem {
             ),
             space_registry_written: parking_lot::Mutex::new(None),
             embed_queue: parking_lot::Mutex::new(Default::default()),
+            unjournaled_rewrites: parking_lot::Mutex::new(Vec::new()),
             replica_spaces: parking_lot::Mutex::new(Default::default()),
             kept_census: parking_lot::Mutex::new(None),
             // R3a (F3): per-user persistent learned-weight store over this user's
@@ -4960,7 +4966,8 @@ impl MemorySystem {
             owned_memory.promote(); // Session -> LongTerm
 
             // Compress if old enough
-            let compressed_memory = if self.should_compress(&owned_memory) {
+            let compress = self.should_compress(&owned_memory);
+            let compressed_memory = if compress {
                 self.compressor.compress(&owned_memory)?
             } else {
                 owned_memory
@@ -4968,6 +4975,9 @@ impl MemorySystem {
 
             // Store in long-term
             self.long_term_memory.store(&compressed_memory)?;
+            if compress {
+                self.note_unjournaled_rewrite(&compressed_memory.id);
+            }
 
             // PRODUCTION: Index memory in Vamana vector DB for semantic search.
             // Don't fail promotion if indexing fails - memory is still stored
@@ -5198,12 +5208,20 @@ impl MemorySystem {
             }
             let compressed = self.compressor.compress(&memory)?;
             self.long_term_memory.update(&compressed)?;
+            self.note_unjournaled_rewrite(&compressed.id);
             self.note_importance_change(memory.importance(), compressed.importance());
             self.stats.write().compressed_count += 1;
             compressed_count += 1;
         }
 
         Ok(compressed_count)
+    }
+
+    fn note_unjournaled_rewrite(&self, id: &MemoryId) {
+        let mut rewrites = self.unjournaled_rewrites.lock();
+        if !rewrites.contains(id) {
+            rewrites.push(id.clone());
+        }
     }
 
     /// Check if a memory should be compressed
@@ -6582,8 +6600,8 @@ impl MemorySystem {
     ///
     /// Clears pre-computed embeddings and re-indexes every memory through the
     /// new `extract_searchable_text()` path which prepends `[project | topic | type]`.
-    /// Returns (re-embedded count, failed count).
-    pub fn reembed_all(&self) -> Result<(usize, usize)> {
+    /// A journaling caller MUST journal an `Update` for each of the report's `rewritten`.
+    pub fn reembed_all(&self) -> Result<retrieval::ReembedReport> {
         tracing::info!("Starting context-prefix re-embedding migration");
         let result = self.retriever.reembed_all()?;
 
@@ -6597,8 +6615,8 @@ impl MemorySystem {
         }
 
         tracing::info!(
-            reembedded = result.0,
-            failed = result.1,
+            reembedded = result.reembedded,
+            failed = result.failed,
             "Re-embedding migration complete"
         );
 
@@ -8618,6 +8636,7 @@ impl MemorySystem {
             total_priority_score: replay_result.total_priority_score,
             facts_extracted: facts_extracted_count,
             facts_reinforced: facts_reinforced_count,
+            rewritten: std::mem::take(&mut *self.unjournaled_rewrites.lock()),
         })
     }
 

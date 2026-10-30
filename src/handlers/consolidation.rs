@@ -199,11 +199,11 @@ pub async fn consolidate_memories(
             return;
         }
         let maintenance_result = {
+            let state = state_clone.clone();
             let memory = memory.clone();
             let uid = user_id.clone();
             match tokio::task::spawn_blocking(move || {
-                let memory_guard = memory.read();
-                memory_guard.run_maintenance(decay_factor, &uid, true)
+                run_maintenance_journaled(&state, &memory, &uid, decay_factor)
             })
             .await
             {
@@ -639,11 +639,11 @@ pub async fn sleep_phase_consolidation(
             return;
         }
         let maintenance_result = {
+            let state = state_clone.clone();
             let memory = memory.clone();
             let uid = user_id.clone();
             match tokio::task::spawn_blocking(move || {
-                let memory_guard = memory.read();
-                memory_guard.run_maintenance(decay_factor, &uid, true)
+                run_maintenance_journaled(&state, &memory, &uid, decay_factor)
             })
             .await
             {
@@ -1069,14 +1069,50 @@ pub async fn reembed_all(
         .await
         .map_err(AppError::Internal)?;
 
-    let memory_guard = memory_sys.read();
-    let (reembedded, failed) = memory_guard.reembed_all().map_err(AppError::Internal)?;
+    // Blocking, and journaled in the same task, so a dropped request still journals every
+    // record the pass rewrote.
+    let report = {
+        let user_id = req.user_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let report = memory_sys.read().reembed_all()?;
+            super::remember::journal_stored(
+                &state,
+                &memory_sys,
+                &user_id,
+                &report.rewritten,
+                super::remember::SnapshotKind::Update,
+            );
+            anyhow::Ok(report)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("re-embed task failed: {e}")))?
+        .map_err(AppError::Internal)?
+    };
 
     Ok(Json(ReembedResponse {
         success: true,
-        reembedded,
-        failed,
+        reembedded: report.reembedded,
+        failed: report.failed,
     }))
+}
+
+/// A heavy maintenance cycle for one tenant, then an `Update` journaled for every record it
+/// rewrote. Blocking.
+pub(crate) fn run_maintenance_journaled(
+    state: &MultiUserMemoryManager,
+    memory: &crate::user_memory::SharedUserMemory,
+    user_id: &str,
+    decay_factor: f32,
+) -> anyhow::Result<crate::memory::types::MaintenanceResult> {
+    let result = memory.read().run_maintenance(decay_factor, user_id, true)?;
+    super::remember::journal_stored(
+        state,
+        memory,
+        user_id,
+        &result.rewritten,
+        super::remember::SnapshotKind::Update,
+    );
+    Ok(result)
 }
 
 // =============================================================================
