@@ -82,6 +82,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_MAX_USERS` | — | `src/config.rs` |
 | `VELD_MEMORY_PATH` | — | `src/config.rs` |
 | `VELD_METRICS_PUBLIC` | — | `src/config.rs` |
+| `VELD_MODEL_IDLE_UNLOAD_SECS` | — | `src/embeddings/idle_unload.rs` |
 | `VELD_MODEL_PATH` | — | `src/embeddings/minilm.rs` |
 | `VELD_MSSQL_ADO_STRING` | — | `src/config.rs` |
 | `VELD_MULTI_TENANT` | — | `src/config.rs` |

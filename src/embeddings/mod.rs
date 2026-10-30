@@ -34,6 +34,7 @@ pub mod competitive;
 pub mod cross_encoder;
 pub mod downloader;
 pub mod http_embedder;
+pub(crate) mod idle_unload;
 pub mod keywords;
 pub mod minilm;
 pub mod model_tape;

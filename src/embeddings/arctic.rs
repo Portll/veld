@@ -29,9 +29,10 @@ use ort::session::Session;
 use ort::value::Value;
 use parking_lot::{Mutex, MutexGuard};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
+use super::idle_unload::ModelSlot;
 use super::minilm::OrtThreading;
 use super::Embedder;
 
@@ -325,7 +326,8 @@ fn normalized(mut v: Vec<f32>) -> Vec<f32> {
 pub struct ArcticEmbedder {
     config: ArcticConfig,
     threading: OrtThreading,
-    lazy_model: OnceLock<Result<Arc<LazyArcticModel>, String>>,
+    /// Loaded on first use; dropped while idle when `VELD_MODEL_IDLE_UNLOAD_SECS` is set.
+    lazy_model: Arc<ModelSlot<LazyArcticModel>>,
 }
 
 impl ArcticEmbedder {
@@ -402,7 +404,7 @@ impl ArcticEmbedder {
         let embedder = Self {
             config,
             threading,
-            lazy_model: OnceLock::new(),
+            lazy_model: ModelSlot::new("arctic-embed-xs"),
         };
         if !super::minilm::lazy_load_enabled() {
             embedder.ensure_model_loaded()?;
@@ -413,17 +415,14 @@ impl ArcticEmbedder {
     /// True once a load was attempted and failed; the shared registry then builds a new
     /// instance instead of handing this one out.
     pub fn model_load_failed(&self) -> bool {
-        matches!(self.lazy_model.get(), Some(Err(_)))
+        self.lazy_model.load_failed()
     }
 
-    fn ensure_model_loaded(&self) -> Result<&Arc<LazyArcticModel>> {
-        let loaded = self.lazy_model.get_or_init(|| {
-            LazyArcticModel::new(&self.config, self.threading)
-                .map(Arc::new)
-                .map_err(|e| format!("{e:#}"))
-        });
-        loaded
-            .as_ref()
+    fn ensure_model_loaded(&self) -> Result<Arc<LazyArcticModel>> {
+        self.lazy_model
+            .get_or_load(|| {
+                LazyArcticModel::new(&self.config, self.threading).map_err(|e| format!("{e:#}"))
+            })
             .map_err(|e| anyhow::anyhow!("Failed to load arctic-embed-xs: {e}"))
     }
 
@@ -450,7 +449,7 @@ impl ArcticEmbedder {
         let model = self.ensure_model_loaded()?;
         let content = model.content_ids(seen)?;
         let mut session = model.lock()?;
-        embed_windowed(model, &mut session, &content)
+        embed_windowed(&model, &mut session, &content)
     }
 }
 
