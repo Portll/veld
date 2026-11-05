@@ -80,7 +80,9 @@ The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published
 | Projects | `add_project`, `list_projects`, `archive_project`, `delete_project` |
 | Seeding | `seed_project` |
 
-The HTTP API beneath the MCP tools is larger (~202 routes registered in [src/handlers/router.rs](src/handlers/router.rs)). Endpoints not exposed via MCP include direct CRUD (`/api/memory/{id}` PUT/DELETE), entity resolution (`/api/entity/*`), prompt generation (`/api/prompt/gen`), context blocks (`/api/context/blocks`), tier moves (`/api/memory/tier`), anchor (`/api/anchor` — decay resistance), sleep-phase consolidation (`/api/consolidation/sleep`), external-dimension push (`/api/sleight/dimensions`), and webhooks (`/webhook/linear`, `/webhook/github`).
+The HTTP API beneath the MCP tools is larger (277 routes registered in [src/handlers/router.rs](src/handlers/router.rs)). Endpoints not exposed via MCP include direct CRUD (`/api/memory/{id}` PUT/DELETE), entity resolution (`/api/entity/*`), prompt generation (`/api/prompt/gen`), context blocks (`/api/context/blocks`), tier moves (`/api/memory/tier`), anchor (`/api/anchor` — decay resistance), sleep-phase consolidation (`/api/consolidation/sleep`), external-dimension push (`/api/sleight/dimensions`), and webhooks (`/webhook/linear`, `/webhook/github`).
+
+The request and response shapes of every HTTP route are in [docs/src/reference/schemas.md](docs/src/reference/schemas.md), generated from the handler source by `gen-schemas` ([docs/generators/src/bin/gen-schemas.rs](docs/generators/src/bin/gen-schemas.rs)); [src/mcp/schema_conformance.rs](src/mcp/schema_conformance.rs) builds a sample of each documented reply for the routes the MCP tools call and deserialises it into the response type the tool reads, so a tool that expects a field the handler never sends fails at test time.
 
 For work that spans sessions, check `list_todos` at session start.
 

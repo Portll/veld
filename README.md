@@ -60,6 +60,7 @@ The full developer docs site lives at **<https://portll.github.io/veld/>**
 - [Architecture overview](https://portll.github.io/veld/architecture/overview.html) — retrieval pipeline, storage, consolidation
 - [MCP tools reference](https://portll.github.io/veld/reference/mcp-tools.html) — all 46 tools, auto-generated
 - [HTTP API reference](https://portll.github.io/veld/reference/http-api.html) — every route, auto-generated
+- [HTTP API schemas](docs/src/reference/schemas.md) — the request and response shape of every route, generated from the handler source
 - [Decisions](https://portll.github.io/veld/decisions/index.html) — architectural decision records
 - [FAQ](https://portll.github.io/veld/faq.html)
 
