@@ -97,6 +97,13 @@ impl Api {
     }
 }
 
+/// The top-level keys of a JSON object reply, sorted: what a typed reply must keep.
+fn top_keys(body: &Value) -> Vec<String> {
+    let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
 fn ok(reply: &Reply, what: &str) {
     assert!(
         reply.status.is_success(),
@@ -170,6 +177,7 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
     // Status needs no step-up; a change does.
     let status = api.get("/api/user_auth/admin/keys/status", &token).await;
     ok(&status, "key status");
+    assert_eq!(top_keys(&status.body), ["keyring_unsealed", "status"]);
     assert!(status.body["status"]["keyring"].is_null());
     let scopes: Vec<_> = status.body["status"]["keystores"]
         .as_array()
@@ -226,6 +234,10 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         )
         .await;
     ok(&init, "keyring init in the elevated session");
+    assert_eq!(
+        top_keys(&init.body),
+        ["enrolled", "keyring", "recovery", "ring"]
+    );
     assert_eq!(init.body["enrolled"].as_array().unwrap().len(), 2);
     let first_code = init.body["recovery"]["code"].as_str().unwrap().to_string();
 
@@ -238,20 +250,25 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         )
         .await;
     ok(&issued, "second recovery code");
+    assert_eq!(top_keys(&issued.body), ["code", "id", "kit", "label"]);
     assert!(issued.body["kit"]
         .as_str()
         .unwrap()
         .contains("VELD RECOVERY KIT"));
     let second_id = issued.body["id"].as_str().unwrap().to_string();
-    ok(
-        &api.post(
+    let revoked_code = api
+        .post(
             "/api/user_auth/admin/keys/revoke",
             &token,
             json!({ "unlock": { "recovery_code": first_code }, "id": second_id }),
         )
-        .await,
-        "revoke with the first code",
+        .await;
+    ok(&revoked_code, "revoke with the first code");
+    assert_eq!(
+        top_keys(&revoked_code.body),
+        ["created_at", "id", "label", "provider"]
     );
+    assert_eq!(revoked_code.body["id"], second_id.as_str());
     let wrong = api
         .post(
             "/api/user_auth/admin/keys/recovery_codes",
@@ -271,6 +288,7 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         )
         .await;
     ok(&start, "start a passkey enrolment");
+    assert_eq!(top_keys(&start.body), ["path", "ticket"]);
     let path = start.body["path"].as_str().unwrap().to_string();
     let ticket = start.body["ticket"].as_str().unwrap().to_string();
     let page = api.call(Method::GET, &path, None, None, None).await;
@@ -305,6 +323,7 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         )
         .await;
     assert_eq!(poll.body["state"], "done", "{}", poll.text);
+    assert_eq!(top_keys(&poll.body), ["factor", "state"]);
     let passkey_id = poll.body["factor"]["id"].as_str().unwrap().to_string();
     assert_eq!(passkey_id, "passkey:localhost:Y3JlZA");
     let again = api.call(Method::GET, &path, None, None, None).await;
@@ -324,6 +343,9 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         )
         .await;
     ok(&rotated, "rotate data keys with the passkey");
+    for epoch in rotated.body.as_array().unwrap() {
+        assert_eq!(top_keys(epoch), ["epoch", "path", "scope"]);
+    }
     assert!(rotated
         .body
         .as_array()

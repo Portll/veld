@@ -19,14 +19,16 @@ use axum::{
     Extension, Json,
 };
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeroize::Zeroizing;
 
 use super::state::MultiUserMemoryManager;
 use super::user_admin::{audit, require_admin, require_admin_step_up};
-use crate::keyring::{self, passkey};
-use crate::keystore::{Factor, PROVIDER_PASSKEY, PROVIDER_SECURE_ENCLAVE};
+use crate::keyring::{
+    self, passkey, EpochStarted, InitReport, IssuedCode, KeyStatus, MasterKeysRotated, Rewrapped,
+};
+use crate::keystore::{Factor, FactorInfo, PROVIDER_PASSKEY, PROVIDER_SECURE_ENCLAVE};
 use crate::tls::ArrivedOverTls;
 use crate::user_auth::{
     runtime::UserAuthRuntime, AuthError, SessionTokenExt, SessionUser, UserRecord,
@@ -130,7 +132,30 @@ impl IntoResponse for KeysError {
     }
 }
 
-type KeysResult = Result<serde_json::Value, KeysError>;
+/// The reply of `GET /api/user_auth/admin/keys/status`.
+#[derive(Debug, Serialize)]
+pub struct KeysStatusResponse {
+    pub status: KeyStatus,
+    /// The id of the ring key this server holds, `None` when it started without one.
+    pub keyring_unsealed: Option<String>,
+}
+
+/// The reply of `POST /api/user_auth/admin/keys/passkey`: the ticket to poll and the
+/// path of the page that finishes the enrolment.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PasskeyStartResponse {
+    pub ticket: String,
+    pub path: String,
+}
+
+/// The reply of `GET /api/user_auth/admin/keys/passkey/{ticket}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PasskeyPollResponse {
+    Waiting,
+    Done { factor: FactorInfo },
+    Failed { error: String },
+}
 
 fn runtime(state: &AppState) -> Result<&UserAuthRuntime, KeysError> {
     state
@@ -167,10 +192,10 @@ fn require_private_transport(state: &AppState, over_tls: &OverTls) -> Result<(),
 
 /// Run a keyring operation off the async runtime: they run Argon2 and write files.
 /// An unlock that fails counts against the shared budget.
-async fn keyring_op<T: serde::Serialize + Send + 'static>(
+async fn keyring_op<T: Serialize + Send + 'static>(
     rt: &UserAuthRuntime,
     op: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-) -> KeysResult {
+) -> Result<T, KeysError> {
     if rt.login_limiter.peek(UNLOCK_BUDGET).is_err() {
         return Err(KeysError::Auth(AuthError::TooManyAttempts));
     }
@@ -178,7 +203,10 @@ async fn keyring_op<T: serde::Serialize + Send + 'static>(
         KeysError::Auth(AuthError::internal(format!("key operation panicked: {e}")))
     })?;
     match outcome {
-        Ok(value) => serde_json::to_value(value)
+        // Serialised here as well as in the reply, so a report that cannot be (a path that
+        // is not UTF-8) is refused before the handler writes its audit record.
+        Ok(value) => serde_json::to_value(&value)
+            .map(|_| value)
             .map_err(|e| KeysError::Auth(AuthError::internal(e.to_string()))),
         Err(e) => {
             let _ = rt.login_limiter.check(UNLOCK_BUDGET);
@@ -204,35 +232,24 @@ fn gate(
     Ok(())
 }
 
-fn respond(result: KeysResult) -> Response {
-    match result {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
 /// `GET /api/user_auth/admin/keys/status` — what is enrolled where; nothing is unsealed.
 pub async fn status(
     State(state): State<AppState>,
     over_tls: OverTls,
     Extension(caller): Extension<SessionUser>,
-) -> Response {
-    let result = async {
-        require_private_transport(&state, &over_tls)?;
-        runtime(&state)?;
-        require_admin(&caller.0)?;
-        let storage = state.base_path.clone();
-        let status = tokio::task::spawn_blocking(move || keyring::status(&storage))
-            .await
-            .map_err(|e| KeysError::Auth(AuthError::internal(e.to_string())))?
-            .map_err(|e| KeysError::Auth(AuthError::internal(format!("{e:#}"))))?;
-        Ok(json!({
-            "status": status,
-            "keyring_unsealed": keyring::installed().map(|r| r.id().to_string()),
-        }))
-    }
-    .await;
-    respond(result)
+) -> Result<Json<KeysStatusResponse>, KeysError> {
+    require_private_transport(&state, &over_tls)?;
+    runtime(&state)?;
+    require_admin(&caller.0)?;
+    let storage = state.base_path.clone();
+    let status = tokio::task::spawn_blocking(move || keyring::status(&storage))
+        .await
+        .map_err(|e| KeysError::Auth(AuthError::internal(e.to_string())))?
+        .map_err(|e| KeysError::Auth(AuthError::internal(format!("{e:#}"))))?;
+    Ok(Json(KeysStatusResponse {
+        status,
+        keyring_unsealed: keyring::installed().map(|r| r.id().to_string()),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -249,27 +266,23 @@ pub async fn init(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<InitBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        let storage = state.base_path.clone();
-        let passphrase = Zeroizing::new(body.passphrase);
-        let value = keyring_op(rt, move || {
-            keyring::init(&storage, &passphrase, body.label.as_deref())
-        })
-        .await?;
-        audit(
-            rt,
-            &caller.0,
-            "keyring_init",
-            None,
-            json!({ "ring": value["ring"] }),
-        )?;
-        Ok(value)
-    }
-    .await;
-    respond(result)
+) -> Result<Json<InitReport>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    let storage = state.base_path.clone();
+    let passphrase = Zeroizing::new(body.passphrase);
+    let report = keyring_op(rt, move || {
+        keyring::init(&storage, &passphrase, body.label.as_deref())
+    })
+    .await?;
+    audit(
+        rt,
+        &caller.0,
+        "keyring_init",
+        None,
+        json!({ "ring": report.ring }),
+    )?;
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]
@@ -287,27 +300,23 @@ pub async fn add_recovery_code(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<IssueBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        let storage = state.base_path.clone();
-        let unlock = Unlock::from_body(body.unlock)?;
-        let value = keyring_op(rt, move || {
-            keyring::add_recovery_code(&storage, &unlock.factor(), body.label.as_deref())
-        })
-        .await?;
-        audit(
-            rt,
-            &caller.0,
-            "recovery_code_issued",
-            value["id"].as_str(),
-            json!({ "label": value["label"] }),
-        )?;
-        Ok(value)
-    }
-    .await;
-    respond(result)
+) -> Result<Json<IssuedCode>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    let storage = state.base_path.clone();
+    let unlock = Unlock::from_body(body.unlock)?;
+    let issued = keyring_op(rt, move || {
+        keyring::add_recovery_code(&storage, &unlock.factor(), body.label.as_deref())
+    })
+    .await?;
+    audit(
+        rt,
+        &caller.0,
+        "recovery_code_issued",
+        Some(issued.id.as_str()),
+        json!({ "label": issued.label }),
+    )?;
+    Ok(Json(issued))
 }
 
 #[derive(Deserialize)]
@@ -324,26 +333,21 @@ pub async fn revoke(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<RevokeBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        let storage = state.base_path.clone();
-        let unlock = Unlock::from_body(body.unlock)?;
-        let id = body.id.clone();
-        let value =
-            keyring_op(rt, move || keyring::revoke(&storage, &unlock.factor(), &id)).await?;
-        audit(
-            rt,
-            &caller.0,
-            "key_factor_revoked",
-            Some(&body.id),
-            json!({}),
-        )?;
-        Ok(value)
-    }
-    .await;
-    respond(result)
+) -> Result<Json<FactorInfo>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    let storage = state.base_path.clone();
+    let unlock = Unlock::from_body(body.unlock)?;
+    let id = body.id.clone();
+    let revoked = keyring_op(rt, move || keyring::revoke(&storage, &unlock.factor(), &id)).await?;
+    audit(
+        rt,
+        &caller.0,
+        "key_factor_revoked",
+        Some(&body.id),
+        json!({}),
+    )?;
+    Ok(Json(revoked))
 }
 
 #[derive(Deserialize)]
@@ -361,19 +365,15 @@ pub async fn rotate_passphrase(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<RotatePassphraseBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        let storage = state.base_path.clone();
-        let (old, new) = (Zeroizing::new(body.old), Zeroizing::new(body.new));
-        let value =
-            keyring_op(rt, move || keyring::rotate_passphrase(&storage, &old, &new)).await?;
-        audit(rt, &caller.0, "passphrase_rotated", None, json!({}))?;
-        Ok(value)
-    }
-    .await;
-    respond(result)
+) -> Result<Json<Rewrapped>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    let storage = state.base_path.clone();
+    let (old, new) = (Zeroizing::new(body.old), Zeroizing::new(body.new));
+    let rewrapped =
+        keyring_op(rt, move || keyring::rotate_passphrase(&storage, &old, &new)).await?;
+    audit(rt, &caller.0, "passphrase_rotated", None, json!({}))?;
+    Ok(Json(rewrapped))
 }
 
 #[derive(Deserialize)]
@@ -389,21 +389,17 @@ pub async fn rotate_data_keys(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UnlockOnlyBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        let storage = state.base_path.clone();
-        let unlock = Unlock::from_body(body.unlock)?;
-        let value = keyring_op(rt, move || {
-            keyring::rotate_data_keys(&storage, &unlock.factor())
-        })
-        .await?;
-        audit(rt, &caller.0, "data_keys_rotated", None, json!({}))?;
-        Ok(value)
-    }
-    .await;
-    respond(result)
+) -> Result<Json<Vec<EpochStarted>>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    let storage = state.base_path.clone();
+    let unlock = Unlock::from_body(body.unlock)?;
+    let started = keyring_op(rt, move || {
+        keyring::rotate_data_keys(&storage, &unlock.factor())
+    })
+    .await?;
+    audit(rt, &caller.0, "data_keys_rotated", None, json!({}))?;
+    Ok(Json(started))
 }
 
 /// `POST /api/user_auth/admin/keys/rotate_master_keys` — step-up. Drops every recovery code
@@ -415,27 +411,23 @@ pub async fn rotate_master_keys(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<InitBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        let storage = state.base_path.clone();
-        let passphrase = Zeroizing::new(body.passphrase);
-        let value = keyring_op(rt, move || {
-            keyring::rotate_master_keys(&storage, &passphrase, body.label.as_deref())
-        })
-        .await?;
-        audit(
-            rt,
-            &caller.0,
-            "master_keys_rotated",
-            None,
-            json!({ "dropped": value["dropped"] }),
-        )?;
-        Ok(value)
-    }
-    .await;
-    respond(result)
+) -> Result<Json<MasterKeysRotated>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    let storage = state.base_path.clone();
+    let passphrase = Zeroizing::new(body.passphrase);
+    let rotated = keyring_op(rt, move || {
+        keyring::rotate_master_keys(&storage, &passphrase, body.label.as_deref())
+    })
+    .await?;
+    audit(
+        rt,
+        &caller.0,
+        "master_keys_rotated",
+        None,
+        json!({ "dropped": rotated.dropped }),
+    )?;
+    Ok(Json(rotated))
 }
 
 #[derive(Deserialize)]
@@ -457,46 +449,48 @@ pub async fn enrol_factor(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<EnrolBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let rt = runtime(&state)?;
-        if body.provider != PROVIDER_SECURE_ENCLAVE {
-            return Err(KeysError::bad(
-                "only secure-enclave secrets are posted; passkeys enrol through /api/user_auth/admin/keys/passkey",
-            ));
-        }
-        let storage = state.base_path.clone();
-        let unlock = Unlock::from_body(body.unlock)?;
-        let secret = Zeroizing::new(
-            base64::engine::general_purpose::STANDARD
-                .decode(Zeroizing::new(body.secret).as_bytes())
-                .map_err(|_| KeysError::bad("the secret is not base64"))?,
-        );
-        let (id, label) = (body.id.clone(), body.label.clone());
-        let value = keyring_op(rt, move || {
-            keyring::enrol_secret(
-                &storage,
-                &unlock.factor(),
-                PROVIDER_SECURE_ENCLAVE,
-                &id,
-                label.as_deref(),
-                &secret,
-            )
-        })
-        .await?;
-        audit(rt, &caller.0, "key_factor_enrolled", Some(&body.id), json!({ "provider": body.provider }))?;
-        Ok(value)
+) -> Result<Json<FactorInfo>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let rt = runtime(&state)?;
+    if body.provider != PROVIDER_SECURE_ENCLAVE {
+        return Err(KeysError::bad(
+            "only secure-enclave secrets are posted; passkeys enrol through /api/user_auth/admin/keys/passkey",
+        ));
     }
-    .await;
-    respond(result)
+    let storage = state.base_path.clone();
+    let unlock = Unlock::from_body(body.unlock)?;
+    let secret = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(Zeroizing::new(body.secret).as_bytes())
+            .map_err(|_| KeysError::bad("the secret is not base64"))?,
+    );
+    let (id, label) = (body.id.clone(), body.label.clone());
+    let enrolled = keyring_op(rt, move || {
+        keyring::enrol_secret(
+            &storage,
+            &unlock.factor(),
+            PROVIDER_SECURE_ENCLAVE,
+            &id,
+            label.as_deref(),
+            &secret,
+        )
+    })
+    .await?;
+    audit(
+        rt,
+        &caller.0,
+        "key_factor_enrolled",
+        Some(&body.id),
+        json!({ "provider": body.provider }),
+    )?;
+    Ok(Json(enrolled))
 }
 
 // ── Passkeys through the server's own origin ────────────────────────────
 
 enum TicketState {
     Waiting,
-    Done(serde_json::Value),
+    Done(FactorInfo),
     Failed(String),
 }
 
@@ -555,31 +549,28 @@ pub async fn passkey_start(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<PasskeyStartBody>,
-) -> Response {
-    let result = async {
-        gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
-        let unlock = Unlock::from_body(body.unlock)?;
-        let mut raw = [0u8; 24];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
-        let ticket = hex::encode(raw);
-        let rp_id = relying_party(&headers);
-        let mut tickets = state.passkey_tickets.0.lock();
-        PasskeyTickets::prune(&mut tickets);
-        tickets.insert(
-            ticket.clone(),
-            PasskeyTicket {
-                created: Instant::now(),
-                label: body.label.unwrap_or_else(|| format!("passkey ({rp_id})")),
-                rp_id,
-                actor: caller.0.clone(),
-                unlock,
-                state: TicketState::Waiting,
-            },
-        );
-        Ok(json!({ "ticket": ticket, "path": format!("/api/user_auth/keys/passkey/{ticket}") }))
-    }
-    .await;
-    respond(result)
+) -> Result<Json<PasskeyStartResponse>, KeysError> {
+    gate(&state, &over_tls, &caller.0, &token.0, &headers)?;
+    let unlock = Unlock::from_body(body.unlock)?;
+    let mut raw = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
+    let ticket = hex::encode(raw);
+    let rp_id = relying_party(&headers);
+    let mut tickets = state.passkey_tickets.0.lock();
+    PasskeyTickets::prune(&mut tickets);
+    tickets.insert(
+        ticket.clone(),
+        PasskeyTicket {
+            created: Instant::now(),
+            label: body.label.unwrap_or_else(|| format!("passkey ({rp_id})")),
+            rp_id,
+            actor: caller.0.clone(),
+            unlock,
+            state: TicketState::Waiting,
+        },
+    );
+    let path = format!("/api/user_auth/keys/passkey/{ticket}");
+    Ok(Json(PasskeyStartResponse { ticket, path }))
 }
 
 /// `GET /api/user_auth/admin/keys/passkey/{ticket}` — `waiting`, `done` with the factor, or
@@ -588,25 +579,33 @@ pub async fn passkey_poll(
     State(state): State<AppState>,
     Extension(caller): Extension<SessionUser>,
     UrlPath(ticket): UrlPath<String>,
-) -> Response {
+) -> Result<Json<PasskeyPollResponse>, StatusCode> {
     let mut tickets = state.passkey_tickets.0.lock();
     PasskeyTickets::prune(&mut tickets);
-    let body = match tickets.get(&ticket) {
+    let reply = match tickets.get(&ticket) {
         Some(t) if t.actor.id == caller.0.id => match &t.state {
-            TicketState::Waiting => json!({ "state": "waiting" }),
-            TicketState::Done(factor) => json!({ "state": "done", "factor": factor }),
-            TicketState::Failed(error) => json!({ "state": "failed", "error": error }),
+            TicketState::Waiting => PasskeyPollResponse::Waiting,
+            TicketState::Done(factor) => PasskeyPollResponse::Done {
+                factor: factor.clone(),
+            },
+            TicketState::Failed(error) => PasskeyPollResponse::Failed {
+                error: error.clone(),
+            },
         },
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => return Err(StatusCode::NOT_FOUND),
     };
-    if body["state"] != "waiting" {
+    if !matches!(reply, PasskeyPollResponse::Waiting) {
         tickets.remove(&ticket);
     }
-    (StatusCode::OK, Json(body)).into_response()
+    Ok(Json(reply))
 }
 
 /// `GET /api/user_auth/keys/passkey/{ticket}` — the ceremony page. Unauthenticated: the ticket is
 /// the capability, and it only ever enrols for the admin who started it.
+///
+/// The reply is an HTML page (or a plain-text 404 for an expired ticket), not JSON, so the
+/// schema reference lists it as opaque. The page posts its result to
+/// `POST /api/user_auth/keys/passkey/{ticket}/result`.
 pub async fn passkey_page(
     State(state): State<AppState>,
     UrlPath(ticket): UrlPath<String>,
@@ -650,12 +649,14 @@ pub struct PasskeyResultBody {
 }
 
 /// `POST /api/user_auth/keys/passkey/{ticket}/result` — the page posts the passkey's PRF secret;
-/// the server enrols it with the unlock the ticket holds.
+/// the server enrols it with the unlock the ticket holds. The reply has no body: `204` when
+/// the factor is enrolled, `422` when it is not (the poll says why), `404` for a ticket that
+/// is unknown, expired or already used.
 pub async fn passkey_result(
     State(state): State<AppState>,
     UrlPath(ticket): UrlPath<String>,
     Json(body): Json<PasskeyResultBody>,
-) -> Response {
+) -> StatusCode {
     let taken = {
         let mut tickets = state.passkey_tickets.0.lock();
         match tickets.get_mut(&ticket) {
@@ -675,7 +676,7 @@ pub async fn passkey_result(
                 t.state = TicketState::Failed("in progress".into());
                 (unlock, t.rp_id.clone(), t.label.clone(), t.actor.clone())
             }
-            _ => return StatusCode::NOT_FOUND.into_response(),
+            _ => return StatusCode::NOT_FOUND,
         }
     };
     let (unlock, rp_id, label, actor) = taken;
@@ -718,7 +719,7 @@ pub async fn passkey_result(
                 json!({ "provider": PROVIDER_PASSKEY }),
             );
         }
-        serde_json::to_value(factor).map_err(|e| e.to_string())
+        Ok(factor)
     }
     .await;
     let status = match &outcome {
@@ -731,12 +732,12 @@ pub async fn passkey_result(
             Err(error) => TicketState::Failed(error),
         };
     }
-    status.into_response()
+    status
 }
 
 #[cfg(test)]
 mod tests {
-    use super::transport_is_private;
+    use super::*;
 
     #[test]
     fn a_request_over_tls_is_private_whatever_the_plain_bind() {
@@ -746,5 +747,54 @@ mod tests {
         if std::env::var_os("VELD_TLS_ACK").is_none() {
             assert!(!transport_is_private("0.0.0.0", false));
         }
+    }
+
+    #[test]
+    fn typed_replies_keep_the_json_keys_they_replaced() {
+        fn keys(value: impl Serialize) -> Vec<String> {
+            let mut keys: Vec<String> = serde_json::to_value(value)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        }
+        let status = KeysStatusResponse {
+            status: KeyStatus {
+                keyring: None,
+                keystores: Vec::new(),
+            },
+            keyring_unsealed: None,
+        };
+        assert_eq!(keys(&status), ["keyring_unsealed", "status"]);
+        assert_eq!(
+            keys(PasskeyStartResponse {
+                ticket: "t".into(),
+                path: "/p".into()
+            }),
+            ["path", "ticket"]
+        );
+        let waiting = serde_json::to_value(PasskeyPollResponse::Waiting).unwrap();
+        assert_eq!(waiting, json!({ "state": "waiting" }));
+        let factor = FactorInfo {
+            provider: PROVIDER_PASSKEY.into(),
+            id: "passkey:localhost:x".into(),
+            label: None,
+            created_at: None,
+        };
+        let done = serde_json::to_value(PasskeyPollResponse::Done {
+            factor: factor.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            done,
+            json!({ "state": "done", "factor": serde_json::to_value(&factor).unwrap() })
+        );
+        let failed =
+            serde_json::to_value(PasskeyPollResponse::Failed { error: "no".into() }).unwrap();
+        assert_eq!(failed, json!({ "state": "failed", "error": "no" }));
     }
 }
