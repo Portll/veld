@@ -131,50 +131,50 @@
       "method": "POST",
       "path": "/api/admin/replication/follow",
       "handler": "replication::follow",
-      "response": "opaque"
+      "response": "FollowResponse"
     },
     {
       "method": "GET",
       "path": "/api/admin/replication/records",
       "handler": "replication::records",
       "query": "RecordsQuery",
-      "response": "opaque"
+      "response": "replication::FeedPage"
     },
     {
       "method": "GET",
       "path": "/api/admin/replication/status",
       "handler": "replication::status",
-      "response": "opaque"
+      "response": "ReplicationStatusResponse"
     },
     {
       "method": "POST",
       "path": "/api/admin/replication/unfollow",
       "handler": "replication::unfollow",
-      "response": "opaque"
+      "response": "UnfollowResponse"
     },
     {
       "method": "POST",
       "path": "/api/admin/reset-rate-limit",
       "handler": "admin::reset_rate_limit",
-      "response": "opaque"
+      "response": "no body"
     },
     {
       "method": "POST",
       "path": "/api/admin/storage/export",
       "handler": "storage_migration::export",
-      "response": "opaque"
+      "response": "ExportResponse"
     },
     {
       "method": "POST",
       "path": "/api/admin/storage/import",
       "handler": "storage_migration::import",
-      "response": "opaque"
+      "response": "ImportResponse"
     },
     {
       "method": "POST",
       "path": "/api/admin/storage/migrate",
       "handler": "storage_migration::migrate",
-      "response": "opaque"
+      "response": "MigrateResponse"
     },
     {
       "method": "POST",
@@ -425,7 +425,7 @@
       "path_param_names": [
         "name"
       ],
-      "response": "opaque"
+      "response": "QueryResponse"
     },
     {
       "method": "POST",
@@ -1415,20 +1415,20 @@
       "path": "/api/sleep_time/enqueue",
       "handler": "sleep_time::enqueue",
       "body": "EnqueueRequest",
-      "response": "opaque"
+      "response": "EnqueueResponse"
     },
     {
       "method": "POST",
       "path": "/api/sleep_time/lock_block",
       "handler": "sleep_time::lock_block",
       "body": "LockBlockRequest",
-      "response": "opaque"
+      "response": "LockBlockResponse"
     },
     {
       "method": "GET",
       "path": "/api/sleep_time/status",
       "handler": "sleep_time::status",
-      "response": "opaque"
+      "response": "OrchestratorStatusResponse"
     },
     {
       "method": "GET",
@@ -1438,7 +1438,7 @@
       "path_param_names": [
         "user_id"
       ],
-      "response": "opaque"
+      "response": "UserStatusResponse"
     },
     {
       "method": "POST",
@@ -8489,6 +8489,72 @@
         }
       ]
     },
+    "DumpReport": {
+      "name": "DumpReport",
+      "file": "src/storage/migrate/mod.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "unit",
+          "type": "Unit",
+          "required": true,
+          "refs": [
+            "Unit"
+          ]
+        },
+        {
+          "name": "path",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "frames",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "records",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "digest",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "derived_rows_not_carried",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "quarantined",
+          "type": "u64",
+          "required": true,
+          "doc": "Set aside, not exported. `records + quarantined == source_records`."
+        },
+        {
+          "name": "source_records",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "quarantine",
+          "type": "Option<QuarantineReport>",
+          "required": false,
+          "refs": [
+            "Option",
+            "QuarantineReport"
+          ]
+        }
+      ]
+    },
     "EdgeSource": {
       "name": "EdgeSource",
       "file": "src/graph_memory.rs",
@@ -8780,6 +8846,27 @@
           "type": "String",
           "required": true,
           "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "EnqueueResponse": {
+      "name": "EnqueueResponse",
+      "file": "src/handlers/sleep_time.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "accepted",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "reason",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
             "String"
           ]
         }
@@ -10349,6 +10436,23 @@
         }
       ]
     },
+    "ExportResponse": {
+      "name": "ExportResponse",
+      "file": "src/handlers/storage_migration.rs",
+      "doc": "`POST /api/admin/storage/export` on success: one report per dump written.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "dumps",
+          "type": "Vec<migrate::DumpReport>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "DumpReport"
+          ]
+        }
+      ]
+    },
     "ExportedDocument": {
       "name": "ExportedDocument",
       "file": "src/handlers/mif.rs",
@@ -10423,6 +10527,76 @@
           "name": "forgotten",
           "type": "bool",
           "required": true
+        }
+      ]
+    },
+    "Extraction": {
+      "name": "Extraction",
+      "file": "src/storage/migrate/mod.rs",
+      "doc": "What an extraction saw. `frames` and `digest` are the trailer values the same rows produce; `records` excludes the meta frames.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "frames",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "records",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "digest",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "decode_failures",
+          "type": "u64",
+          "required": true,
+          "doc": "Records no decoder accepts that were NOT set aside. Any non-zero value fails an export."
+        },
+        {
+          "name": "failed_keys",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "quarantined",
+          "type": "u64",
+          "required": true,
+          "doc": "Undecodable records written byte-for-byte to a quarantine file, never exported."
+        },
+        {
+          "name": "quarantined_keys",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "derived_rows_not_carried",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "sealed_records",
+          "type": "u64",
+          "required": true,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Sealed memories carried as stored, each shown to open under the keystore."
         }
       ]
     },
@@ -11047,6 +11221,97 @@
         }
       ]
     },
+    "FeedPage": {
+      "name": "FeedPage",
+      "file": "src/replication.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "records",
+          "type": "Vec<FeedRecord>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "FeedRecord"
+          ]
+        },
+        {
+          "name": "head_lsn",
+          "type": "u64",
+          "required": true,
+          "doc": "The LSN the leader will assign next; `records` end before it."
+        },
+        {
+          "name": "more",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "log_created",
+          "type": "u64",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Identity of the leader's log file: the creation time in its header, 0 for a legacy log without one. A different value means the log was recreated."
+        },
+        {
+          "name": "slot_spaces",
+          "type": "Option<SlotSpaces>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "How the leader reads a vector slot that records no space. A snapshot journaled before spaces were recorded carries such slots, and a follower with another embedder must not read them as its own. Absent from a leader that predates spaces: the follower then reads them as its own, as it always did.",
+          "refs": [
+            "Option",
+            "SlotSpaces"
+          ]
+        },
+        {
+          "name": "spaces",
+          "type": "Vec<SpaceId>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The spaces of the vectors in this page's snapshots, as the leader reads them.",
+          "refs": [
+            "Vec",
+            "SpaceId"
+          ]
+        }
+      ]
+    },
+    "FeedRecord": {
+      "name": "FeedRecord",
+      "file": "src/replication.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "lsn",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "frame_b64",
+          "type": "String",
+          "required": true,
+          "doc": "The frame's payload bytes (decrypted, bincode `IntentPayload`), base64.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "FeedbackProcessed": {
       "name": "FeedbackProcessed",
       "file": "src/handlers/recall.rs",
@@ -11449,6 +11714,277 @@
           "required": true,
           "refs": [
             "String"
+          ]
+        }
+      ]
+    },
+    "FollowResponse": {
+      "name": "FollowResponse",
+      "file": "src/handlers/replication.rs",
+      "doc": "`POST /api/admin/replication/follow`: the follow state once tailing has started.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "following",
+          "type": "replication::FollowStatus",
+          "required": true,
+          "refs": [
+            "FollowStatus"
+          ]
+        }
+      ]
+    },
+    "FollowStatus": {
+      "name": "FollowStatus",
+      "file": "src/replication.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "target",
+          "type": "Option<FollowTarget>",
+          "required": false,
+          "refs": [
+            "Option",
+            "FollowTarget"
+          ]
+        },
+        {
+          "name": "generation",
+          "type": "u64",
+          "required": true,
+          "doc": "Bumped by every follow and unfollow; a poll started under an older value stops at its next page and writes nothing."
+        },
+        {
+          "name": "polls",
+          "type": "u64",
+          "required": true,
+          "doc": "Passes over every tenant that finished. An initial sync is one pass that can run for hours: `pass_started`, `syncing` and `pages` show it moving."
+        },
+        {
+          "name": "pages",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "pass_started",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "doc": "When the pass in progress, or the last one, began.",
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "syncing",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "The tenant the pass in progress is syncing.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "last_poll",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "last_applied",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "last_error",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "The last failure to reach the leader at all; per-tenant failures are on the tenant.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "leader_instance_id",
+          "type": "Option<uuid::Uuid>",
+          "required": false,
+          "doc": "The leader's process identity, from its status route at the last pass.",
+          "refs": [
+            "Option",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "reached_leader_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "doc": "When the last pass over every tenant the leader listed finished.",
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "caught_up_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "doc": "When the leader was asked for its tenants by the last pass that left every one of them at its head: this follower held all the leader had then.",
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "leader_contact_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "doc": "When a request to the leader last succeeded: its status, or a page of its feed.",
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "users",
+          "type": "BTreeMap<String, UserProgress>",
+          "required": true,
+          "refs": [
+            "BTreeMap",
+            "String",
+            "UserProgress"
+          ]
+        }
+      ]
+    },
+    "FollowTarget": {
+      "name": "FollowTarget",
+      "file": "src/replication.rs",
+      "doc": "What a follower follows. The keys never leave the process: serialization skips them and `Debug` prints them redacted.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "source",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "since",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        }
+      ]
+    },
+    "FollowerTenant": {
+      "name": "FollowerTenant",
+      "file": "src/replication.rs",
+      "doc": "One tenant as a follower last asked the leader's feed for it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "requested_lsn",
+          "type": "u64",
+          "required": true,
+          "doc": "The first LSN the follower asked for: the feed's `after_lsn` is the follower's cursor, the last frame it applied, so the LSN it asks for next is one past it, or 0 from a follower that has applied nothing."
+        },
+        {
+          "name": "leader_head_lsn",
+          "type": "u64",
+          "required": true,
+          "doc": "The LSN the leader assigns next, as the feed read it for that reply."
+        },
+        {
+          "name": "lag_frames",
+          "type": "u64",
+          "required": true,
+          "doc": "Frames the leader held that the follower had still not been sent when the reply left: `leader_head_lsn - (requested_lsn + served)`, floored at 0. The feed serves contiguous LSNs from `requested_lsn`, so a reply that carried everything up to the head leaves 0 and a page the limit cut short leaves the rest."
+        }
+      ]
+    },
+    "FollowerView": {
+      "name": "FollowerView",
+      "file": "src/replication.rs",
+      "doc": "A follower as its leader sees it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "instance_id",
+          "type": "uuid::Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "url",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Self-reported; for display only.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "remote_addr",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "The peer address of the last poll, from the socket. None only where no socket is (an in-process router).",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "first_seen",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "last_poll",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "users",
+          "type": "BTreeMap<String, FollowerTenant>",
+          "required": true,
+          "refs": [
+            "BTreeMap",
+            "String",
+            "FollowerTenant"
           ]
         }
       ]
@@ -13108,6 +13644,87 @@
           "name": "occurrences",
           "type": "usize",
           "required": true
+        }
+      ]
+    },
+    "ImportReport": {
+      "name": "ImportReport",
+      "file": "src/storage/migrate/mod.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "unit",
+          "type": "Unit",
+          "required": true,
+          "refs": [
+            "Unit"
+          ]
+        },
+        {
+          "name": "source",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "frames",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "records",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "digest",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "verified_frames",
+          "type": "u64",
+          "required": true,
+          "doc": "Frames and digest re-derived from the target after the import. Equal to the trailer by construction of `Ok`; reported so the equality is visible."
+        },
+        {
+          "name": "verified_digest",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "verified_sealed_records",
+          "type": "u64",
+          "required": true,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Sealed memories on the target, each opened under the keystore copied there."
+        }
+      ]
+    },
+    "ImportResponse": {
+      "name": "ImportResponse",
+      "file": "src/handlers/storage_migration.rs",
+      "doc": "`POST /api/admin/storage/import` on success: one report per dump read in.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "imported",
+          "type": "Vec<migrate::ImportReport>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "ImportReport"
+          ]
         }
       ]
     },
@@ -15563,6 +16180,34 @@
     },
     "LockBlockRequest": {
       "name": "LockBlockRequest",
+      "file": "src/handlers/sleep_time.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "block_key",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "locked",
+          "type": "bool",
+          "required": true
+        }
+      ]
+    },
+    "LockBlockResponse": {
+      "name": "LockBlockResponse",
       "file": "src/handlers/sleep_time.rs",
       "kind": "struct",
       "fields": [
@@ -18528,6 +19173,83 @@
         }
       ]
     },
+    "MigrateReport": {
+      "name": "MigrateReport",
+      "file": "src/storage/migrate/mod.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "from",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "dry_run",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "quarantine_requested",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "units",
+          "type": "Vec<UnitPlan>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "UnitPlan"
+          ]
+        },
+        {
+          "name": "imported",
+          "type": "Vec<ImportReport>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "ImportReport"
+          ]
+        },
+        {
+          "name": "quarantined",
+          "type": "Vec<QuarantineReport>",
+          "required": true,
+          "doc": "Records set aside and NOT migrated. Empty unless quarantine was requested.",
+          "refs": [
+            "Vec",
+            "QuarantineReport"
+          ]
+        }
+      ]
+    },
+    "MigrateResponse": {
+      "name": "MigrateResponse",
+      "file": "src/handlers/storage_migration.rs",
+      "doc": "`POST /api/admin/storage/migrate` on success. A blocked migration is refused with 409 and `{\"error\": \"blocked\", \"report\": …}` instead.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "report",
+          "type": "migrate::MigrateReport",
+          "required": true,
+          "refs": [
+            "MigrateReport"
+          ]
+        }
+      ]
+    },
     "MigrationKind": {
       "name": "MigrationKind",
       "file": "src/memory/space_migration.rs",
@@ -18777,6 +19499,33 @@
           "refs": [
             "Option"
           ]
+        }
+      ]
+    },
+    "OrchestratorStatusResponse": {
+      "name": "OrchestratorStatusResponse",
+      "file": "src/handlers/sleep_time.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "enabled",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "num_workers",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "queue_pending_total",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "distinct_users_in_queue",
+          "type": "usize",
+          "required": true
         }
       ]
     },
@@ -20883,6 +21632,54 @@
         }
       ]
     },
+    "QuarantineReport": {
+      "name": "QuarantineReport",
+      "file": "src/storage/migrate/mod.rs",
+      "doc": "A unit's undecodable records, set aside rather than exported.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "unit",
+          "type": "Unit",
+          "required": true,
+          "refs": [
+            "Unit"
+          ]
+        },
+        {
+          "name": "records",
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "ids",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "dump",
+          "type": "PathBuf",
+          "required": true,
+          "doc": "VELDPORT file holding each record's raw key and value, byte for byte.",
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "listing",
+          "type": "PathBuf",
+          "required": true,
+          "doc": "JSON listing: keyspace, key, value length and value sha256 per record.",
+          "refs": [
+            "PathBuf"
+          ]
+        }
+      ]
+    },
     "Query": {
       "name": "Query",
       "file": "src/query_planner/predicate.rs",
@@ -21077,6 +21874,32 @@
           "required": false,
           "refs": [
             "Option"
+          ]
+        }
+      ]
+    },
+    "QueryResponse": {
+      "name": "QueryResponse",
+      "file": "src/handlers/datasets.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "columns",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        },
+        {
+          "name": "rows",
+          "type": "Vec<Vec<serde_json::Value>>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "Vec",
+            "Value"
           ]
         }
       ]
@@ -24113,6 +24936,65 @@
         }
       ]
     },
+    "ReplicationStatusResponse": {
+      "name": "ReplicationStatusResponse",
+      "file": "src/handlers/replication.rs",
+      "doc": "`GET /api/admin/replication/status`: both roles of this instance.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "base_url",
+          "type": "String",
+          "required": true,
+          "doc": "This instance's own address, with a wildcard bind host read as `127.0.0.1`.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "instance_id",
+          "type": "uuid::Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "users",
+          "type": "Vec<replication::UserLogInfo>",
+          "required": true,
+          "doc": "The tenants this instance can feed.",
+          "refs": [
+            "Vec",
+            "UserLogInfo"
+          ]
+        },
+        {
+          "name": "following",
+          "type": "Option<replication::FollowStatus>",
+          "required": false,
+          "doc": "What this instance tails; null when it follows no leader.",
+          "refs": [
+            "Option",
+            "FollowStatus"
+          ]
+        },
+        {
+          "name": "followers",
+          "type": "Option<Vec<replication::FollowerView>>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Who polled this instance lately. Absent from a follower's own poll, which names itself and reads none of them.",
+          "refs": [
+            "Option",
+            "Vec",
+            "FollowerView"
+          ]
+        }
+      ]
+    },
     "ReportPeriod": {
       "name": "ReportPeriod",
       "file": "src/memory/introspection.rs",
@@ -26390,6 +27272,34 @@
           "name": "success",
           "type": "bool",
           "required": true
+        }
+      ]
+    },
+    "SlotSpaces": {
+      "name": "SlotSpaces",
+      "file": "src/embeddings/space.rs",
+      "doc": "How an instance reads a vector slot that records no space: its primary index's space for the primary slot, its secondary index's for the secondary. A replication leader sends its own with every page, so a follower with another embedder does not read the leader's vectors as its own.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "primary",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "secondary",
+          "type": "Option<SpaceId>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "SpaceId"
+          ]
         }
       ]
     },
@@ -29063,6 +29973,91 @@
         }
       ]
     },
+    "UnfollowResponse": {
+      "name": "UnfollowResponse",
+      "file": "src/handlers/replication.rs",
+      "doc": "`POST /api/admin/replication/unfollow`: `following` is always null; `users` keeps each tenant's progress as it stood when tailing stopped.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "following",
+          "type": "Option<replication::FollowStatus>",
+          "required": false,
+          "refs": [
+            "Option",
+            "FollowStatus"
+          ]
+        },
+        {
+          "name": "users",
+          "type": "BTreeMap<String, replication::UserProgress>",
+          "required": true,
+          "refs": [
+            "BTreeMap",
+            "String",
+            "UserProgress"
+          ]
+        }
+      ]
+    },
+    "Unit": {
+      "name": "Unit",
+      "file": "src/storage/migrate/mod.rs",
+      "doc": "What one dump holds: one user's per-user stores, or the stores every user shares.",
+      "kind": "enum",
+      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "variants": [
+        {
+          "name": "user",
+          "payload": "String"
+        },
+        {
+          "name": "shared"
+        }
+      ]
+    },
+    "UnitPlan": {
+      "name": "UnitPlan",
+      "file": "src/storage/migrate/mod.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "unit",
+          "type": "Unit",
+          "required": true,
+          "refs": [
+            "Unit"
+          ]
+        },
+        {
+          "name": "source",
+          "type": "Option<Extraction>",
+          "required": false,
+          "refs": [
+            "Option",
+            "Extraction"
+          ]
+        },
+        {
+          "name": "target",
+          "type": "Option<Extraction>",
+          "required": false,
+          "refs": [
+            "Option",
+            "Extraction"
+          ]
+        },
+        {
+          "name": "blocked",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
     "UniverseBounds": {
       "name": "UniverseBounds",
       "file": "src/graph_memory.rs",
@@ -29976,6 +30971,27 @@
         }
       ]
     },
+    "UserLogInfo": {
+      "name": "UserLogInfo",
+      "file": "src/replication.rs",
+      "doc": "One user's intent log on the leader, as the follower sees it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "log_bytes",
+          "type": "u64",
+          "required": true
+        }
+      ]
+    },
     "UserMemoryCounts": {
       "name": "UserMemoryCounts",
       "file": "src/handlers/health.rs",
@@ -30006,6 +31022,124 @@
           "name": "vector_index_count",
           "type": "usize",
           "required": true
+        }
+      ]
+    },
+    "UserProgress": {
+      "name": "UserProgress",
+      "file": "src/replication.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "applied_lsn",
+          "type": "Option<u64>",
+          "required": false,
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "applied_records",
+          "type": "u64",
+          "required": true,
+          "doc": "Leader frames consumed."
+        },
+        {
+          "name": "journaled_records",
+          "type": "u64",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Frames written to this follower's own log after coalescing."
+        },
+        {
+          "name": "source_bytes",
+          "type": "u64",
+          "required": true,
+          "doc": "Leader log length at the last poll that found nothing new."
+        },
+        {
+          "name": "leader_head_lsn",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The leader's next LSN when this tenant was last read.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "lag",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Leader frames not yet applied here: `leader_head_lsn - 1 - applied_lsn`, or the whole leader log when nothing is applied.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "log_created",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The leader log identity this cursor belongs to (see [`FeedPage::log_created`]).",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "leader_spaces",
+          "type": "Vec<SpaceId>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The spaces of the vectors in the leader's last page (see [`FeedPage::spaces`]).",
+          "refs": [
+            "Vec",
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "diverged",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Set when the leader's log no longer contains what this follower applied. The tenant is not synced again until its local data is removed.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "last_error",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "failures",
+          "type": "u32",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ]
         }
       ]
     },
@@ -30147,6 +31281,45 @@
           "name": "needs_compaction",
           "type": "bool",
           "required": true
+        }
+      ]
+    },
+    "UserStatusResponse": {
+      "name": "UserStatusResponse",
+      "file": "src/handlers/sleep_time.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "pending_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "tokens_this_hour",
+          "type": "u32",
+          "required": true
+        },
+        {
+          "name": "calls_today",
+          "type": "u32",
+          "required": true
+        },
+        {
+          "name": "locked_blocks",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
         }
       ]
     },

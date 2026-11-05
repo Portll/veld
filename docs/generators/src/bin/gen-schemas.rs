@@ -6,6 +6,10 @@
 //! and receives rather than a hand-kept copy of it. `Path` tuples are paired with the route's
 //! `{name}` segments, and an `f32` field whose name ends in a score word is noted as a score.
 //!
+//! The reply is read from the `Ok` side of a `Result`, and from the `Json` element of a
+//! `(StatusCode, Json<T>)` tuple. A bare `StatusCode` (a 204, say) is a reply with no body;
+//! `Response` or `impl IntoResponse` is *opaque*: the handler builds it by hand.
+//!
 //! Emits `docs/src/reference/schemas.md` for people and `schemas.json` for tools and tests.
 //!
 //! A type name is resolved from the file that uses it: a definition in the same file, then
@@ -1197,6 +1201,8 @@ fn handler_shape(root: &Path, handler: &str) -> Result<Option<HandlerShape>> {
             match last_segment(&current) {
                 Some((name, args)) if name == "Json" => shape.response = args.first().cloned(),
                 Some((name, _)) if name == "Response" => shape.opaque = true,
+                // A status alone carries no body.
+                Some((name, _)) if name == "StatusCode" => {}
                 _ => {
                     if matches!(current, Type::ImplTrait(_)) {
                         shape.opaque = true;
@@ -1382,7 +1388,8 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
          request without it is rejected and a response always carries it. A field marked *omitted when \
          empty* is left out of a response when it has no value. Enum variants are listed in wire form. \
          `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is \
-         any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.\n\n",
+         any JSON. A response shown as *no body* is a status code alone. A response shown as *opaque* is \
+         built by hand in the handler; read the handler for it.\n\n",
     );
     if skipped > 0 {
         md.push_str(&format!(

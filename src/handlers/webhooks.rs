@@ -132,6 +132,12 @@ pub async fn memory_events_sse(
 /// - conversation: Agent dialogue (high semantic content)
 /// - sensor: IoT/robotics data (needs aggregation)
 /// - event: Discrete system events
+///
+/// # Schema
+/// The HTTP reply is the WebSocket upgrade, so the schema reference lists this route as
+/// opaque. The frames are typed: the first client frame is a
+/// [`streaming::StreamHandshake`], later client frames are [`streaming::StreamMessage`],
+/// and every server frame is a [`streaming::ExtractionResult`].
 pub async fn streaming_memory_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -434,6 +440,13 @@ async fn handle_streaming_socket(
 /// 2. Client sends handshake: { user_id, config?, debounce_ms? }
 /// 3. Client streams context updates: { context, entities?, config? }
 /// 4. Server responds with relevant memories when threshold met
+///
+/// # Schema
+/// The HTTP reply is the WebSocket upgrade, so the schema reference lists this route as
+/// opaque. The frames are typed: the handshake is a
+/// [`relevance::ContextMonitorHandshake`], each later client frame a
+/// [`relevance::ContextUpdate`], and every server frame a
+/// [`relevance::ContextMonitorResponse`].
 pub async fn context_monitor_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,

@@ -6,9 +6,9 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **277** routes over **588** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **277** routes over **615** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
-**How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
+**How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *no body* is a status code alone. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
 > 1 route registration(s) use a non-literal path or an unrecognised method chain and are not listed; see src/handlers/router.rs.
 
@@ -36,14 +36,14 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/admin/replication/follow` | none | `opaque` |
-| `GET` | `/api/admin/replication/records` | query [`RecordsQuery`](#recordsquery) | `opaque` |
-| `GET` | `/api/admin/replication/status` | none | `opaque` |
-| `POST` | `/api/admin/replication/unfollow` | none | `opaque` |
-| `POST` | `/api/admin/reset-rate-limit` | none | `opaque` |
-| `POST` | `/api/admin/storage/export` | none | `opaque` |
-| `POST` | `/api/admin/storage/import` | none | `opaque` |
-| `POST` | `/api/admin/storage/migrate` | none | `opaque` |
+| `POST` | `/api/admin/replication/follow` | none | [`FollowResponse`](#followresponse) |
+| `GET` | `/api/admin/replication/records` | query [`RecordsQuery`](#recordsquery) | replication::[`FeedPage`](#feedpage) |
+| `GET` | `/api/admin/replication/status` | none | [`ReplicationStatusResponse`](#replicationstatusresponse) |
+| `POST` | `/api/admin/replication/unfollow` | none | [`UnfollowResponse`](#unfollowresponse) |
+| `POST` | `/api/admin/reset-rate-limit` | none | `no body` |
+| `POST` | `/api/admin/storage/export` | none | [`ExportResponse`](#exportresponse) |
+| `POST` | `/api/admin/storage/import` | none | [`ImportResponse`](#importresponse) |
+| `POST` | `/api/admin/storage/migrate` | none | [`MigrateResponse`](#migrateresponse) |
 
 ### /anchor
 
@@ -130,7 +130,7 @@ The request and response shape of every HTTP route, read from the handler signat
 | `DELETE` | `/api/datasets/{name}` | query [`DatasetUserQuery`](#datasetuserquery); path `{name: String}` | [`DropDatasetResponse`](#dropdatasetresponse) |
 | `GET` | `/api/datasets/{name}` | query [`DatasetUserQuery`](#datasetuserquery); path `{name: String}` | [`DatasetMetadataResponse`](#datasetmetadataresponse) |
 | `POST` | `/api/datasets/{name}/link` | body [`LinkRequest`](#linkrequest); path `{name: String}` | [`LinkResponse`](#linkresponse) |
-| `POST` | `/api/datasets/{name}/query` | body [`QueryRequest`](#queryrequest); path `{name: String}` | `opaque` |
+| `POST` | `/api/datasets/{name}/query` | body [`QueryRequest`](#queryrequest); path `{name: String}` | [`QueryResponse`](#queryresponse) |
 | `POST` | `/api/datasets/{name}/rows` | body [`InsertRowsRequest`](#insertrowsrequest); path `{name: String}` | [`InsertRowsResponse`](#insertrowsresponse) |
 
 ### /dials
@@ -450,10 +450,10 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/sleep_time/enqueue` | body [`EnqueueRequest`](#enqueuerequest) | `opaque` |
-| `POST` | `/api/sleep_time/lock_block` | body [`LockBlockRequest`](#lockblockrequest) | `opaque` |
-| `GET` | `/api/sleep_time/status` | none | `opaque` |
-| `GET` | `/api/sleep_time/status/{user_id}` | path `{user_id: String}` | `opaque` |
+| `POST` | `/api/sleep_time/enqueue` | body [`EnqueueRequest`](#enqueuerequest) | [`EnqueueResponse`](#enqueueresponse) |
+| `POST` | `/api/sleep_time/lock_block` | body [`LockBlockRequest`](#lockblockrequest) | [`LockBlockResponse`](#lockblockresponse) |
+| `GET` | `/api/sleep_time/status` | none | [`OrchestratorStatusResponse`](#orchestratorstatusresponse) |
+| `GET` | `/api/sleep_time/status/{user_id}` | path `{user_id: String}` | [`UserStatusResponse`](#userstatusresponse) |
 
 ### /sleight
 
@@ -2294,6 +2294,22 @@ Defined in `src/handlers/todos.rs`. Request to get due todos
 | `user_id` | `String` | yes |  |
 | `include_overdue` | `bool` | no | default when absent |
 
+### DumpReport
+
+Defined in `src/storage/migrate/mod.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `unit` | [`Unit`](#unit) | yes |  |
+| `path` | `PathBuf` | yes |  |
+| `frames` | `u64` | yes |  |
+| `records` | `u64` | yes |  |
+| `digest` | `String` | yes |  |
+| `derived_rows_not_carried` | `u64` | yes |  |
+| `quarantined` | `u64` | yes | Set aside, not exported. `records + quarantined == source_records`. |
+| `source_records` | `u64` | yes |  |
+| `quarantine` | Option&lt;[`QuarantineReport`](#quarantinereport)&gt; | no |  |
+
 ### EdgeSource
 
 Defined in `src/graph_memory.rs`. Creation source for relationship edges (FIX-06: dream replay tagging)
@@ -2391,6 +2407,15 @@ Defined in `src/handlers/sleep_time.rs`.
 | `user_id` | `String` | yes |  |
 | `mode` | `String` | yes |  |
 | `trigger` | `String` | yes |  |
+
+### EnqueueResponse
+
+Defined in `src/handlers/sleep_time.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `accepted` | `bool` | yes |  |
+| `reason` | `Option<String>` | no |  |
 
 ### EnrolBody
 
@@ -2700,6 +2725,14 @@ Enum, untagged: the variant's payload alone.
 | `Document` | Box&lt;[`ExportedDocument`](#exporteddocument)&gt; |  |
 | `Encoded` | [`EncodedExport`](#encodedexport) |  |
 
+### ExportResponse
+
+Defined in `src/handlers/storage_migration.rs`. `POST /api/admin/storage/export` on success: one report per dump written.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `dumps` | Vec&lt;migrate::[`DumpReport`](#dumpreport)&gt; | yes |  |
+
 ### ExportedDocument
 
 Defined in `src/handlers/mif.rs`. A `veld` or `json` export of `POST /api/export/mif`: the MIF document's own fields.
@@ -2720,6 +2753,22 @@ Defined in `src/handlers/crud.rs`. What veld holds under an external id: enough 
 | `version` | `u32` | yes |  |
 | `content_sha256` | `Option<String>` | no | SHA-256 (hex) of the content as written. `None` when a lossy compressor replaced the body, so no written content can be compared with it. |
 | `forgotten` | `bool` | yes |  |
+
+### Extraction
+
+Defined in `src/storage/migrate/mod.rs`. What an extraction saw. `frames` and `digest` are the trailer values the same rows produce; `records` excludes the meta frames.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `frames` | `u64` | yes |  |
+| `records` | `u64` | yes |  |
+| `digest` | `String` | yes |  |
+| `decode_failures` | `u64` | yes | Records no decoder accepts that were NOT set aside. Any non-zero value fails an export. |
+| `failed_keys` | `Vec<String>` | yes |  |
+| `quarantined` | `u64` | yes | Undecodable records written byte-for-byte to a quarantine file, never exported. |
+| `quarantined_keys` | `Vec<String>` | yes |  |
+| `derived_rows_not_carried` | `u64` | yes |  |
+| `sealed_records` | `u64` | yes | omitted when empty; Sealed memories carried as stored, each shown to open under the keystore. |
 
 ### FactCard
 
@@ -2908,6 +2957,29 @@ Defined in `src/handlers/facts.rs`. Request for searching facts
 | `query` | `String` | yes |  |
 | `limit` | `usize` | no | default when absent |
 
+### FeedPage
+
+Defined in `src/replication.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `records` | Vec&lt;[`FeedRecord`](#feedrecord)&gt; | yes |  |
+| `head_lsn` | `u64` | yes | The LSN the leader will assign next; `records` end before it. |
+| `more` | `bool` | yes |  |
+| `log_created` | `u64` | no | default when absent; Identity of the leader's log file: the creation time in its header, 0 for a legacy log without one. A different value means the log was recreated. |
+| `slot_spaces` | Option&lt;[`SlotSpaces`](#slotspaces)&gt; | no | default when absent; How the leader reads a vector slot that records no space. A snapshot journaled before spaces were recorded carries such slots, and a follower with another embedder must not read them as its own. Absent from a leader that predates spaces: the follower then reads them as its own, as it always did. |
+| `spaces` | Vec&lt;[`SpaceId`](#spaceid)&gt; | no | default when absent; The spaces of the vectors in this page's snapshots, as the leader reads them. |
+
+### FeedRecord
+
+Defined in `src/replication.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `lsn` | `u64` | yes |  |
+| `frame_b64` | `String` | yes | The frame's payload bytes (decrypted, bincode `IntentPayload`), base64. |
+
 ### FeedbackProcessed
 
 Defined in `src/handlers/recall.rs`. Feedback processing results
@@ -3030,6 +3102,67 @@ Defined in `src/handlers/todos.rs`. Body of the flat `/api/todos/complete` and `
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `todo_id` | `String` | yes |  |
+
+### FollowResponse
+
+Defined in `src/handlers/replication.rs`. `POST /api/admin/replication/follow`: the follow state once tailing has started.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `following` | replication::[`FollowStatus`](#followstatus) | yes |  |
+
+### FollowStatus
+
+Defined in `src/replication.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `target` | Option&lt;[`FollowTarget`](#followtarget)&gt; | no |  |
+| `generation` | `u64` | yes | Bumped by every follow and unfollow; a poll started under an older value stops at its next page and writes nothing. |
+| `polls` | `u64` | yes | Passes over every tenant that finished. An initial sync is one pass that can run for hours: `pass_started`, `syncing` and `pages` show it moving. |
+| `pages` | `u64` | yes |  |
+| `pass_started` | `Option<DateTime<Utc>>` | no | When the pass in progress, or the last one, began. |
+| `syncing` | `Option<String>` | no | The tenant the pass in progress is syncing. |
+| `last_poll` | `Option<DateTime<Utc>>` | no |  |
+| `last_applied` | `Option<DateTime<Utc>>` | no |  |
+| `last_error` | `Option<String>` | no | The last failure to reach the leader at all; per-tenant failures are on the tenant. |
+| `leader_instance_id` | `Option<uuid::Uuid>` | no | The leader's process identity, from its status route at the last pass. |
+| `reached_leader_at` | `Option<DateTime<Utc>>` | no | When the last pass over every tenant the leader listed finished. |
+| `caught_up_at` | `Option<DateTime<Utc>>` | no | When the leader was asked for its tenants by the last pass that left every one of them at its head: this follower held all the leader had then. |
+| `leader_contact_at` | `Option<DateTime<Utc>>` | no | When a request to the leader last succeeded: its status, or a page of its feed. |
+| `users` | BTreeMap&lt;String, [`UserProgress`](#userprogress)&gt; | yes |  |
+
+### FollowTarget
+
+Defined in `src/replication.rs`. What a follower follows. The keys never leave the process: serialization skips them and `Debug` prints them redacted.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `source` | `String` | yes |  |
+| `since` | `DateTime<Utc>` | yes |  |
+
+### FollowerTenant
+
+Defined in `src/replication.rs`. One tenant as a follower last asked the leader's feed for it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `requested_lsn` | `u64` | yes | The first LSN the follower asked for: the feed's `after_lsn` is the follower's cursor, the last frame it applied, so the LSN it asks for next is one past it, or 0 from a follower that has applied nothing. |
+| `leader_head_lsn` | `u64` | yes | The LSN the leader assigns next, as the feed read it for that reply. |
+| `lag_frames` | `u64` | yes | Frames the leader held that the follower had still not been sent when the reply left: `leader_head_lsn - (requested_lsn + served)`, floored at 0. The feed serves contiguous LSNs from `requested_lsn`, so a reply that carried everything up to the head leaves 0 and a page the limit cut short leaves the rest. |
+
+### FollowerView
+
+Defined in `src/replication.rs`. A follower as its leader sees it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `instance_id` | `uuid::Uuid` | yes |  |
+| `url` | `Option<String>` | no | omitted when empty; Self-reported; for display only. |
+| `remote_addr` | `Option<String>` | no | The peer address of the last poll, from the socket. None only where no socket is (an in-process router). |
+| `first_seen` | `DateTime<Utc>` | yes |  |
+| `last_poll` | `DateTime<Utc>` | yes |  |
+| `users` | BTreeMap&lt;String, [`FollowerTenant`](#followertenant)&gt; | yes |  |
 
 ### ForgetByAgeRequest
 
@@ -3487,6 +3620,29 @@ Defined in `src/handlers/ui.rs`.
 |---|---|---|---|
 | `tags` | `usize` | yes |  |
 | `occurrences` | `usize` | yes |  |
+
+### ImportReport
+
+Defined in `src/storage/migrate/mod.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `unit` | [`Unit`](#unit) | yes |  |
+| `source` | `PathBuf` | yes |  |
+| `frames` | `u64` | yes |  |
+| `records` | `u64` | yes |  |
+| `digest` | `String` | yes |  |
+| `verified_frames` | `u64` | yes | Frames and digest re-derived from the target after the import. Equal to the trailer by construction of `Ok`; reported so the equality is visible. |
+| `verified_digest` | `String` | yes |  |
+| `verified_sealed_records` | `u64` | yes | omitted when empty; Sealed memories on the target, each opened under the keystore copied there. |
+
+### ImportResponse
+
+Defined in `src/handlers/storage_migration.rs`. `POST /api/admin/storage/import` on success: one report per dump read in.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `imported` | Vec&lt;migrate::[`ImportReport`](#importreport)&gt; | yes |  |
 
 ### ImportResult
 
@@ -4165,6 +4321,16 @@ Defined in `src/handlers/sleep_time.rs`.
 | `block_key` | `String` | yes |  |
 | `locked` | `bool` | yes |  |
 
+### LockBlockResponse
+
+Defined in `src/handlers/sleep_time.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `block_key` | `String` | yes |  |
+| `locked` | `bool` | yes |  |
+
 ### LoginRequest
 
 Defined in `src/handlers/user_auth.rs`.
@@ -4811,6 +4977,28 @@ Defined in `src/handlers/types.rs`.
 | `already_current_count` | `usize` | yes |  |
 | `failed_count` | `usize` | yes |  |
 
+### MigrateReport
+
+Defined in `src/storage/migrate/mod.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `from` | `String` | yes |  |
+| `to` | `String` | yes |  |
+| `dry_run` | `bool` | yes |  |
+| `quarantine_requested` | `bool` | yes |  |
+| `units` | Vec&lt;[`UnitPlan`](#unitplan)&gt; | yes |  |
+| `imported` | Vec&lt;[`ImportReport`](#importreport)&gt; | yes |  |
+| `quarantined` | Vec&lt;[`QuarantineReport`](#quarantinereport)&gt; | yes | Records set aside and NOT migrated. Empty unless quarantine was requested. |
+
+### MigrateResponse
+
+Defined in `src/handlers/storage_migration.rs`. `POST /api/admin/storage/migrate` on success. A blocked migration is refused with 409 and `{"error": "blocked", "report": …}` instead.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `report` | migrate::[`MigrateReport`](#migratereport) | yes |  |
+
 ### MigrationKind
 
 Defined in `src/memory/space_migration.rs`. What the drain is doing to the corpus's spaces.
@@ -4882,6 +5070,17 @@ Defined in `src/memory/types.rs`. Raw experience data to be stored (ENHANCED wit
 | `confidence` | `f32` | yes | score |
 | `start_char` | `Option<usize>` | no | default when absent; Character offset of entity start in source content |
 | `end_char` | `Option<usize>` | no | default when absent; Character offset of entity end in source content |
+
+### OrchestratorStatusResponse
+
+Defined in `src/handlers/sleep_time.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `enabled` | `bool` | yes |  |
+| `num_workers` | `usize` | yes |  |
+| `queue_pending_total` | `usize` | yes |  |
+| `distinct_users_in_queue` | `usize` | yes |  |
 
 ### OriginCounts
 
@@ -5387,6 +5586,18 @@ Enum, internally tagged: the payload's fields plus `"kind": <variant>`.
 | `pattern_match` | `{ pattern_hash: String }` | Matched a substring pattern. Pattern is stored as a SHA-256 hash to avoid leaking content into the record; the raw pattern (if forensics needs it) lives in the audit log keyed by purge event id. |
 | `confidence_floor` | `{ threshold: f32 }` | Calibrated confidence fell below the given threshold. |
 
+### QuarantineReport
+
+Defined in `src/storage/migrate/mod.rs`. A unit's undecodable records, set aside rather than exported.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `unit` | [`Unit`](#unit) | yes |  |
+| `records` | `u64` | yes |  |
+| `ids` | `Vec<String>` | yes |  |
+| `dump` | `PathBuf` | yes | VELDPORT file holding each record's raw key and value, byte for byte. |
+| `listing` | `PathBuf` | yes | JSON listing: keyspace, key, value length and value sha256 per record. |
+
 ### Query
 
 Defined in `src/query_planner/predicate.rs`. A single planner-level query. Combines relational filters, an optional vector scan, and graph reachability predicates against a single tenant (`user_id`).
@@ -5426,6 +5637,15 @@ Defined in `src/handlers/datasets.rs`. Parametrised SELECT.
 | `where` | `Option<String>` | no |  |
 | `params` | `Vec<serde_json::Value>` | no | default when absent |
 | `limit` | `Option<u32>` | no |  |
+
+### QueryResponse
+
+Defined in `src/handlers/datasets.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `columns` | `Vec<String>` | yes |  |
+| `rows` | `Vec<Vec<serde_json::Value>>` | yes |  |
 
 ### ReadyResponse
 
@@ -6155,6 +6375,18 @@ Defined in `src/memory/introspection.rs`. Replay event details (SHO-105)
 | `connected_memories` | `usize` | yes |  |
 | `timestamp` | `DateTime<Utc>` | yes |  |
 
+### ReplicationStatusResponse
+
+Defined in `src/handlers/replication.rs`. `GET /api/admin/replication/status`: both roles of this instance.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `base_url` | `String` | yes | This instance's own address, with a wildcard bind host read as `127.0.0.1`. |
+| `instance_id` | `uuid::Uuid` | yes |  |
+| `users` | Vec&lt;replication::[`UserLogInfo`](#userloginfo)&gt; | yes | The tenants this instance can feed. |
+| `following` | Option&lt;replication::[`FollowStatus`](#followstatus)&gt; | no | What this instance tails; null when it follows no leader. |
+| `followers` | Option&lt;Vec&lt;replication::[`FollowerView`](#followerview)&gt;&gt; | no | omitted when empty; Who polled this instance lately. Absent from a follower's own poll, which names itself and reads none of them. |
+
 ### ReportPeriod
 
 Defined in `src/memory/introspection.rs`. Time period for a report
@@ -6722,6 +6954,15 @@ Defined in `src/handlers/external_dimensions.rs`. Response body for POST /api/sl
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `success` | `bool` | yes |  |
+
+### SlotSpaces
+
+Defined in `src/embeddings/space.rs`. How an instance reads a vector slot that records no space: its primary index's space for the primary slot, its secondary index's for the secondary. A replication leader sends its own with every page, so a follower with another embedder does not read the leader's vectors as its own.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `primary` | [`SpaceId`](#spaceid) | yes |  |
+| `secondary` | Option&lt;[`SpaceId`](#spaceid)&gt; | no | default when absent |
 
 ### SourceContext
 
@@ -7423,6 +7664,37 @@ Defined in `src/entity_frequency.rs`. Why the result cannot be read as a measure
 |---|---|---|---|
 | `reason` | `String` | yes |  |
 
+### UnfollowResponse
+
+Defined in `src/handlers/replication.rs`. `POST /api/admin/replication/unfollow`: `following` is always null; `users` keeps each tenant's progress as it stood when tailing stopped.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `following` | Option&lt;replication::[`FollowStatus`](#followstatus)&gt; | no |  |
+| `users` | BTreeMap&lt;String, replication::[`UserProgress`](#userprogress)&gt; | yes |  |
+
+### Unit
+
+Defined in `src/storage/migrate/mod.rs`. What one dump holds: one user's per-user stores, or the stores every user shares.
+
+Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `user` | `String` |  |
+| `shared` | none |  |
+
+### UnitPlan
+
+Defined in `src/storage/migrate/mod.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `unit` | [`Unit`](#unit) | yes |  |
+| `source` | Option&lt;[`Extraction`](#extraction)&gt; | no |  |
+| `target` | Option&lt;[`Extraction`](#extraction)&gt; | no |  |
+| `blocked` | `Vec<String>` | yes |  |
+
 ### UniverseBounds
 
 Defined in `src/graph_memory.rs`. Bounds of the memory universe
@@ -7612,6 +7884,15 @@ Defined in `src/handlers/health.rs`. Reply of `GET /api/health/index`: one tenan
 | `spaces` | Vec&lt;[`SpaceIndexSummary`](#spaceindexsummary)&gt; | yes | Every non-primary embedding space's index, the secondary's included. |
 | `timestamp` | `String` | yes | RFC 3339. |
 
+### UserLogInfo
+
+Defined in `src/replication.rs`. One user's intent log on the leader, as the follower sees it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `log_bytes` | `u64` | yes |  |
+
 ### UserMemoryCounts
 
 Defined in `src/handlers/health.rs`. Memory counts of one tenant.
@@ -7623,6 +7904,24 @@ Defined in `src/handlers/health.rs`. Memory counts of one tenant.
 | `session_memory_count` | `usize` | yes |  |
 | `long_term_memory_count` | `usize` | yes |  |
 | `vector_index_count` | `usize` | yes |  |
+
+### UserProgress
+
+Defined in `src/replication.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `applied_lsn` | `Option<u64>` | no |  |
+| `applied_records` | `u64` | yes | Leader frames consumed. |
+| `journaled_records` | `u64` | no | default when absent; Frames written to this follower's own log after coalescing. |
+| `source_bytes` | `u64` | yes | Leader log length at the last poll that found nothing new. |
+| `leader_head_lsn` | `Option<u64>` | no | default when absent; The leader's next LSN when this tenant was last read. |
+| `lag` | `Option<u64>` | no | default when absent; Leader frames not yet applied here: `leader_head_lsn - 1 - applied_lsn`, or the whole leader log when nothing is applied. |
+| `log_created` | `Option<u64>` | no | default when absent; The leader log identity this cursor belongs to (see [`FeedPage::log_created`]). |
+| `leader_spaces` | Vec&lt;[`SpaceId`](#spaceid)&gt; | no | default when absent; The spaces of the vectors in the leader's last page (see [`FeedPage::spaces`]). |
+| `diverged` | `Option<String>` | no | default when absent; Set when the leader's log no longer contains what this follower applied. The tenant is not synced again until its local data is removed. |
+| `last_error` | `Option<String>` | no | default when absent |
+| `failures` | `u32` | no | default when absent |
 
 ### UserReadyResponse
 
@@ -7653,6 +7952,18 @@ Defined in `src/handlers/health.rs`. Health of a tenant's secondary vector index
 | `deletion_ratio` | `f32` | yes |  |
 | `needs_rebuild` | `bool` | yes |  |
 | `needs_compaction` | `bool` | yes |  |
+
+### UserStatusResponse
+
+Defined in `src/handlers/sleep_time.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `pending_count` | `usize` | yes |  |
+| `tokens_this_hour` | `u32` | yes |  |
+| `calls_today` | `u32` | yes |  |
+| `locked_blocks` | `Vec<String>` | yes |  |
 
 ### UserTodoStats
 

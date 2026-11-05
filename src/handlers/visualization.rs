@@ -274,6 +274,9 @@ pub struct GraphDataStats {
 }
 
 /// GET /graph/view - Serve interactive graph visualization HTML
+///
+/// The reply is an HTML page (`graph_view.html`), not JSON, so the schema reference lists
+/// it as opaque. The page reads its data from `GET /api/graph/data/{user_id}`.
 pub async fn graph_view(Query(params): Query<GraphViewParams>) -> impl IntoResponse {
     let user_id = params.user_id.unwrap_or_else(|| "default".to_string());
     let nonce = fresh_csp_nonce();

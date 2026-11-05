@@ -17,13 +17,14 @@
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::auth::AuthenticatedUser;
+use crate::errors::AppError;
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::handlers::utils::resolve_request_user_id;
 use crate::memory::sleep_time::{
@@ -97,19 +98,47 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Why a sleep-time route refused: a hand-built `{"error": …}` body with its status (no
+/// orchestrator, a bad mode or trigger, an orchestrator failure), or the shared [`AppError`]
+/// body when the caller may not act for the requested user.
+#[derive(Debug)]
+pub enum SleepTimeRefusal {
+    Status(StatusCode, ErrorResponse),
+    App(AppError),
+}
+
+impl IntoResponse for SleepTimeRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Status(status, body) => (status, Json(body)).into_response(),
+            Self::App(e) => e.into_response(),
+        }
+    }
+}
+
+impl From<AppError> for SleepTimeRefusal {
+    fn from(e: AppError) -> Self {
+        Self::App(e)
+    }
+}
+
+impl SleepTimeRefusal {
+    fn status(status: StatusCode, error: String) -> Self {
+        Self::Status(status, ErrorResponse { error })
+    }
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
 
-fn orchestrator_or_503(state: &AppState) -> Result<Arc<SleepTimeOrchestrator>, impl IntoResponse> {
+fn orchestrator_or_503(state: &AppState) -> Result<Arc<SleepTimeOrchestrator>, SleepTimeRefusal> {
     let guard = state.sleep_time_orchestrator.read();
     match guard.as_ref() {
         Some(orch) => Ok(orch.clone()),
-        None => Err((
+        None => Err(SleepTimeRefusal::status(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "sleep-time not enabled on this server".to_string(),
-            }),
+            "sleep-time not enabled on this server".to_string(),
         )),
     }
 }
@@ -138,66 +167,46 @@ fn parse_trigger(s: &str) -> Result<SleepTimeTrigger, String> {
 pub async fn enqueue(
     State(state): State<AppState>,
     Json(body): Json<EnqueueRequest>,
-) -> impl IntoResponse {
-    let orch = match orchestrator_or_503(&state) {
-        Ok(o) => o,
-        Err(resp) => return resp.into_response(),
-    };
-    let mode = match parse_mode(&body.mode) {
-        Ok(m) => m,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response()
-        }
-    };
-    let trigger = match parse_trigger(&body.trigger) {
-        Ok(t) => t,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response()
-        }
-    };
+) -> Result<(StatusCode, Json<EnqueueResponse>), SleepTimeRefusal> {
+    let orch = orchestrator_or_503(&state)?;
+    let mode =
+        parse_mode(&body.mode).map_err(|e| SleepTimeRefusal::status(StatusCode::BAD_REQUEST, e))?;
+    let trigger = parse_trigger(&body.trigger)
+        .map_err(|e| SleepTimeRefusal::status(StatusCode::BAD_REQUEST, e))?;
 
     match orch.enqueue(&body.user_id, mode, trigger) {
-        Ok(true) => (
+        Ok(true) => Ok((
             StatusCode::OK,
             Json(EnqueueResponse {
                 accepted: true,
                 reason: None,
             }),
-        )
-            .into_response(),
-        Ok(false) => (
+        )),
+        Ok(false) => Ok((
             StatusCode::OK,
             Json(EnqueueResponse {
                 accepted: false,
                 reason: Some("debounced".to_string()),
             }),
-        )
-            .into_response(),
-        Err(e) => (
+        )),
+        Err(e) => Err(SleepTimeRefusal::status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("enqueue failed: {e}"),
-            }),
-        )
-            .into_response(),
+            format!("enqueue failed: {e}"),
+        )),
     }
 }
 
 /// `GET /api/sleep_time/status`
-pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let orch = match orchestrator_or_503(&state) {
-        Ok(o) => o,
-        Err(resp) => return resp.into_response(),
-    };
+pub async fn status(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<OrchestratorStatusResponse>), SleepTimeRefusal> {
+    let orch = orchestrator_or_503(&state)?;
     match orch.status() {
-        Ok(s) => (StatusCode::OK, Json(OrchestratorStatusResponse::from(s))).into_response(),
-        Err(e) => (
+        Ok(s) => Ok((StatusCode::OK, Json(OrchestratorStatusResponse::from(s)))),
+        Err(e) => Err(SleepTimeRefusal::status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("status failed: {e}"),
-            }),
-        )
-            .into_response(),
+            format!("status failed: {e}"),
+        )),
     }
 }
 
@@ -206,20 +215,14 @@ pub async fn user_status(
     State(state): State<AppState>,
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
-) -> impl IntoResponse {
-    let user_id = match resolve_request_user_id(
+) -> Result<(StatusCode, Json<UserStatusResponse>), SleepTimeRefusal> {
+    let user_id = resolve_request_user_id(
         Some(&user_id),
         authenticated_user.as_ref().map(|extension| &extension.0),
-    ) {
-        Ok(user_id) => user_id,
-        Err(e) => return e.into_response(),
-    };
-    let orch = match orchestrator_or_503(&state) {
-        Ok(o) => o,
-        Err(resp) => return resp.into_response(),
-    };
+    )?;
+    let orch = orchestrator_or_503(&state)?;
     match orch.user_status(&user_id) {
-        Ok(s) => (
+        Ok(s) => Ok((
             StatusCode::OK,
             Json(UserStatusResponse {
                 user_id: s.user_id,
@@ -228,15 +231,11 @@ pub async fn user_status(
                 calls_today: s.budget.calls_today,
                 locked_blocks: s.budget.locked_blocks,
             }),
-        )
-            .into_response(),
-        Err(e) => (
+        )),
+        Err(e) => Err(SleepTimeRefusal::status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("user_status failed: {e}"),
-            }),
-        )
-            .into_response(),
+            format!("user_status failed: {e}"),
+        )),
     }
 }
 
@@ -244,28 +243,21 @@ pub async fn user_status(
 pub async fn lock_block(
     State(state): State<AppState>,
     Json(body): Json<LockBlockRequest>,
-) -> impl IntoResponse {
-    let orch = match orchestrator_or_503(&state) {
-        Ok(o) => o,
-        Err(resp) => return resp.into_response(),
-    };
+) -> Result<(StatusCode, Json<LockBlockResponse>), SleepTimeRefusal> {
+    let orch = orchestrator_or_503(&state)?;
     match orch.set_block_lock(&body.user_id, &body.block_key, body.locked) {
-        Ok(()) => (
+        Ok(()) => Ok((
             StatusCode::OK,
             Json(LockBlockResponse {
                 user_id: body.user_id,
                 block_key: body.block_key,
                 locked: body.locked,
             }),
-        )
-            .into_response(),
-        Err(e) => (
+        )),
+        Err(e) => Err(SleepTimeRefusal::status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("lock_block failed: {e}"),
-            }),
-        )
-            .into_response(),
+            format!("lock_block failed: {e}"),
+        )),
     }
 }
 
@@ -301,5 +293,23 @@ mod tests {
     #[test]
     fn parse_trigger_unknown() {
         assert!(parse_trigger("explode").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_status_refusal_answers_its_code_with_an_error_body() {
+        let refusal = SleepTimeRefusal::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sleep-time not enabled on this server".to_string(),
+        )
+        .into_response();
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(refusal.into_body(), usize::MAX)
+            .await
+            .expect("a buffered body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "sleep-time not enabled on this server"})
+        );
     }
 }

@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -58,6 +58,25 @@ pub struct MigrateRequest {
 
 fn all_users() -> String {
     "all".to_string()
+}
+
+/// `POST /api/admin/storage/export` on success: one report per dump written.
+#[derive(Debug, Serialize)]
+pub struct ExportResponse {
+    pub dumps: Vec<migrate::DumpReport>,
+}
+
+/// `POST /api/admin/storage/import` on success: one report per dump read in.
+#[derive(Debug, Serialize)]
+pub struct ImportResponse {
+    pub imported: Vec<migrate::ImportReport>,
+}
+
+/// `POST /api/admin/storage/migrate` on success. A blocked migration is refused with 409
+/// and `{"error": "blocked", "report": …}` instead.
+#[derive(Debug, Serialize)]
+pub struct MigrateResponse {
+    pub report: migrate::MigrateReport,
 }
 
 fn respond(status: StatusCode, body: serde_json::Value) -> Response {
@@ -123,10 +142,18 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| anyhow::anyhow!("storage task did not complete: {e}"))?
 }
 
-pub async fn export(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Err(refusal) = require_admin_key(&headers) {
-        return refusal;
-    }
+/// Write `user`'s stores to `<data>/exports/<name>`. A refusal is a hand-built
+/// `{"error", "detail"}` body, not [`crate::errors::AppError`]'s: the monitor reads those keys.
+#[allow(
+    clippy::result_large_err,
+    reason = "the refusal is the Response the route sends, built once per request"
+)]
+pub async fn export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ExportResponse>), Response> {
+    require_admin_key(&headers)?;
     let prepared = (|| {
         let req: ExportRequest = parse(&body)?;
         let scope = Scope::parse(&req.user).map_err(bad_request)?;
@@ -137,44 +164,55 @@ pub async fn export(State(state): State<AppState>, headers: HeaderMap, body: Byt
         let quarantine = quarantine_dir(&state, req.quarantine.as_deref())?;
         Ok::<_, Response>((scope, source, export_dir(&state, &req.name)?, quarantine))
     })();
-    let (scope, source, out, quarantine) = match prepared {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let (scope, source, out, quarantine) = prepared?;
     let base = state.base_path.clone();
     match blocking(move || migrate::export(&base, source, &scope, &out, quarantine.as_deref()))
         .await
     {
-        Ok(reports) => respond(StatusCode::OK, json!({"dumps": reports})),
-        Err(e) => failed(e),
+        Ok(dumps) => Ok((StatusCode::OK, Json(ExportResponse { dumps }))),
+        Err(e) => Err(failed(e)),
     }
 }
 
-pub async fn import(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Err(refusal) = require_admin_key(&headers) {
-        return refusal;
-    }
+/// Read the dumps under `<data>/exports/<name>` into `backend`, which must not be the one
+/// this server is serving. Refusals are `{"error", "detail"}` bodies, as for export.
+#[allow(
+    clippy::result_large_err,
+    reason = "the refusal is the Response the route sends, built once per request"
+)]
+pub async fn import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ImportResponse>), Response> {
+    require_admin_key(&headers)?;
     let prepared = (|| {
         let req: ImportRequest = parse(&body)?;
         let target = backend(&req.backend)?;
         refuse_live_target(&state, target)?;
         Ok::<_, Response>((target, export_dir(&state, &req.name)?))
     })();
-    let (target, input) = match prepared {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let (target, input) = prepared?;
     let base = state.base_path.clone();
     match blocking(move || migrate::import(&base, target, &input)).await {
-        Ok(reports) => respond(StatusCode::OK, json!({"imported": reports})),
-        Err(e) => failed(e),
+        Ok(imported) => Ok((StatusCode::OK, Json(ImportResponse { imported }))),
+        Err(e) => Err(failed(e)),
     }
 }
 
-pub async fn migrate(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Err(refusal) = require_admin_key(&headers) {
-        return refusal;
-    }
+/// Copy `from`'s stores into `to` in the same data directory. A migration the report marks
+/// blocked is refused with 409 `{"error": "blocked", "report": …}`; other refusals are
+/// `{"error", "detail"}` bodies, as for export.
+#[allow(
+    clippy::result_large_err,
+    reason = "the refusal is the Response the route sends, built once per request"
+)]
+pub async fn migrate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<MigrateResponse>), Response> {
+    require_admin_key(&headers)?;
     let prepared = (|| {
         let req: MigrateRequest = parse(&body)?;
         let from = backend(&req.from)?;
@@ -186,22 +224,19 @@ pub async fn migrate(State(state): State<AppState>, headers: HeaderMap, body: By
         let quarantine = quarantine_dir(&state, req.quarantine.as_deref())?;
         Ok::<_, Response>((from, to, scope, req.dry_run, quarantine))
     })();
-    let (from, to, scope, dry_run, quarantine) = match prepared {
-        Ok(p) => p,
-        Err(r) => return r,
-    };
+    let (from, to, scope, dry_run, quarantine) = prepared?;
     let base = state.base_path.clone();
     match blocking(move || {
         migrate::migrate(&base, from, to, &scope, dry_run, quarantine.as_deref())
     })
     .await
     {
-        Ok(report) if report.blocked() => respond(
+        Ok(report) if report.blocked() => Err(respond(
             StatusCode::CONFLICT,
             json!({"error": "blocked", "report": report}),
-        ),
-        Ok(report) => respond(StatusCode::OK, json!({"report": report})),
-        Err(e) => failed(e),
+        )),
+        Ok(report) => Ok((StatusCode::OK, Json(MigrateResponse { report }))),
+        Err(e) => Err(failed(e)),
     }
 }
 

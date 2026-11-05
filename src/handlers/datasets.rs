@@ -28,8 +28,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Json, Response},
+    response::Json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -384,7 +383,7 @@ pub async fn query_dataset(
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(name): Path<String>,
     Json(req): Json<QueryRequest>,
-) -> Result<Response, AppError> {
+) -> Result<Json<QueryResponse>, AppError> {
     let user_id = resolve_request_user_id(
         req.user_id.as_deref(),
         authenticated_user.as_ref().map(|e| &e.0),
@@ -470,7 +469,7 @@ pub async fn query_dataset(
         columns,
         rows: out_rows,
     };
-    Ok((StatusCode::OK, Json(body)).into_response())
+    Ok(Json(body))
 }
 
 /// POST /api/datasets/{name}/link — link a row to an entity or memory.

@@ -114,8 +114,9 @@ const CHECKS: &[(&str, &str, Check)] = &[
 /// Routes whose handler still answers an untyped `serde_json::Value` or an opaque
 /// `Response`, so the schema has no fields to sample. Each is a Phase 1 item of the schema
 /// remediation plan; when its handler gains a typed reply this test refuses the entry so the
-/// row above starts to count.
-const UNTYPED_TODAY: &[&str] = &["POST /api/datasets/{name}/query"];
+/// row above starts to count. Every route above that the schema shows untyped must be listed
+/// here, so a handler that loses its typed reply fails loudly too.
+const UNTYPED_TODAY: &[&str] = &[];
 
 const UNTYPED_RESPONSES: &[&str] = &["serde_json::Value", "opaque", "no body", "unknown"];
 
@@ -325,7 +326,7 @@ fn every_mcp_route_exists_in_the_schema() {
 }
 
 #[test]
-fn untyped_today_lists_only_routes_still_untyped() {
+fn untyped_today_lists_exactly_the_untyped_routes() {
     let schemas = schemas();
     for route in UNTYPED_TODAY {
         let found = schemas
@@ -337,6 +338,20 @@ fn untyped_today_lists_only_routes_still_untyped() {
             "{route} now answers `{response}`: drop it from UNTYPED_TODAY so its row is checked"
         );
     }
+    let unlisted: Vec<String> = CHECKS
+        .iter()
+        .filter(|(route, _, _)| !UNTYPED_TODAY.contains(route))
+        .filter_map(|(route, _, _)| {
+            let response = schemas.route(route)?["response"].as_str()?;
+            UNTYPED_RESPONSES
+                .contains(&response)
+                .then(|| format!("{route} answers `{response}`"))
+        })
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "routes an MCP tool reads that answer no typed reply: {unlisted:?}"
+    );
 }
 
 #[test]

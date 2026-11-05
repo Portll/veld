@@ -50,24 +50,26 @@ pub const ADMIN_API_KEY_ENV: &str = "VELD_ADMIN_API_KEY";
 /// a compromised regular key still hits the GCRA wall. The admin key has a
 /// strictly smaller blast radius — it can only reset the rate limiter, nothing
 /// else.
+#[allow(
+    clippy::result_large_err,
+    reason = "the refusal is the Response the route sends, built once per request"
+)]
 pub async fn reset_rate_limit(
     handle: Option<Extension<ResetHandle>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Response {
+) -> Result<StatusCode, Response> {
     // 0) Rate limiting must be enabled — otherwise there is no Extension to
     //    extract and nothing to reset.
     let Some(Extension(handle)) = handle else {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "rate_limiting_disabled"})),
         )
-            .into_response();
+            .into_response());
     };
 
-    if let Err(refusal) = require_admin_key(&headers) {
-        return refusal;
-    }
+    require_admin_key(&headers)?;
 
     // 4) Authenticated — perform the reset and audit-log.
     //    The audit trail is the caller IP; no key material (not even a prefix)
@@ -78,7 +80,7 @@ pub async fn reset_rate_limit(
         "rate-limit state reset by admin endpoint"
     );
 
-    StatusCode::NO_CONTENT.into_response()
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The admin-key gate: 503 when `VELD_ADMIN_API_KEY` is unset, 401 when

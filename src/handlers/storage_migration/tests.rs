@@ -201,3 +201,62 @@ async fn an_export_failure_is_an_error_response_never_a_success() {
         "{body}"
     );
 }
+
+#[test]
+fn typed_replies_serialise_to_the_bodies_once_built_with_json() {
+    use crate::storage::migrate::{DumpReport, ImportReport, MigrateReport, Unit};
+
+    let dump = DumpReport {
+        unit: Unit::User("una".into()),
+        path: "exports/n/una.veldport".into(),
+        frames: 2,
+        records: 1,
+        digest: "d".into(),
+        derived_rows_not_carried: 0,
+        quarantined: 0,
+        source_records: 1,
+        quarantine: None,
+    };
+    let imported = ImportReport {
+        unit: Unit::Shared,
+        source: "exports/n/shared.veldport".into(),
+        frames: 2,
+        records: 1,
+        digest: "d".into(),
+        verified_frames: 2,
+        verified_digest: "d".into(),
+        verified_sealed_records: 0,
+    };
+    let report = MigrateReport {
+        from: "rocksdb".into(),
+        to: "redb".into(),
+        dry_run: false,
+        quarantine_requested: false,
+        units: Vec::new(),
+        imported: vec![imported.clone()],
+        quarantined: Vec::new(),
+    };
+    let cases = [
+        (
+            json!(super::ExportResponse {
+                dumps: vec![dump.clone()]
+            }),
+            json!({"dumps": [dump]}),
+        ),
+        (
+            json!(super::ImportResponse {
+                imported: vec![imported.clone()]
+            }),
+            json!({"imported": [imported]}),
+        ),
+        (
+            json!(super::MigrateResponse {
+                report: report.clone()
+            }),
+            json!({"report": report}),
+        ),
+    ];
+    for (typed, by_hand) in cases {
+        assert_eq!(typed, by_hand);
+    }
+}
