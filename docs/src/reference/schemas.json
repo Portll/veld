@@ -1346,6 +1346,12 @@
       "response": "ReminderActionResponse"
     },
     {
+      "method": "GET",
+      "path": "/api/replication/role",
+      "handler": "replica::role",
+      "response": "RoleReport"
+    },
+    {
       "method": "POST",
       "path": "/api/search/advanced",
       "handler": "search::advanced_search",
@@ -1440,6 +1446,27 @@
       "handler": "external_dimensions::push_dimensions",
       "body": "SleightDimensionsRequest",
       "response": "SleightDimensionsResponse"
+    },
+    {
+      "method": "GET",
+      "path": "/api/spaces",
+      "handler": "spaces::list_spaces",
+      "query": "SpacesQuery",
+      "response": "SpacesResponse"
+    },
+    {
+      "method": "POST",
+      "path": "/api/spaces/align",
+      "handler": "spaces::align_spaces",
+      "body": "AlignRequest",
+      "response": "BridgeReport"
+    },
+    {
+      "method": "POST",
+      "path": "/api/spaces/retire",
+      "handler": "spaces::retire_space",
+      "body": "RetireRequest",
+      "response": "crate::memory::retrieval::RetireReport"
     },
     {
       "method": "POST",
@@ -3250,6 +3277,40 @@
         }
       ]
     },
+    "AlignRequest": {
+      "name": "AlignRequest",
+      "file": "src/handlers/spaces.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "from",
+          "type": "String",
+          "required": true,
+          "doc": "The space queries or foreign vectors arrive in.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "String",
+          "required": true,
+          "doc": "The space they are searched in.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "AnchorRequest": {
       "name": "AnchorRequest",
       "file": "src/handlers/crud.rs",
@@ -3505,6 +3566,22 @@
             "Option",
             "String"
           ]
+        },
+        {
+          "name": "by_target_space",
+          "type": "BTreeMap<String, usize>",
+          "required": true,
+          "doc": "Rows by the space they wait for; `primary` for rows that name none.",
+          "refs": [
+            "BTreeMap",
+            "String"
+          ]
+        },
+        {
+          "name": "space_mismatches",
+          "type": "usize",
+          "required": true,
+          "doc": "Rows whose memory stores a vector in another space than the index that refused it."
         }
       ]
     },
@@ -4239,6 +4316,65 @@
           "notes": [
             "score"
           ]
+        }
+      ]
+    },
+    "BridgeReport": {
+      "name": "BridgeReport",
+      "file": "src/embeddings/alignment_spaces.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "from",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "method",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "pairs",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "held_out",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "held_out_cosine",
+          "type": "f32",
+          "required": true,
+          "doc": "Mean cosine between a held-out `from` vector, mapped, and its own `to` vector. The map's confidence."
+        },
+        {
+          "name": "held_out_recall_at_1",
+          "type": "f32",
+          "required": true,
+          "doc": "Share of held-out mapped vectors whose nearest held-out `to` vector is their own pair."
+        },
+        {
+          "name": "held_out_csls_recall_at_1",
+          "type": "f32",
+          "required": true,
+          "doc": "The same with CSLS hubness correction applied to the comparison."
         }
       ]
     },
@@ -5107,13 +5243,38 @@
           ]
         },
         {
+          "name": "fusion",
+          "type": "Option<FusionMode>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "How recall Layer 4 fuses its candidate lists. `None` is [`FusionMode::Rrf`] unless `SHODH_FUSION_FLAT` asks for FLAT ([`crate::memory::ablation`]); a set dial wins over that variable.",
+          "refs": [
+            "Option",
+            "FusionMode"
+          ]
+        },
+        {
+          "name": "graph_candidates_only",
+          "type": "Option<bool>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Whether the graph leg only admits candidates to recall Layer 4. A graph hit joins the pool, but its fused score comes from the vector and BM25 lists alone: a hit neither list returned is scored as the vector list would have scored it, its cosine over the list's best, and the graph's activation and hop weight add nothing anywhere. `None` and `Some(false)` score the graph leg.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
           "name": "rrf_k_outer",
           "type": "Option<f32>",
           "required": false,
           "notes": [
             "default when absent"
           ],
-          "doc": "RRF k for the outer graph+hybrid fusion (recall.rs Layer 4). Default 20.",
+          "doc": "RRF k for the outer graph+hybrid fusion (recall.rs Layer 4), read only under [`FusionMode::Rrf`]. Default 20.",
           "refs": [
             "Option"
           ]
@@ -5155,6 +5316,32 @@
           ]
         },
         {
+          "name": "space_weights",
+          "type": "std::collections::BTreeMap<String, f32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Per-space multiplier on a non-primary space's RRF contribution, keyed by space id (`<model>@<dimension>`); a space with no entry weighs 1.0. The primary space's vector weight is `rrf_weights`' second term.",
+          "refs": [
+            "BTreeMap",
+            "String"
+          ]
+        },
+        {
+          "name": "space_candidates",
+          "type": "std::collections::BTreeMap<String, f32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Per-space candidate budget of a recall leg beyond the primary index, in multiples of the results asked for, keyed by space id. A space with no entry asks for what its own record of returned depth supports, 8 until it has one. The primary space's entry governs the leg through the secondary-to-primary map, not the primary search.",
+          "refs": [
+            "BTreeMap",
+            "String"
+          ]
+        },
+        {
           "name": "bm25_min_score",
           "type": "Option<f32>",
           "required": false,
@@ -5174,7 +5361,7 @@
           "notes": [
             "default when absent"
           ],
-          "doc": "Ontological rerank boost per entity-label match. Default 0.15.",
+          "doc": "Ontological rerank boost per entity-label match, as a share of the memory's fused score. Default 0.15.",
           "refs": [
             "Option"
           ]
@@ -5186,7 +5373,7 @@
           "notes": [
             "default when absent"
           ],
-          "doc": "Ontological rerank boost cap. Default 0.40.",
+          "doc": "Ontological rerank boost cap, as a share of the fused score. Default 0.40.",
           "refs": [
             "Option"
           ]
@@ -5198,7 +5385,7 @@
           "notes": [
             "default when absent"
           ],
-          "doc": "Ontological rerank mismatch penalty (negative). Default -0.08.",
+          "doc": "Ontological rerank mismatch penalty (negative), as a share of the fused score: -1 zeroes it. Default -0.08.",
           "refs": [
             "Option"
           ]
@@ -5222,7 +5409,7 @@
           "notes": [
             "default when absent"
           ],
-          "doc": "Temporal-fact source-memory boost. Default 0.20.",
+          "doc": "Temporal-fact source-memory boost, as a share of the memory's fused score. Default 0.20.",
           "refs": [
             "Option"
           ]
@@ -8468,6 +8655,20 @@
           "name": "todo_count",
           "type": "usize",
           "required": true
+        },
+        {
+          "name": "not_replicated",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "doc": "As in [`ExportedDocument::not_replicated`].",
+          "refs": [
+            "Vec",
+            "String"
+          ]
         }
       ]
     },
@@ -10140,11 +10341,44 @@
       "variants": [
         {
           "name": "Document",
-          "payload": "Box<MifDocument>"
+          "payload": "Box<ExportedDocument>"
         },
         {
           "name": "Encoded",
           "payload": "EncodedExport"
+        }
+      ]
+    },
+    "ExportedDocument": {
+      "name": "ExportedDocument",
+      "file": "src/handlers/mif.rs",
+      "doc": "A `veld` or `json` export of `POST /api/export/mif`: the MIF document's own fields.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "document",
+          "type": "MifDocument",
+          "required": true,
+          "notes": [
+            "flattened into the parent"
+          ],
+          "refs": [
+            "MifDocument"
+          ]
+        },
+        {
+          "name": "not_replicated",
+          "type": "Vec<String>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "doc": "On a follower, the exported stores replication does not carry: they hold this instance's own data, not its leader's. An import ignores the field.",
+          "refs": [
+            "Vec",
+            "String"
+          ]
         }
       ]
     },
@@ -11578,6 +11812,23 @@
         }
       ]
     },
+    "FusionMode": {
+      "name": "FusionMode",
+      "file": "src/memory/dials.rs",
+      "doc": "How recall Layer 4 joins its candidate lists into one fused score.",
+      "kind": "enum",
+      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "variants": [
+        {
+          "name": "flat",
+          "doc": "Calibrated max (shodh-memory's FLAT fusion, #320). Each list enters at its weight times the candidate's score over the list's best score; the vector and BM25 lists join as the larger of the two plus [`crate::constants::FLAT_CONSENSUS`] of the smaller. Not the default: on veld's LoCoMo hold-out it cost p@1 (see [`crate::constants::FLAT_CONSENSUS`])."
+        },
+        {
+          "name": "rrf",
+          "doc": "Reciprocal rank, the default: each list adds `weight / (k + rank)`, with k from `rrf_k_outer`."
+        }
+      ]
+    },
     "GapAnalysisRequest": {
       "name": "GapAnalysisRequest",
       "file": "src/handlers/gap_analysis.rs",
@@ -12797,6 +13048,38 @@
           ]
         },
         {
+          "name": "embedding_spaces",
+          "type": "Vec<crate::embeddings::space::SpaceSummary>",
+          "required": true,
+          "doc": "Embedding spaces across the users in cache, summed by space: memories each index holds, backlog rows waiting for a vector in the space, and memories stored in it that an index in another space refused. Space ids name models and widths, never a tenant.",
+          "refs": [
+            "Vec",
+            "SpaceSummary"
+          ]
+        },
+        {
+          "name": "orphaned_corpora",
+          "type": "usize",
+          "required": true,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Users in cache whose corpus no index here can search by vector: memories stored, none indexed, vectors waiting. Any makes `status` degraded. A count, never a tenant id."
+        },
+        {
+          "name": "space_migrations",
+          "type": "Vec<crate::memory::space_migration::MigrationProgress>",
+          "required": true,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Space migrations under way for users in cache: a change of embedder re-embedding in the background, or the one-time stamp of spaces. Absent when none is running.",
+          "refs": [
+            "Vec",
+            "MigrationProgress"
+          ]
+        },
+        {
           "name": "write_latch",
           "type": "Vec<crate::storage::write_latch::LatchSnapshot>",
           "required": true,
@@ -12938,6 +13221,15 @@
           "type": "bool",
           "required": true,
           "doc": "True when either index holds fewer memories than the store."
+        },
+        {
+          "name": "stored_source",
+          "type": "String",
+          "required": true,
+          "doc": "`maintained` for the running count, `recount` when `exact=true` walked the store.",
+          "refs": [
+            "String"
+          ]
         }
       ]
     },
@@ -18236,6 +18528,91 @@
         }
       ]
     },
+    "MigrationKind": {
+      "name": "MigrationKind",
+      "file": "src/memory/space_migration.rs",
+      "doc": "What the drain is doing to the corpus's spaces.",
+      "kind": "enum",
+      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "variants": [
+        {
+          "name": "stamp",
+          "doc": "Name the space of every vector that has none, without re-embedding: the corpus markers name it. Nothing is unreachable while it runs, since a vector with no space is read as the index's at the index's width."
+        },
+        {
+          "name": "reembed",
+          "doc": "Re-embed every primary vector not in `to`."
+        }
+      ]
+    },
+    "MigrationProgress": {
+      "name": "MigrationProgress",
+      "file": "src/memory/space_migration.rs",
+      "doc": "A migration's progress as the unauthenticated `/health` may show it: no cursor, no error text, nothing that names a memory or a host.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "kind",
+          "type": "MigrationKind",
+          "required": true,
+          "refs": [
+            "MigrationKind"
+          ]
+        },
+        {
+          "name": "from",
+          "type": "Option<SpaceId>",
+          "required": false,
+          "refs": [
+            "Option",
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "walked",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "total",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "changed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "failed",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "started_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "stalled",
+          "type": "bool",
+          "required": true,
+          "doc": "Whether the last batch stopped for want of an embedder."
+        }
+      ]
+    },
     "MirrorReport": {
       "name": "MirrorReport",
       "file": "src/memory/gap_topology/run.rs",
@@ -19289,6 +19666,18 @@
           "refs": [
             "Vec",
             "DetectedEntityInfo"
+          ]
+        },
+        {
+          "name": "not_replicated",
+          "type": "Vec<&'static str>",
+          "required": true,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "On a follower, the sections read from stores replication does not carry: they hold this instance's own data, not its leader's.",
+          "refs": [
+            "Vec"
           ]
         }
       ]
@@ -20990,6 +21379,24 @@
             "default when absent"
           ],
           "doc": "Also match tags veld derived from the content (NER, keywords, ingest hints). Off by default: a keyword such as `handoff` or `decision` pulled out of the text would otherwise answer for the writer's own tag of the same name."
+        },
+        {
+          "name": "include_annotations",
+          "type": "bool",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The write-time NER records and co-occurrence pairs the graph was built from: per-token type, span and confidence, about 39 KB per memory on the live store and three quarters of a tag-recall response. Readers of the text do not need them."
+        },
+        {
+          "name": "include_context",
+          "type": "bool",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The memory's rich context (conversation, project, environment, repo)."
         }
       ]
     },
@@ -21377,7 +21784,21 @@
         {
           "name": "score",
           "type": "f32",
-          "required": true
+          "required": true,
+          "doc": "The pipeline's unified score divided by the top result's, so it sits in `[0, 1]`, falls with rank, and the gap between two results means something. Rank-based when the pipeline attached no score."
+        },
+        {
+          "name": "raw_score",
+          "type": "Option<f32>",
+          "required": false,
+          "notes": [
+            "omitted when empty",
+            "score"
+          ],
+          "doc": "The unified score as the pipeline left it, unnormalised, so a reader can check a ranking against its signal attribution. Absent when the pipeline attached none.",
+          "refs": [
+            "Option"
+          ]
         },
         {
           "name": "tier",
@@ -22257,6 +22678,58 @@
         },
         {
           "name": "password",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "RegisteredAlignment": {
+      "name": "RegisteredAlignment",
+      "file": "src/embeddings/space.rs",
+      "doc": "A fitted map between two spaces, recorded where the registry's readers can see it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "from",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "method",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "residual",
+          "type": "Option<f32>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "The fit's held-out residual; the confidence an aligned result is discounted by.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "path",
           "type": "String",
           "required": true,
           "refs": [
@@ -23807,6 +24280,56 @@
         }
       ]
     },
+    "RetireReport": {
+      "name": "RetireReport",
+      "file": "src/memory/retrieval.rs",
+      "doc": "What retiring a space removed.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "space",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "vectors_dropped",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "maps_removed",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
+    "RetireRequest": {
+      "name": "RetireRequest",
+      "file": "src/handlers/spaces.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "space",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "RetrievalStats": {
       "name": "RetrievalStats",
       "file": "src/memory/types.rs",
@@ -24426,6 +24949,129 @@
         }
       ]
     },
+    "Role": {
+      "name": "Role",
+      "file": "src/replication.rs",
+      "doc": "What this instance is to replication, as `GET /api/replication/role` reports it.",
+      "kind": "enum",
+      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "variants": [
+        {
+          "name": "leader"
+        },
+        {
+          "name": "follower"
+        },
+        {
+          "name": "standalone"
+        }
+      ]
+    },
+    "RoleReport": {
+      "name": "RoleReport",
+      "file": "src/replication.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "role",
+          "type": "Role",
+          "required": true,
+          "refs": [
+            "Role"
+          ]
+        },
+        {
+          "name": "instance_id",
+          "type": "uuid::Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "leader_instance_id",
+          "type": "Option<uuid::Uuid>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "Uuid"
+          ]
+        },
+        {
+          "name": "leader_url",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "lag_frames",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "lag_seconds",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "leader_contact_age_seconds",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "See [`FollowStatus::leader_contact_age_seconds`].",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "followers_count",
+          "type": "Option<usize>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "Followers that polled in the last [`FOLLOWER_TTL`]; absent when there are none.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "max_lag_frames",
+          "type": "Option<u64>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "The largest follower lag: each follower's `lag_frames` summed over its tenants.",
+          "refs": [
+            "Option"
+          ]
+        }
+      ]
+    },
     "RotatePassphraseBody": {
       "name": "RotatePassphraseBody",
       "file": "src/handlers/keys.rs",
@@ -24574,6 +25220,29 @@
           "refs": [
             "Option"
           ]
+        }
+      ]
+    },
+    "ScoreStats": {
+      "name": "ScoreStats",
+      "file": "src/embeddings/space.rs",
+      "doc": "The distribution of the best similarities a space's searches return, as an exponential moving mean and variance. Two models' cosines are not on one scale: a sharper model's near-misses can outscore a flatter model's hits. A similarity is moved onto another space's scale by matching z-scores, which is what any comparison of raw cosines across spaces needs.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "mean",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "variance",
+          "type": "f32",
+          "required": true
+        },
+        {
+          "name": "samples",
+          "type": "u64",
+          "required": true
         }
       ]
     },
@@ -25839,6 +26508,343 @@
         {
           "name": "Unknown",
           "doc": "Unknown source"
+        }
+      ]
+    },
+    "SpaceId": {
+      "name": "SpaceId",
+      "file": "src/embeddings/space.rs",
+      "kind": "newtype",
+      "inner": "String",
+      "refs": [
+        "String"
+      ]
+    },
+    "SpaceIndexSummary": {
+      "name": "SpaceIndexSummary",
+      "file": "src/handlers/health.rs",
+      "doc": "One embedding space's index, as `GET /api/health/index` summarises it.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "space",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "codec",
+          "type": "String",
+          "required": true,
+          "doc": "`f32` or `pq`.",
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "memories",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "total_vectors",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "vector_bytes",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "deleted_count",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "needs_rebuild",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "needs_compaction",
+          "type": "bool",
+          "required": true
+        }
+      ]
+    },
+    "SpaceMigration": {
+      "name": "SpaceMigration",
+      "file": "src/memory/space_migration.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "kind",
+          "type": "MigrationKind",
+          "required": true,
+          "refs": [
+            "MigrationKind"
+          ]
+        },
+        {
+          "name": "from",
+          "type": "Option<SpaceId>",
+          "required": false,
+          "doc": "The space the corpus markers named when the migration began; `None` when they named none. A stamp records it on vectors with no space.",
+          "refs": [
+            "Option",
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "to",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "cursor",
+          "type": "Option<MemoryId>",
+          "required": false,
+          "doc": "The last memory id the drain finished; the next batch starts after it.",
+          "refs": [
+            "Option",
+            "MemoryId"
+          ]
+        },
+        {
+          "name": "started_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "finished_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "walked",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Memories the drain has walked past."
+        },
+        {
+          "name": "changed",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Memories it re-embedded, or stamped."
+        },
+        {
+          "name": "failed",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Memories it could not finish: unreadable, or the embedder refused them. They are left to the backlog."
+        },
+        {
+          "name": "total",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Memories in the store when the migration began."
+        },
+        {
+          "name": "last_error",
+          "type": "Option<String>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "bridge_tried",
+          "type": "bool",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Whether the drain has tried to map the new space back into the old one."
+        }
+      ]
+    },
+    "SpaceSummary": {
+      "name": "SpaceSummary",
+      "file": "src/embeddings/space.rs",
+      "doc": "What one corpus, or a fleet of them, holds in a space.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "model",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "dimension",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "codec",
+          "type": "String",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "memories",
+          "type": "usize",
+          "required": true,
+          "doc": "Memories an index in this space holds."
+        },
+        {
+          "name": "backlog",
+          "type": "usize",
+          "required": true,
+          "doc": "Backlog rows waiting for a vector in this space."
+        },
+        {
+          "name": "stranded",
+          "type": "usize",
+          "required": true,
+          "doc": "Memories whose stored vector is in this space and was refused by an index in another."
+        },
+        {
+          "name": "kept",
+          "type": "usize",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Memories keeping a vector in this space that no index here holds: a vector a re-embed replaced, or one another instance wrote. Counted by a census over the store, at most hourly, so it may lag the store by that much."
+        },
+        {
+          "name": "scores",
+          "type": "Option<ScoreStats>",
+          "required": false,
+          "notes": [
+            "default when absent",
+            "omitted when empty"
+          ],
+          "doc": "How this space's search similarities are distributed, learned from its own searches; see [`ScoreStats`]. Absent until enough searches have run.",
+          "refs": [
+            "Option",
+            "ScoreStats"
+          ]
+        }
+      ]
+    },
+    "SpacesQuery": {
+      "name": "SpacesQuery",
+      "file": "src/handlers/spaces.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "SpacesResponse": {
+      "name": "SpacesResponse",
+      "file": "src/handlers/spaces.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user_id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "index_space",
+          "type": "SpaceId",
+          "required": true,
+          "refs": [
+            "SpaceId"
+          ]
+        },
+        {
+          "name": "spaces",
+          "type": "Vec<SpaceSummary>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "SpaceSummary"
+          ]
+        },
+        {
+          "name": "alignments",
+          "type": "Vec<RegisteredAlignment>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "RegisteredAlignment"
+          ]
+        },
+        {
+          "name": "migration",
+          "type": "Option<crate::memory::space_migration::SpaceMigration>",
+          "required": false,
+          "notes": [
+            "omitted when empty"
+          ],
+          "doc": "The corpus's space migration, finished or under way, when one was ever recorded.",
+          "refs": [
+            "Option",
+            "SpaceMigration"
+          ]
         }
       ]
     },
@@ -28947,6 +29953,16 @@
           "refs": [
             "Option",
             "SecondaryIndexSummary"
+          ]
+        },
+        {
+          "name": "spaces",
+          "type": "Vec<SpaceIndexSummary>",
+          "required": true,
+          "doc": "Every non-primary embedding space's index, the secondary's included.",
+          "refs": [
+            "Vec",
+            "SpaceIndexSummary"
           ]
         },
         {

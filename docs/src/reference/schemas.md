@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **273** routes over **570** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **277** routes over **588** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -417,6 +417,12 @@ The request and response shape of every HTTP route, read from the handler signat
 | `POST` | `/api/reminders/{reminder_id}/delete` | query [`DeleteReminderQuery`](#deletereminderquery); path `{reminder_id: String}` | [`ReminderActionResponse`](#reminderactionresponse) |
 | `POST` | `/api/reminders/{reminder_id}/dismiss` | body [`DismissReminderRequest`](#dismissreminderrequest); path `{reminder_id: String}` | [`ReminderActionResponse`](#reminderactionresponse) |
 
+### /replication
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/api/replication/role` | none | [`RoleReport`](#rolereport) |
+
 ### /search
 
 | Method | Path | Request | Response |
@@ -454,6 +460,14 @@ The request and response shape of every HTTP route, read from the handler signat
 | Method | Path | Request | Response |
 |---|---|---|---|
 | `POST` | `/api/sleight/dimensions` | body [`SleightDimensionsRequest`](#sleightdimensionsrequest) | [`SleightDimensionsResponse`](#sleightdimensionsresponse) |
+
+### /spaces
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/api/spaces` | query [`SpacesQuery`](#spacesquery) | [`SpacesResponse`](#spacesresponse) |
+| `POST` | `/api/spaces/align` | body [`AlignRequest`](#alignrequest) | [`BridgeReport`](#bridgereport) |
+| `POST` | `/api/spaces/retire` | body [`RetireRequest`](#retirerequest) | crate::memory::retrieval::[`RetireReport`](#retirereport) |
 
 ### /spine
 
@@ -896,6 +910,16 @@ Defined in `src/memory/facets.rs`. Records which agent was operating from which 
 | `declared` | [`DeclaredWriter`](#declaredwriter) | no | default when absent; What the CALLER said about itself — see [`DeclaredWriter`]. |
 | `verified` | [`VerifiedWriter`](#verifiedwriter) | no | default when absent; What the SERVER established — see [`VerifiedWriter`]. |
 
+### AlignRequest
+
+Defined in `src/handlers/spaces.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `Option<String>` | no |  |
+| `from` | `String` | yes | The space queries or foreign vectors arrive in. |
+| `to` | `String` | yes | The space they are searched in. |
+
 ### AnchorRequest
 
 Defined in `src/handlers/crud.rs`. Request to anchor or unanchor a memory
@@ -972,6 +996,8 @@ Defined in `src/memory/embedding_backlog.rs`.
 | `max_attempts` | `u32` | yes |  |
 | `by_reason` | `BTreeMap<String, usize>` | yes |  |
 | `last_error` | `Option<String>` | no |  |
+| `by_target_space` | `BTreeMap<String, usize>` | yes | Rows by the space they wait for; `primary` for rows that name none. |
+| `space_mismatches` | `usize` | yes | Rows whose memory stores a vector in another space than the index that refused it. |
 
 ### BackupMetadata
 
@@ -1173,6 +1199,21 @@ Defined in `src/handlers/visualization.rs`. Brain statistics
 | `longterm_count` | `usize` | yes |  |
 | `avg_activation` | `f32` | yes |  |
 | `avg_importance` | `f32` | yes | score |
+
+### BridgeReport
+
+Defined in `src/embeddings/alignment_spaces.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `from` | [`SpaceId`](#spaceid) | yes |  |
+| `to` | [`SpaceId`](#spaceid) | yes |  |
+| `method` | `String` | yes |  |
+| `pairs` | `usize` | yes |  |
+| `held_out` | `usize` | yes |  |
+| `held_out_cosine` | `f32` | yes | Mean cosine between a held-out `from` vector, mapped, and its own `to` vector. The map's confidence. |
+| `held_out_recall_at_1` | `f32` | yes | Share of held-out mapped vectors whose nearest held-out `to` vector is their own pair. |
+| `held_out_csls_recall_at_1` | `f32` | yes | The same with CSLS hubness correction applied to the comparison. |
 
 ### Bucket
 
@@ -1432,16 +1473,20 @@ Defined in `src/memory/dials.rs`. Runtime-tunable cognitive parameters for a sin
 | `rerank_model` | `Option<String>` | no | default when absent; Which cross-encoder reranks, by registry id (`crate::embeddings::cross_encoder::lookup`). `None` keeps the process-wide choice (`VELD_CROSS_ENCODER`, else mxbai-rerank-xsmall-v1). Set to `ms-marco-MiniLM-L-6-v2` for the recall gate's parity arm against upstream. [`CognitiveDials::sanitized`] drops an id the registry does not know, so what `GET /api/dials` returns is what reranks. |
 | `rrf_weights` | `Option<(f32, f32, f32)>` | no | default when absent; Override the RRF fusion weights `(bm25, vector, graph)`. `None` keeps the engine/learned weights. |
 | `date_window_leg` | `Option<bool>` | no | default when absent; Whether recall adds the date window candidate leg: when a query names a calendar day or month-year, memories whose `created_at` falls in that window enter RRF fusion as their own candidate list (recall.rs Layer 4). `None` and `Some(true)` run it; `Some(false)` leaves the window to the temporal boost only. |
-| `rrf_k_outer` | `Option<f32>` | no | default when absent; RRF k for the outer graph+hybrid fusion (recall.rs Layer 4). Default 20. |
+| `fusion` | Option&lt;[`FusionMode`](#fusionmode)&gt; | no | default when absent; How recall Layer 4 fuses its candidate lists. `None` is [`FusionMode::Rrf`] unless `SHODH_FUSION_FLAT` asks for FLAT ([`crate::memory::ablation`]); a set dial wins over that variable. |
+| `graph_candidates_only` | `Option<bool>` | no | default when absent; Whether the graph leg only admits candidates to recall Layer 4. A graph hit joins the pool, but its fused score comes from the vector and BM25 lists alone: a hit neither list returned is scored as the vector list would have scored it, its cosine over the list's best, and the graph's activation and hop weight add nothing anywhere. `None` and `Some(false)` score the graph leg. |
+| `rrf_k_outer` | `Option<f32>` | no | default when absent; RRF k for the outer graph+hybrid fusion (recall.rs Layer 4), read only under [`FusionMode::Rrf`]. Default 20. |
 | `rrf_k_decomp` | `Option<f32>` | no | default when absent; RRF k for the decomposed sub-query merge. Default 20. |
 | `rrf_k_inner` | `Option<f32>` | no | default when absent; RRF k for the inner BM25+vector fusion (hybrid_search). Default 45. |
 | `secondary_rrf_ratio` | `Option<f32>` | no | default when absent; Weight ratio of the secondary (768d) vector index signal. Default 0.5. |
+| `space_weights` | `std::collections::BTreeMap<String, f32>` | no | default when absent; Per-space multiplier on a non-primary space's RRF contribution, keyed by space id (`<model>@<dimension>`); a space with no entry weighs 1.0. The primary space's vector weight is `rrf_weights`' second term. |
+| `space_candidates` | `std::collections::BTreeMap<String, f32>` | no | default when absent; Per-space candidate budget of a recall leg beyond the primary index, in multiples of the results asked for, keyed by space id. A space with no entry asks for what its own record of returned depth supports, 8 until it has one. The primary space's entry governs the leg through the secondary-to-primary map, not the primary search. |
 | `bm25_min_score` | `Option<f32>` | no | default when absent; score; BM25 minimum-score floor for lexical candidates. Default 0.1. |
-| `onto_rerank_boost` | `Option<f32>` | no | default when absent; Ontological rerank boost per entity-label match. Default 0.15. |
-| `onto_rerank_max` | `Option<f32>` | no | default when absent; Ontological rerank boost cap. Default 0.40. |
-| `onto_rerank_penalty` | `Option<f32>` | no | default when absent; Ontological rerank mismatch penalty (negative). Default -0.08. |
+| `onto_rerank_boost` | `Option<f32>` | no | default when absent; Ontological rerank boost per entity-label match, as a share of the memory's fused score. Default 0.15. |
+| `onto_rerank_max` | `Option<f32>` | no | default when absent; Ontological rerank boost cap, as a share of the fused score. Default 0.40. |
+| `onto_rerank_penalty` | `Option<f32>` | no | default when absent; Ontological rerank mismatch penalty (negative), as a share of the fused score: -1 zeroes it. Default -0.08. |
 | `ce_blend` | `Option<f32>` | no | default when absent; Cross-encoder share of the Layer 5.3 blend for every query shape at once, except that Abstract (decomposed) never drops below its own share. `None` lets the per-shape dials and `constants::CE_BLEND_*` decide. See `ce_share`. |
-| `temporal_recall_boost` | `Option<f32>` | no | default when absent; Temporal-fact source-memory boost. Default 0.20. |
+| `temporal_recall_boost` | `Option<f32>` | no | default when absent; Temporal-fact source-memory boost, as a share of the memory's fused score. Default 0.20. |
 | `ce_blend_identifier` | `Option<f32>` | no | default when absent; Cross-encoder share for one query shape; each overrides its `constants::CE_BLEND_*` default and is itself overridden by `ce_blend`. See `ce_share`. |
 | `ce_blend_ordinal` | `Option<f32>` | no | default when absent |
 | `ce_blend_temporal` | `Option<f32>` | no | default when absent |
@@ -2307,6 +2352,7 @@ Defined in `src/handlers/mif.rs`. A non-JSON export of `POST /api/export/mif`.
 | `data` | `String` | yes | The adapter's output, as text. |
 | `memory_count` | `usize` | yes |  |
 | `todo_count` | `usize` | yes |  |
+| `not_replicated` | `Vec<String>` | no | default when absent; omitted when empty; As in [`ExportedDocument::not_replicated`]. |
 
 ### EndSessionRequest
 
@@ -2651,8 +2697,17 @@ Enum, untagged: the variant's payload alone.
 
 | Variant | Payload | Notes |
 |---|---|---|
-| `Document` | Box&lt;[`MifDocument`](#mifdocument)&gt; |  |
+| `Document` | Box&lt;[`ExportedDocument`](#exporteddocument)&gt; |  |
 | `Encoded` | [`EncodedExport`](#encodedexport) |  |
+
+### ExportedDocument
+
+Defined in `src/handlers/mif.rs`. A `veld` or `json` export of `POST /api/export/mif`: the MIF document's own fields.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `document` | [`MifDocument`](#mifdocument) | yes | flattened into the parent |
+| `not_replicated` | `Vec<String>` | no | default when absent; omitted when empty; On a follower, the exported stores replication does not carry: they hold this instance's own data, not its leader's. An import ignores the field. |
 
 ### ExternalIdRecord
 
@@ -3091,6 +3146,17 @@ Defined in `src/entity_frequency.rs`.
 | `totals` | `BTreeMap<String, usize>` | yes |  |
 | `undetermined` | Option&lt;[`Undetermined`](#undetermined)&gt; | no | omitted when empty |
 
+### FusionMode
+
+Defined in `src/memory/dials.rs`. How recall Layer 4 joins its candidate lists into one fused score.
+
+Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `flat` | none | Calibrated max (shodh-memory's FLAT fusion, #320). Each list enters at its weight times the candidate's score over the list's best score; the vector and BM25 lists join as the larger of the two plus [`crate::constants::FLAT_CONSENSUS`] of the smaller. Not the default: on veld's LoCoMo hold-out it cost p@1 (see [`crate::constants::FLAT_CONSENSUS`]). |
+| `rrf` | none | Reciprocal rank, the default: each list adds `weight / (k + rank)`, with k from `rrf_k_outer`. |
+
 ### GapAnalysisRequest
 
 Defined in `src/handlers/gap_analysis.rs`.
@@ -3408,6 +3474,9 @@ Defined in `src/handlers/health.rs`. Health response for main health endpoint
 | `max_cache_size` | `usize` | yes |  |
 | `embedder` | Option&lt;crate::embeddings::[`PrimaryEmbedderInfo`](#primaryembedderinfo)&gt; | no | omitted when empty; The primary embedder this process chose (id, model, dimension, kind, reason). `null` until the first user's memory system has been constructed. Measured 2026-09-10: the running server was on hash-bigram vectors and nothing on this endpoint said so. |
 | `tenants_with_data` | crate::storage::boot_guard::[`BackendCensus`](#backendcensus) | yes | Tenants holding data on each backend at boot. `users_count` over an empty store is the 2026-09-10 outage; this is what tells the two apart. |
+| `embedding_spaces` | Vec&lt;crate::embeddings::space::[`SpaceSummary`](#spacesummary)&gt; | yes | Embedding spaces across the users in cache, summed by space: memories each index holds, backlog rows waiting for a vector in the space, and memories stored in it that an index in another space refused. Space ids name models and widths, never a tenant. |
+| `orphaned_corpora` | `usize` | yes | omitted when empty; Users in cache whose corpus no index here can search by vector: memories stored, none indexed, vectors waiting. Any makes `status` degraded. A count, never a tenant id. |
+| `space_migrations` | Vec&lt;crate::memory::space_migration::[`MigrationProgress`](#migrationprogress)&gt; | yes | omitted when empty; Space migrations under way for users in cache: a change of embedder re-embedding in the background, or the one-time stamp of spaces. Absent when none is running. |
 | `write_latch` | Vec&lt;crate::storage::write_latch::[`LatchSnapshot`](#latchsnapshot)&gt; | yes | omitted when empty; One entry per store currently refusing writes; absent when none is. Measured 2026-10-11: this endpoint served `healthy` through 11,088 consecutive failed writes. |
 
 ### HiddenCount
@@ -3454,6 +3523,7 @@ Defined in `src/handlers/health.rs`. Populations, not error counts: a memory sto
 | `vector_indexed` | `usize` | yes |  |
 | `lexically_indexed` | `usize` | yes |  |
 | `shortfall` | `bool` | yes | True when either index holds fewer memories than the store. |
+| `stored_source` | `String` | yes | `maintained` for the running count, `recount` when `exact=true` walked the store. |
 
 ### IndexHealthResponse
 
@@ -4741,6 +4811,33 @@ Defined in `src/handlers/types.rs`.
 | `already_current_count` | `usize` | yes |  |
 | `failed_count` | `usize` | yes |  |
 
+### MigrationKind
+
+Defined in `src/memory/space_migration.rs`. What the drain is doing to the corpus's spaces.
+
+Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `stamp` | none | Name the space of every vector that has none, without re-embedding: the corpus markers name it. Nothing is unreachable while it runs, since a vector with no space is read as the index's at the index's width. |
+| `reembed` | none | Re-embed every primary vector not in `to`. |
+
+### MigrationProgress
+
+Defined in `src/memory/space_migration.rs`. A migration's progress as the unauthenticated `/health` may show it: no cursor, no error text, nothing that names a memory or a host.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `kind` | [`MigrationKind`](#migrationkind) | yes |  |
+| `from` | Option&lt;[`SpaceId`](#spaceid)&gt; | no |  |
+| `to` | [`SpaceId`](#spaceid) | yes |  |
+| `walked` | `usize` | yes |  |
+| `total` | `usize` | yes |  |
+| `changed` | `usize` | yes |  |
+| `failed` | `usize` | yes |  |
+| `started_at` | `DateTime<Utc>` | yes |  |
+| `stalled` | `bool` | yes | Whether the last batch stopped for want of an embedder. |
+
 ### MirrorReport
 
 Defined in `src/memory/gap_topology/run.rs`. How a run's mirror was brought up to the graph.
@@ -5010,6 +5107,7 @@ Defined in `src/handlers/recall.rs`. Response for proactive context
 | `relevant_facts` | Vec&lt;[`ProactiveFact`](#proactivefact)&gt; | no | default when absent; omitted when empty; Consolidated facts from knowledge graph |
 | `latency_ms` | `f64` | yes | Processing latency in milliseconds |
 | `detected_entities` | Vec&lt;[`DetectedEntityInfo`](#detectedentityinfo)&gt; | no | default when absent; omitted when empty; Entities detected in the query context |
+| `not_replicated` | `Vec<&'static str>` | yes | omitted when empty; On a follower, the sections read from stores replication does not carry: they hold this instance's own data, not its leader's. |
 
 ### ProactiveFact
 
@@ -5423,6 +5521,8 @@ Defined in `src/handlers/recall.rs`. Recall memories by tags
 | `limit` | `Option<usize>` | no | Maximum number of results (default: 50) |
 | `include_embeddings` | `bool` | no | default when absent; Both embedding vectors are about 17 KB per memory; a caller that reads text does not need them. |
 | `include_derived` | `bool` | no | default when absent; Also match tags veld derived from the content (NER, keywords, ingest hints). Off by default: a keyword such as `handoff` or `decision` pulled out of the text would otherwise answer for the writer's own tag of the same name. |
+| `include_annotations` | `bool` | no | default when absent; The write-time NER records and co-occurrence pairs the graph was built from: per-token type, span and confidence, about 39 KB per memory on the live store and three quarters of a tag-recall response. Readers of the text do not need them. |
+| `include_context` | `bool` | no | default when absent; The memory's rich context (conversation, project, environment, repo). |
 
 ### RecallEvent
 
@@ -5521,7 +5621,8 @@ Defined in `src/handlers/types.rs`.
 | `experience` | [`RecallExperience`](#recallexperience) | yes |  |
 | `importance` | `f32` | yes | score |
 | `created_at` | `String` | yes |  |
-| `score` | `f32` | yes |  |
+| `score` | `f32` | yes | The pipeline's unified score divided by the top result's, so it sits in `[0, 1]`, falls with rank, and the gap between two results means something. Rank-based when the pipeline attached no score. |
+| `raw_score` | `Option<f32>` | no | omitted when empty; score; The unified score as the pipeline left it, unnormalised, so a reader can check a ranking against its signal attribution. Absent when the pipeline attached none. |
 | `tier` | `String` | yes |  |
 | `competition_conflict` | `Option<bool>` | no | omitted when empty |
 | `competition_opponent` | `Option<String>` | no | omitted when empty |
@@ -5726,6 +5827,18 @@ Defined in `src/handlers/user_auth.rs`.
 |---|---|---|---|
 | `username` | `String` | yes |  |
 | `password` | `String` | yes |  |
+
+### RegisteredAlignment
+
+Defined in `src/embeddings/space.rs`. A fitted map between two spaces, recorded where the registry's readers can see it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `from` | [`SpaceId`](#spaceid) | yes |  |
+| `to` | [`SpaceId`](#spaceid) | yes |  |
+| `method` | `String` | yes |  |
+| `residual` | `Option<f32>` | no | default when absent; The fit's held-out residual; the confidence an aligned result is discounted by. |
+| `path` | `String` | yes |  |
 
 ### ReinforceFeedbackRequest
 
@@ -6087,6 +6200,25 @@ Defined in `src/handlers/types.rs`.
 | `message` | `String` | yes |  |
 | `restored_stores` | `Vec<String>` | yes |  |
 
+### RetireReport
+
+Defined in `src/memory/retrieval.rs`. What retiring a space removed.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `space` | [`SpaceId`](#spaceid) | yes |  |
+| `vectors_dropped` | `usize` | yes |  |
+| `maps_removed` | `usize` | yes |  |
+
+### RetireRequest
+
+Defined in `src/handlers/spaces.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `Option<String>` | no |  |
+| `space` | `String` | yes |  |
+
 ### RetrievalStats
 
 Defined in `src/memory/types.rs`. Retrieval statistics for SHO-26 associative retrieval (debugging/observability)
@@ -6192,6 +6324,34 @@ Defined in `src/handlers/search.rs`.
 | `max_reward` | `Option<f32>` | no |  |
 | `limit` | `Option<usize>` | no |  |
 
+### Role
+
+Defined in `src/replication.rs`. What this instance is to replication, as `GET /api/replication/role` reports it.
+
+Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `leader` | none |  |
+| `follower` | none |  |
+| `standalone` | none |  |
+
+### RoleReport
+
+Defined in `src/replication.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `role` | [`Role`](#role) | yes |  |
+| `instance_id` | `uuid::Uuid` | yes |  |
+| `leader_instance_id` | `Option<uuid::Uuid>` | no | omitted when empty |
+| `leader_url` | `Option<String>` | no | omitted when empty |
+| `lag_frames` | `Option<u64>` | no | omitted when empty |
+| `lag_seconds` | `Option<u64>` | no | omitted when empty |
+| `leader_contact_age_seconds` | `Option<u64>` | no | omitted when empty; See [`FollowStatus::leader_contact_age_seconds`]. |
+| `followers_count` | `Option<usize>` | no | omitted when empty; Followers that polled in the last [`FOLLOWER_TTL`]; absent when there are none. |
+| `max_lag_frames` | `Option<u64>` | no | omitted when empty; The largest follower lag: each follower's `lag_frames` summed over its tenants. |
+
 ### RotatePassphraseBody
 
 Defined in `src/handlers/keys.rs`.
@@ -6236,6 +6396,16 @@ Defined in `src/memory/gap_topology/scope.rs`. The scope a result covers.
 | `nodes_analyzed` | `usize` | yes | Entities the analysis ran over. |
 | `sampled` | `bool` | yes | Fewer entities were analyzed than matched. |
 | `sample_method` | `Option<&'static str>` | no | How the sample was drawn, when `sampled`. |
+
+### ScoreStats
+
+Defined in `src/embeddings/space.rs`. The distribution of the best similarities a space's searches return, as an exponential moving mean and variance. Two models' cosines are not on one scale: a sharper model's near-misses can outscore a flatter model's hits. A similarity is moved onto another space's scale by matching z-scores, which is what any comparison of raw cosines across spaces needs.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `mean` | `f32` | yes |  |
+| `variance` | `f32` | yes |  |
+| `samples` | `u64` | yes |  |
 
 ### ScoredMemoryIdWire
 
@@ -6582,6 +6752,82 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 | `AiGenerated` | none | AI/LLM generated content |
 | `Inferred` | none | Inferred by the system |
 | `Unknown` | none | Unknown source |
+
+### SpaceId
+
+Defined in `src/embeddings/space.rs`.
+
+On the wire this is its inner value, `String`.
+
+### SpaceIndexSummary
+
+Defined in `src/handlers/health.rs`. One embedding space's index, as `GET /api/health/index` summarises it.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `space` | `String` | yes |  |
+| `codec` | `String` | yes | `f32` or `pq`. |
+| `memories` | `usize` | yes |  |
+| `total_vectors` | `usize` | yes |  |
+| `vector_bytes` | `usize` | yes |  |
+| `deleted_count` | `usize` | yes |  |
+| `needs_rebuild` | `bool` | yes |  |
+| `needs_compaction` | `bool` | yes |  |
+
+### SpaceMigration
+
+Defined in `src/memory/space_migration.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `kind` | [`MigrationKind`](#migrationkind) | yes |  |
+| `from` | Option&lt;[`SpaceId`](#spaceid)&gt; | no | The space the corpus markers named when the migration began; `None` when they named none. A stamp records it on vectors with no space. |
+| `to` | [`SpaceId`](#spaceid) | yes |  |
+| `cursor` | Option&lt;[`MemoryId`](#memoryid)&gt; | no | The last memory id the drain finished; the next batch starts after it. |
+| `started_at` | `DateTime<Utc>` | yes |  |
+| `finished_at` | `Option<DateTime<Utc>>` | no | default when absent |
+| `walked` | `usize` | no | default when absent; Memories the drain has walked past. |
+| `changed` | `usize` | no | default when absent; Memories it re-embedded, or stamped. |
+| `failed` | `usize` | no | default when absent; Memories it could not finish: unreadable, or the embedder refused them. They are left to the backlog. |
+| `total` | `usize` | no | default when absent; Memories in the store when the migration began. |
+| `last_error` | `Option<String>` | no | default when absent |
+| `bridge_tried` | `bool` | no | default when absent; Whether the drain has tried to map the new space back into the old one. |
+
+### SpaceSummary
+
+Defined in `src/embeddings/space.rs`. What one corpus, or a fleet of them, holds in a space.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | [`SpaceId`](#spaceid) | yes |  |
+| `model` | `String` | yes |  |
+| `dimension` | `usize` | yes |  |
+| `codec` | `String` | no | default when absent |
+| `memories` | `usize` | yes | Memories an index in this space holds. |
+| `backlog` | `usize` | yes | Backlog rows waiting for a vector in this space. |
+| `stranded` | `usize` | yes | Memories whose stored vector is in this space and was refused by an index in another. |
+| `kept` | `usize` | no | default when absent; Memories keeping a vector in this space that no index here holds: a vector a re-embed replaced, or one another instance wrote. Counted by a census over the store, at most hourly, so it may lag the store by that much. |
+| `scores` | Option&lt;[`ScoreStats`](#scorestats)&gt; | no | default when absent; omitted when empty; How this space's search similarities are distributed, learned from its own searches; see [`ScoreStats`]. Absent until enough searches have run. |
+
+### SpacesQuery
+
+Defined in `src/handlers/spaces.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `Option<String>` | no |  |
+
+### SpacesResponse
+
+Defined in `src/handlers/spaces.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user_id` | `String` | yes |  |
+| `index_space` | [`SpaceId`](#spaceid) | yes |  |
+| `spaces` | Vec&lt;[`SpaceSummary`](#spacesummary)&gt; | yes |  |
+| `alignments` | Vec&lt;[`RegisteredAlignment`](#registeredalignment)&gt; | yes |  |
+| `migration` | Option&lt;crate::memory::space_migration::[`SpaceMigration`](#spacemigration)&gt; | no | omitted when empty; The corpus's space migration, finished or under way, when one was ever recorded. |
 
 ### SplitMemoryResponse
 
@@ -7363,6 +7609,7 @@ Defined in `src/handlers/health.rs`. Reply of `GET /api/health/index`: one tenan
 | `rebuild_threshold` | `usize` | yes |  |
 | `degradation_percent` | `f64` | yes | `incremental_inserts` as a percentage of `rebuild_threshold`, capped at 100. |
 | `secondary` | Option&lt;[`SecondaryIndexSummary`](#secondaryindexsummary)&gt; | no | `null` when there is no secondary index. |
+| `spaces` | Vec&lt;[`SpaceIndexSummary`](#spaceindexsummary)&gt; | yes | Every non-primary embedding space's index, the secondary's included. |
 | `timestamp` | `String` | yes | RFC 3339. |
 
 ### UserMemoryCounts
