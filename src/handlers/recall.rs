@@ -8,6 +8,7 @@
 //! - Tracked retrieval with Hebbian feedback
 
 use axum::{extract::State, response::Json};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -156,7 +157,7 @@ pub(crate) fn recall_memory_view(
             tags: m.experience.entities.clone(),
         },
         importance: m.importance(),
-        created_at: m.created_at.to_rfc3339(),
+        created_at: m.created_at,
         score,
         raw_score,
         tier: format!("{:?}", m.tier),
@@ -348,7 +349,7 @@ pub struct SummaryItem {
     pub id: String,
     pub content: String,
     pub importance: f32,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Context summary response - categorized memories for session bootstrap
@@ -464,7 +465,7 @@ pub struct ProactiveSurfacedMemory {
     pub memory_type: String,
     pub score: f32,
     pub importance: f32,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
     pub tags: Vec<String>,
     pub tier: String,
     /// Why this memory was surfaced ("semantic", "entity", "combined", "co_activation")
@@ -751,7 +752,7 @@ pub async fn recall(
                         keywords,
                         match_type,
                         priority: task.priority,
-                        created_at: task.created_at.to_rfc3339(),
+                        created_at: task.created_at,
                     }
                 })
                 .collect();
@@ -1299,7 +1300,7 @@ pub async fn context_summary(
                         id: m.id.0.to_string(),
                         content: m.experience.content.clone(),
                         importance: m.importance(),
-                        created_at: m.created_at.to_rfc3339(),
+                        created_at: m.created_at,
                     })
                     .collect()
             };
@@ -2035,7 +2036,7 @@ pub async fn proactive_context(
                         memory_type: format!("{:?}", m.experience.experience_type),
                         score,
                         importance: m.importance(),
-                        created_at: m.created_at.to_rfc3339(),
+                        created_at: m.created_at,
                         tags: m.experience.tags.clone(),
                         tier: format!("{:?}", m.tier),
                         relevance_reason,

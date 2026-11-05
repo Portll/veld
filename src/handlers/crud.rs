@@ -7,6 +7,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     response::Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
@@ -208,7 +209,7 @@ pub struct ListMemoryItem {
     pub memory_type: String,
     pub importance: f32,
     pub tags: Vec<String>,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
     pub tier: String,
 }
 
@@ -228,7 +229,7 @@ fn list_item(m: &crate::memory::Memory) -> ListMemoryItem {
         memory_type: format!("{:?}", m.experience.experience_type),
         importance: m.importance(),
         tags: m.experience.entities.clone(),
-        created_at: m.created_at.to_rfc3339(),
+        created_at: m.created_at,
         tier: format!("{:?}", m.tier),
     }
 }
@@ -1487,8 +1488,8 @@ pub struct MemoryHealthResponse {
     pub importance: f32,
     pub tier: String,
     pub access_count: u32,
-    pub created_at: String,
-    pub last_accessed: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_accessed: Option<DateTime<Utc>>,
     /// Feedback momentum EMA (-1.0 to +1.0)
     pub feedback_momentum: Option<f32>,
     /// Number of feedback signals received
@@ -1533,8 +1534,8 @@ pub async fn get_memory_health(
     let importance = mem.importance();
     let tier = format!("{:?}", mem.tier);
     let access_count = mem.access_count();
-    let created_at = mem.created_at.to_rfc3339();
-    let last_accessed = Some(mem.last_accessed().to_rfc3339());
+    let created_at = mem.created_at;
+    let last_accessed = Some(mem.last_accessed());
 
     // FIX-02 wiring: Look up feedback momentum from FeedbackStore
     let memory_id_typed = crate::memory::types::MemoryId(

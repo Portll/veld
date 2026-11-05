@@ -1159,7 +1159,7 @@ Defined in `src/handlers/context_blocks.rs`.
 | `key` | `String` | yes |  |
 | `content` | `String` | yes |  |
 | `max_tokens` | `usize` | yes |  |
-| `updated_at` | `String` | yes |  |
+| `updated_at` | `DateTime<Utc>` | yes |  |
 | `version` | `u32` | yes |  |
 
 ### BoundaryCause
@@ -3321,7 +3321,7 @@ Defined in `src/handlers/gap_analysis.rs`.
 | `duration_ms` | `u64` | yes | Mirror sync and detection of the run that produced the result. |
 | `detect_ms` | `u64` | yes | Detection alone. |
 | `status` | `&'static str` | yes | `fresh`: computed within the last five minutes. `stale`: an older result, served while a new run goes on (or after it failed). `running`: no result yet, the run goes on (status 202). |
-| `computed_at` | `Option<String>` | no | When the result was computed, RFC 3339; absent while `running`. |
+| `computed_at` | `Option<DateTime<Utc>>` | no | When the result was computed, RFC 3339; absent while `running`. |
 | `age_secs` | `Option<i64>` | no | Seconds since `computed_at`. |
 | `refreshing` | `bool` | yes | A run for these parameters is under way. |
 | `scope` | Option&lt;[`ScopeReport`](#scopereport)&gt; | no | The part of the graph the result covers; absent while `running`. |
@@ -3598,7 +3598,7 @@ Defined in `src/handlers/health.rs`. Health response for main health endpoint
 | `status` | `String` | yes |  |
 | `version` | `String` | yes |  |
 | `build` | `String` | yes |  |
-| `built_at` | `String` | yes |  |
+| `built_at` | `String` | yes | Stays a String: `env!("VELD_BUILD_TIMESTAMP")`, which build.rs writes once at compile time. |
 | `requested_storage_backend` | `String` | yes |  |
 | `effective_storage_backend` | `String` | yes |  |
 | `users_count` | `usize` | yes |  |
@@ -4215,7 +4215,7 @@ Defined in `src/handlers/crud.rs`.
 | `memory_type` | `String` | yes |  |
 | `importance` | `f32` | yes | score |
 | `tags` | `Vec<String>` | yes |  |
-| `created_at` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
 | `tier` | `String` | yes |  |
 
 ### ListProjectsRequest
@@ -4514,8 +4514,8 @@ Defined in `src/handlers/crud.rs`. Memory health response — exposes internal s
 | `importance` | `f32` | yes | score |
 | `tier` | `String` | yes |  |
 | `access_count` | `u32` | yes |  |
-| `created_at` | `String` | yes |  |
-| `last_accessed` | `Option<String>` | no |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `last_accessed` | `Option<DateTime<Utc>>` | no |  |
 | `feedback_momentum` | `Option<f32>` | no | Feedback momentum EMA (-1.0 to +1.0) |
 | `feedback_signal_count` | `Option<u32>` | no | Number of feedback signals received |
 | `edge_count` | `usize` | yes | Edge count from this memory's entities |
@@ -4559,7 +4559,7 @@ Defined in `src/handlers/visualization.rs`. Individual memory neuron for visuali
 | `importance` | `f32` | yes | score |
 | `tier` | `String` | yes |  |
 | `access_count` | `u32` | yes |  |
-| `created_at` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
 
 ### MemoryRevision
 
@@ -5331,7 +5331,7 @@ Defined in `src/handlers/recall.rs`. Surfaced memory in proactive context respon
 | `memory_type` | `String` | yes |  |
 | `score` | `f32` | yes |  |
 | `importance` | `f32` | yes | score |
-| `created_at` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
 | `tags` | `Vec<String>` | yes |  |
 | `tier` | `String` | yes |  |
 | `relevance_reason` | `String` | yes | Why this memory was surfaced ("semantic", "entity", "combined", "co_activation") |
@@ -5840,7 +5840,7 @@ Defined in `src/handlers/types.rs`.
 | `id` | `String` | yes |  |
 | `experience` | [`RecallExperience`](#recallexperience) | yes |  |
 | `importance` | `f32` | yes | score |
-| `created_at` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
 | `score` | `f32` | yes | The pipeline's unified score divided by the top result's, so it sits in `[0, 1]`, falls with rank, and the gap between two results means something. Rank-based when the pipeline attached no score. |
 | `raw_score` | `Option<f32>` | no | omitted when empty; score; The unified score as the pipeline left it, unnormalised, so a reader can check a ranking against its signal attribution. Absent when the pipeline attached none. |
 | `tier` | `String` | yes |  |
@@ -5863,7 +5863,7 @@ Defined in `src/handlers/types.rs`. Reminder/prospective task returned in recall
 | `keywords` | `Vec<String>` | yes | Keywords that triggered this reminder (from OnContext trigger) |
 | `match_type` | `String` | yes | How the reminder was matched (keyword_match, semantic_match) |
 | `priority` | `u8` | yes |  |
-| `created_at` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
 
 ### RecallRequest
 
@@ -7185,7 +7185,7 @@ Defined in `src/handlers/recall.rs`. Summary item - simplified memory for contex
 | `id` | `String` | yes |  |
 | `content` | `String` | yes |  |
 | `importance` | `f32` | yes | score |
-| `created_at` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
 
 ### SurfacedMemory
 

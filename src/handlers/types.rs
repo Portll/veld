@@ -3,6 +3,7 @@
 //! All HTTP API request and response structures for the veld server.
 //! Extracted from main.rs for better organization.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -284,7 +285,7 @@ pub struct RecallReminder {
     /// How the reminder was matched (keyword_match, semantic_match)
     pub match_type: String,
     pub priority: u8,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Semantic fact returned in recall results
@@ -315,7 +316,7 @@ pub struct RecallMemory {
     pub id: String,
     pub experience: RecallExperience,
     pub importance: f32,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
     /// The pipeline's unified score divided by the top result's, so it sits in `[0, 1]`,
     /// falls with rank, and the gap between two results means something. Rank-based when
     /// the pipeline attached no score.

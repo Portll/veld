@@ -26,6 +26,7 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub build: String,
+    /// Stays a String: `env!("VELD_BUILD_TIMESTAMP")`, which build.rs writes once at compile time.
     pub built_at: String,
     pub requested_storage_backend: String,
     pub effective_storage_backend: String,

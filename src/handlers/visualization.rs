@@ -7,6 +7,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     response::{Html, IntoResponse, Json},
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
@@ -37,7 +38,7 @@ pub struct MemoryNeuron {
     pub importance: f32,
     pub tier: String,
     pub access_count: u32,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Brain statistics
@@ -86,7 +87,7 @@ pub async fn get_brain_state(
             importance: mem.importance(),
             tier: "working".to_string(),
             access_count: mem.metadata_snapshot().access_count,
-            created_at: mem.created_at.to_rfc3339(),
+            created_at: mem.created_at,
         };
         total_activation += neuron.activation;
         total_importance += neuron.importance;
@@ -102,7 +103,7 @@ pub async fn get_brain_state(
             importance: mem.importance(),
             tier: "session".to_string(),
             access_count: mem.metadata_snapshot().access_count,
-            created_at: mem.created_at.to_rfc3339(),
+            created_at: mem.created_at,
         };
         total_activation += neuron.activation;
         total_importance += neuron.importance;
@@ -119,7 +120,7 @@ pub async fn get_brain_state(
             importance: mem.importance(),
             tier: "longterm".to_string(),
             access_count: mem.metadata_snapshot().access_count,
-            created_at: mem.created_at.to_rfc3339(),
+            created_at: mem.created_at,
         };
         total_activation += neuron.activation;
         total_importance += neuron.importance;

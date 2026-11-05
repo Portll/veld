@@ -4193,10 +4193,11 @@
         },
         {
           "name": "updated_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
@@ -12548,12 +12549,13 @@
         },
         {
           "name": "computed_at",
-          "type": "Option<String>",
+          "type": "Option<DateTime<Utc>>",
           "required": false,
           "doc": "When the result was computed, RFC 3339; absent while `running`.",
           "refs": [
             "Option",
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
@@ -13521,6 +13523,7 @@
           "name": "built_at",
           "type": "String",
           "required": true,
+          "doc": "Stays a String: `env!(\"VELD_BUILD_TIMESTAMP\")`, which build.rs writes once at compile time.",
           "refs": [
             "String"
           ]
@@ -15813,10 +15816,11 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
@@ -17003,19 +17007,21 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
           "name": "last_accessed",
-          "type": "Option<String>",
+          "type": "Option<DateTime<Utc>>",
           "required": false,
           "refs": [
             "Option",
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
@@ -17233,10 +17239,11 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         }
       ]
@@ -20522,10 +20529,11 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
@@ -22598,10 +22606,11 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         },
         {
@@ -22766,10 +22775,11 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         }
       ]
@@ -28127,10 +28137,11 @@
         },
         {
           "name": "created_at",
-          "type": "String",
+          "type": "DateTime<Utc>",
           "required": true,
           "refs": [
-            "String"
+            "DateTime",
+            "Utc"
           ]
         }
       ]

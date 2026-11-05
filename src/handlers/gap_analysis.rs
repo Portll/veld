@@ -5,6 +5,7 @@
 //! These return raw structural data — interpretation is left to consumers.
 
 use axum::{extract::State, http::StatusCode, response::Json};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -122,7 +123,7 @@ pub struct GapAnalysisResponse {
     /// yet, the run goes on (status 202).
     pub status: &'static str,
     /// When the result was computed, RFC 3339; absent while `running`.
-    pub computed_at: Option<String>,
+    pub computed_at: Option<DateTime<Utc>>,
     /// Seconds since `computed_at`.
     pub age_secs: Option<i64>,
     /// A run for these parameters is under way.
@@ -203,7 +204,7 @@ fn summarize(
         duration_ms: run.duration_ms,
         detect_ms: run.detect_ms,
         status,
-        computed_at: Some(detected.at.to_rfc3339()),
+        computed_at: Some(detected.at),
         age_secs: Some((chrono::Utc::now() - detected.at).num_seconds().max(0)),
         refreshing,
         scope: Some(run.scope.clone()),

@@ -6,6 +6,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     response::Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ pub struct BlockResponse {
     pub key: String,
     pub content: String,
     pub max_tokens: usize,
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
     pub version: u32,
 }
 
@@ -58,7 +59,7 @@ fn block_to_response(block: &crate::memory::ContextBlock) -> BlockResponse {
         key: block.key.clone(),
         content: block.content.clone(),
         max_tokens: block.max_tokens,
-        updated_at: block.updated_at.to_rfc3339(),
+        updated_at: block.updated_at,
         version: block.version,
     }
 }
