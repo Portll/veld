@@ -1779,48 +1779,48 @@
       "path": "/api/user_auth/2fa/confirm",
       "handler": "user_auth::confirm_2fa",
       "body": "Confirm2faRequest",
-      "response": "opaque"
+      "response": "AuthSuccessResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/2fa/enroll",
       "handler": "user_auth::enroll_2fa",
-      "response": "opaque"
+      "response": "Enroll2faResponse"
     },
     {
       "method": "GET",
       "path": "/api/user_auth/admin/audit",
       "handler": "user_admin::read_audit",
       "query": "AuditQuery",
-      "response": "opaque"
+      "response": "Vec<AuditEvent>"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/demote",
       "handler": "user_auth::admin_demote",
       "body": "UsernameRequest",
-      "response": "opaque"
+      "response": "AuthSuccessResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/factors",
       "handler": "keys::enrol_factor",
       "body": "EnrolBody",
-      "response": "opaque"
+      "response": "FactorInfo"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/init",
       "handler": "keys::init",
       "body": "InitBody",
-      "response": "opaque"
+      "response": "InitReport"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/passkey",
       "handler": "keys::passkey_start",
       "body": "PasskeyStartBody",
-      "response": "opaque"
+      "response": "PasskeyStartResponse"
     },
     {
       "method": "GET",
@@ -1829,110 +1829,110 @@
       "path_param_names": [
         "ticket"
       ],
-      "response": "opaque"
+      "response": "PasskeyPollResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/recovery_codes",
       "handler": "keys::add_recovery_code",
       "body": "IssueBody",
-      "response": "opaque"
+      "response": "IssuedCode"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/revoke",
       "handler": "keys::revoke",
       "body": "RevokeBody",
-      "response": "opaque"
+      "response": "FactorInfo"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/rotate_data_keys",
       "handler": "keys::rotate_data_keys",
       "body": "UnlockOnlyBody",
-      "response": "opaque"
+      "response": "Vec<EpochStarted>"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/rotate_master_keys",
       "handler": "keys::rotate_master_keys",
       "body": "InitBody",
-      "response": "opaque"
+      "response": "MasterKeysRotated"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/keys/rotate_passphrase",
       "handler": "keys::rotate_passphrase",
       "body": "RotatePassphraseBody",
-      "response": "opaque"
+      "response": "Rewrapped"
     },
     {
       "method": "GET",
       "path": "/api/user_auth/admin/keys/status",
       "handler": "keys::status",
-      "response": "opaque"
+      "response": "KeysStatusResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/promote",
       "handler": "user_auth::admin_promote",
       "body": "UsernameRequest",
-      "response": "opaque"
+      "response": "AuthSuccessResponse"
     },
     {
       "method": "GET",
       "path": "/api/user_auth/admin/sessions",
       "handler": "user_admin::list_sessions",
       "query": "SessionsQuery",
-      "response": "opaque"
+      "response": "Vec<SessionView>"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/sessions/revoke",
       "handler": "user_admin::revoke_session",
       "body": "RevokeSessionBody",
-      "response": "opaque"
+      "response": "RevokeSessionResponse"
     },
     {
       "method": "GET",
       "path": "/api/user_auth/admin/users",
       "handler": "user_admin::list_users",
-      "response": "opaque"
+      "response": "Vec<UserView>"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/users/disable",
       "handler": "user_admin::disable_user",
       "body": "UsernameBody",
-      "response": "opaque"
+      "response": "UserView"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/users/enable",
       "handler": "user_admin::enable_user",
       "body": "UsernameBody",
-      "response": "opaque"
+      "response": "UserView"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/users/reset_2fa",
       "handler": "user_admin::reset_2fa",
       "body": "UsernameBody",
-      "response": "opaque"
+      "response": "UserView"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/users/reset_password",
       "handler": "user_admin::reset_password",
       "body": "UsernameBody",
-      "response": "opaque"
+      "response": "ResetPasswordResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/admin/users/unlock",
       "handler": "user_admin::unlock_user",
       "body": "UsernameBody",
-      "response": "opaque"
+      "response": "UserView"
     },
     {
       "method": "GET",
@@ -1951,73 +1951,73 @@
       "path_param_names": [
         "ticket"
       ],
-      "response": "opaque"
+      "response": "no body"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/login",
       "handler": "user_auth::login",
       "body": "LoginRequest",
-      "response": "opaque"
+      "response": "LoginResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/logout",
       "handler": "user_auth::logout",
-      "response": "opaque"
+      "response": "AuthSuccessResponse"
     },
     {
       "method": "GET",
       "path": "/api/user_auth/me",
       "handler": "user_admin::me",
-      "response": "opaque"
+      "response": "MeResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/password",
       "handler": "user_admin::change_password",
       "body": "ChangePasswordBody",
-      "response": "opaque"
+      "response": "ChangePasswordResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/recover",
       "handler": "user_auth::recover",
       "body": "RecoverRequest",
-      "response": "opaque"
+      "response": "AuthSuccessResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/recovery_codes",
       "handler": "user_admin::regenerate_recovery_codes",
-      "response": "opaque"
+      "response": "RegenerateRecoveryCodesResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/register",
       "handler": "user_auth::register",
       "body": "RegisterRequest",
-      "response": "opaque"
+      "response": "RegisterResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/sessions/revoke",
       "handler": "user_admin::revoke_own_session",
       "body": "OwnSessionBody",
-      "response": "opaque"
+      "response": "RevokeSessionResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/sessions/revoke_all",
       "handler": "user_auth::revoke_all_sessions",
       "body": "UsernameRequest",
-      "response": "opaque"
+      "response": "RevokedSessionsResponse"
     },
     {
       "method": "POST",
       "path": "/api/user_auth/sessions/revoke_mine",
       "handler": "user_auth::revoke_my_other_sessions",
-      "response": "opaque"
+      "response": "RevokedSessionsResponse"
     },
     {
       "method": "ANY",
@@ -2026,7 +2026,7 @@
       "path_param_names": [
         "path"
       ],
-      "response": "opaque"
+      "response": "UserAuthDisabledResponse"
     },
     {
       "method": "GET",
@@ -3473,6 +3473,57 @@
         }
       ]
     },
+    "AuditEvent": {
+      "name": "AuditEvent",
+      "file": "src/user_auth/mod.rs",
+      "doc": "One administrative action, kept in the `user_auth` store.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "actor",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "action",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "target",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "detail",
+          "type": "String",
+          "required": true,
+          "doc": "JSON text; bincode cannot carry a `serde_json::Value`.",
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "AuditQuery": {
       "name": "AuditQuery",
       "file": "src/handlers/user_admin.rs",
@@ -3485,6 +3536,19 @@
           "refs": [
             "Option"
           ]
+        }
+      ]
+    },
+    "AuthSuccessResponse": {
+      "name": "AuthSuccessResponse",
+      "file": "src/handlers/user_auth.rs",
+      "doc": "`{\"success\": true}` — the reply of the user-auth routes whose success carries nothing beyond the fact (2FA confirm, recover, logout, admin promote / demote).",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
         }
       ]
     },
@@ -4689,6 +4753,24 @@
           "refs": [
             "String"
           ]
+        }
+      ]
+    },
+    "ChangePasswordResponse": {
+      "name": "ChangePasswordResponse",
+      "file": "src/handlers/user_admin.rs",
+      "doc": "The reply of `POST /api/user_auth/password`; `sessions_revoked` counts the caller's other sessions that ended.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "sessions_revoked",
+          "type": "usize",
+          "required": true
         }
       ]
     },
@@ -8922,6 +9004,35 @@
         }
       ]
     },
+    "Enroll2faResponse": {
+      "name": "Enroll2faResponse",
+      "file": "src/handlers/user_auth.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "provisioning_uri",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "recovery_codes",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
     "EntityCard": {
       "name": "EntityCard",
       "file": "src/handlers/ui.rs",
@@ -9750,6 +9861,34 @@
             "String",
             "String"
           ]
+        }
+      ]
+    },
+    "EpochStarted": {
+      "name": "EpochStarted",
+      "file": "src/keyring.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "scope",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "path",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "epoch",
+          "type": "u32",
+          "required": true
         }
       ]
     },
@@ -10954,6 +11093,48 @@
         {
           "name": "Pattern",
           "doc": "Pattern: \"errors often occur after deployment\""
+        }
+      ]
+    },
+    "FactorInfo": {
+      "name": "FactorInfo",
+      "file": "src/keystore.rs",
+      "doc": "A wrap of the master key, described without anything secret.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "provider",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "label",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
         }
       ]
     },
@@ -14248,6 +14429,46 @@
         }
       ]
     },
+    "InitReport": {
+      "name": "InitReport",
+      "file": "src/keyring.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "keyring",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "ring",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "enrolled",
+          "type": "Vec<ManagedKeystore>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "ManagedKeystore"
+          ]
+        },
+        {
+          "name": "recovery",
+          "type": "IssuedCode",
+          "required": true,
+          "refs": [
+            "IssuedCode"
+          ]
+        }
+      ]
+    },
     "InsertRowsRequest": {
       "name": "InsertRowsRequest",
       "file": "src/handlers/datasets.rs",
@@ -14487,6 +14708,174 @@
           "name": "label",
           "type": "Option<String>",
           "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "IssuedCode": {
+      "name": "IssuedCode",
+      "file": "src/keyring.rs",
+      "doc": "A recovery code issued once. The code is shown or downloaded once and never stored.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "label",
+          "type": "Option<String>",
+          "required": false,
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "code",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "kit",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "KeyStatus": {
+      "name": "KeyStatus",
+      "file": "src/keyring.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "keyring",
+          "type": "Option<KeystoreSummary>",
+          "required": false,
+          "refs": [
+            "Option",
+            "KeystoreSummary"
+          ]
+        },
+        {
+          "name": "keystores",
+          "type": "Vec<KeystoreSummary>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "KeystoreSummary"
+          ]
+        }
+      ]
+    },
+    "KeysStatusResponse": {
+      "name": "KeysStatusResponse",
+      "file": "src/handlers/keys.rs",
+      "doc": "The reply of `GET /api/user_auth/admin/keys/status`.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": "KeyStatus",
+          "required": true,
+          "refs": [
+            "KeyStatus"
+          ]
+        },
+        {
+          "name": "keyring_unsealed",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "The id of the ring key this server holds, `None` when it started without one.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "KeystoreSummary": {
+      "name": "KeystoreSummary",
+      "file": "src/keyring.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "scope",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "path",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "generation",
+          "type": "Option<u64>",
+          "required": false,
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "active_epoch",
+          "type": "Option<u32>",
+          "required": false,
+          "refs": [
+            "Option"
+          ]
+        },
+        {
+          "name": "epochs",
+          "type": "Vec<u32>",
+          "required": true,
+          "refs": [
+            "Vec"
+          ]
+        },
+        {
+          "name": "factors",
+          "type": "Vec<FactorInfo>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "FactorInfo"
+          ]
+        },
+        {
+          "name": "ring",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "The id of this keystore's ring wrap; `None` when the keyring cannot open it.",
+          "refs": [
+            "Option",
+            "String"
+          ]
+        },
+        {
+          "name": "error",
+          "type": "Option<String>",
+          "required": false,
+          "doc": "Why the file could not be read. A keystore that does not parse is reported, never left out.",
           "refs": [
             "Option",
             "String"
@@ -16273,6 +16662,40 @@
         }
       ]
     },
+    "LoginResponse": {
+      "name": "LoginResponse",
+      "file": "src/handlers/user_auth.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "session_token",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "expires_at",
+          "type": "chrono::DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "role",
+          "type": "&'static str",
+          "required": true
+        }
+      ]
+    },
     "LtpStatus": {
       "name": "LtpStatus",
       "file": "src/graph_memory.rs",
@@ -16296,6 +16719,30 @@
         {
           "name": "Full",
           "doc": "Fully potentiated: 10+ activations OR 5+ over 30 days Maximum protection (10x slower decay) Represents systems consolidation (semantic memory)"
+        }
+      ]
+    },
+    "ManagedKeystore": {
+      "name": "ManagedKeystore",
+      "file": "src/keyring.rs",
+      "doc": "A keystore the keyring manages: a tenant's store keystore or the global one.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "scope",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "path",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
         }
       ]
     },
@@ -16505,6 +16952,73 @@
           "name": "duration_ms",
           "type": "u64",
           "required": true
+        }
+      ]
+    },
+    "MasterKeysRotated": {
+      "name": "MasterKeysRotated",
+      "file": "src/keyring.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "keyring",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "keystores",
+          "type": "Vec<ManagedKeystore>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "ManagedKeystore"
+          ]
+        },
+        {
+          "name": "dropped",
+          "type": "Vec<FactorInfo>",
+          "required": true,
+          "doc": "Factors the old master keys carried that the new ones do not: re-enrol any still wanted.",
+          "refs": [
+            "Vec",
+            "FactorInfo"
+          ]
+        },
+        {
+          "name": "recovery",
+          "type": "IssuedCode",
+          "required": true,
+          "refs": [
+            "IssuedCode"
+          ]
+        }
+      ]
+    },
+    "MeResponse": {
+      "name": "MeResponse",
+      "file": "src/handlers/user_admin.rs",
+      "doc": "The reply of `GET /api/user_auth/me`: the caller's account and sessions.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "user",
+          "type": "UserView",
+          "required": true,
+          "refs": [
+            "UserView"
+          ]
+        },
+        {
+          "name": "sessions",
+          "type": "Vec<SessionView>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "SessionView"
+          ]
         }
       ]
     },
@@ -19573,6 +20087,26 @@
         }
       ]
     },
+    "PasskeyPollResponse": {
+      "name": "PasskeyPollResponse",
+      "file": "src/handlers/keys.rs",
+      "doc": "The reply of `GET /api/user_auth/admin/keys/passkey/{ticket}`.",
+      "kind": "enum",
+      "representation": "internally tagged: the payload's fields plus `\"state\": <variant>`",
+      "variants": [
+        {
+          "name": "waiting"
+        },
+        {
+          "name": "done",
+          "payload": "{ factor: FactorInfo }"
+        },
+        {
+          "name": "failed",
+          "payload": "{ error: String }"
+        }
+      ]
+    },
     "PasskeyResultBody": {
       "name": "PasskeyResultBody",
       "file": "src/handlers/keys.rs",
@@ -19626,6 +20160,30 @@
           "required": false,
           "refs": [
             "Option",
+            "String"
+          ]
+        }
+      ]
+    },
+    "PasskeyStartResponse": {
+      "name": "PasskeyStartResponse",
+      "file": "src/handlers/keys.rs",
+      "doc": "The reply of `POST /api/user_auth/admin/keys/passkey`: the ticket to poll and the path of the page that finishes the enrolment.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "ticket",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "path",
+          "type": "String",
+          "required": true,
+          "refs": [
             "String"
           ]
         }
@@ -23496,6 +24054,23 @@
         }
       ]
     },
+    "RegenerateRecoveryCodesResponse": {
+      "name": "RegenerateRecoveryCodesResponse",
+      "file": "src/handlers/user_admin.rs",
+      "doc": "The reply of `POST /api/user_auth/recovery_codes`: the new batch, shown this once.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "recovery_codes",
+          "type": "Vec<String>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "String"
+          ]
+        }
+      ]
+    },
     "RegisterRequest": {
       "name": "RegisterRequest",
       "file": "src/handlers/user_auth.rs",
@@ -23516,6 +24091,31 @@
           "refs": [
             "String"
           ]
+        }
+      ]
+    },
+    "RegisterResponse": {
+      "name": "RegisterResponse",
+      "file": "src/handlers/user_auth.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "user_id",
+          "type": "Uuid",
+          "required": true,
+          "refs": [
+            "Uuid"
+          ]
+        },
+        {
+          "name": "role",
+          "type": "&'static str",
+          "required": true
         }
       ]
     },
@@ -25031,6 +25631,30 @@
         }
       ]
     },
+    "ResetPasswordResponse": {
+      "name": "ResetPasswordResponse",
+      "file": "src/handlers/user_admin.rs",
+      "doc": "The reply of `POST /api/user_auth/admin/users/reset_password`: the temporary password, shown this once.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "username",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "temporary_password",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
     "ResolvedEntity": {
       "name": "ResolvedEntity",
       "file": "src/handlers/prompt_gen.rs",
@@ -25499,6 +26123,64 @@
           "required": true,
           "refs": [
             "String"
+          ]
+        }
+      ]
+    },
+    "RevokeSessionResponse": {
+      "name": "RevokeSessionResponse",
+      "file": "src/handlers/user_admin.rs",
+      "doc": "`{\"revoked\": id}` — the reply of the session revocation routes, naming the public id of the session that ended.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "revoked",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        }
+      ]
+    },
+    "RevokedSessionsResponse": {
+      "name": "RevokedSessionsResponse",
+      "file": "src/handlers/user_auth.rs",
+      "doc": "`{\"success\": true, \"removed\": n}` — the reply of the session revocation routes; `removed` counts the sessions deleted.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "success",
+          "type": "bool",
+          "required": true
+        },
+        {
+          "name": "removed",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
+    "Rewrapped": {
+      "name": "Rewrapped",
+      "file": "src/keyring.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "keyring",
+          "type": "PathBuf",
+          "required": true,
+          "refs": [
+            "PathBuf"
+          ]
+        },
+        {
+          "name": "keystores",
+          "type": "Vec<ManagedKeystore>",
+          "required": true,
+          "refs": [
+            "Vec",
+            "ManagedKeystore"
           ]
         }
       ]
@@ -26976,6 +27658,44 @@
           "refs": [
             "String"
           ]
+        }
+      ]
+    },
+    "SessionView": {
+      "name": "SessionView",
+      "file": "src/handlers/user_admin.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "expires_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "current",
+          "type": "bool",
+          "required": true
         }
       ]
     },
@@ -30767,6 +31487,24 @@
         }
       ]
     },
+    "UserAuthDisabledResponse": {
+      "name": "UserAuthDisabledResponse",
+      "file": "src/handlers/user_auth.rs",
+      "doc": "The `503` body of every `/api/user_auth/*` path while `VELD_USER_AUTH_ENABLED` is off; see [`disabled_fallback`].",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "error",
+          "type": "&'static str",
+          "required": true
+        },
+        {
+          "name": "detail",
+          "type": "&'static str",
+          "required": true
+        }
+      ]
+    },
     "UserContext": {
       "name": "UserContext",
       "file": "src/memory/types.rs",
@@ -31387,6 +32125,94 @@
         },
         {
           "name": "projects",
+          "type": "usize",
+          "required": true
+        }
+      ]
+    },
+    "UserView": {
+      "name": "UserView",
+      "file": "src/handlers/user_admin.rs",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "username",
+          "type": "String",
+          "required": true,
+          "refs": [
+            "String"
+          ]
+        },
+        {
+          "name": "role",
+          "type": "&'static str",
+          "required": true
+        },
+        {
+          "name": "created_at",
+          "type": "DateTime<Utc>",
+          "required": true,
+          "refs": [
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "last_login_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "totp",
+          "type": "&'static str",
+          "required": true,
+          "doc": "`active`, `pending` or `none`."
+        },
+        {
+          "name": "recovery_codes_remaining",
+          "type": "usize",
+          "required": true
+        },
+        {
+          "name": "disabled_at",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "locked_until",
+          "type": "Option<DateTime<Utc>>",
+          "required": false,
+          "refs": [
+            "Option",
+            "DateTime",
+            "Utc"
+          ]
+        },
+        {
+          "name": "failed_attempts",
+          "type": "u32",
+          "required": true
+        },
+        {
+          "name": "sessions",
           "type": "usize",
           "required": true
         }

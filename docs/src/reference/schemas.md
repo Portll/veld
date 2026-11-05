@@ -6,7 +6,7 @@
 
 # HTTP API schemas
 
-The request and response shape of every HTTP route, read from the handler signatures and the types they name: **277** routes over **615** types. `schemas.json` beside this page holds the same facts for tools and tests.
+The request and response shape of every HTTP route, read from the handler signatures and the types they name: **277** routes over **641** types. `schemas.json` beside this page holds the same facts for tools and tests.
 
 **How to read a type.** *Required* means the field has no `Option` and no serde default, so a request without it is rejected and a response always carries it. A field marked *omitted when empty* is left out of a response when it has no value. Enum variants are listed in wire form. `DateTime<Utc>` is an RFC 3339 string, `Uuid` and `MemoryId` are UUID strings, and `Value` is any JSON. A response shown as *no body* is a status code alone. A response shown as *opaque* is built by hand in the handler; read the handler for it.
 
@@ -549,42 +549,42 @@ The request and response shape of every HTTP route, read from the handler signat
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| `POST` | `/api/user_auth/2fa/confirm` | body [`Confirm2faRequest`](#confirm2farequest) | `opaque` |
-| `POST` | `/api/user_auth/2fa/enroll` | none | `opaque` |
-| `GET` | `/api/user_auth/admin/audit` | query [`AuditQuery`](#auditquery) | `opaque` |
-| `POST` | `/api/user_auth/admin/demote` | body [`UsernameRequest`](#usernamerequest) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/factors` | body [`EnrolBody`](#enrolbody) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/init` | body [`InitBody`](#initbody) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/passkey` | body [`PasskeyStartBody`](#passkeystartbody) | `opaque` |
-| `GET` | `/api/user_auth/admin/keys/passkey/{ticket}` | none | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/recovery_codes` | body [`IssueBody`](#issuebody) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/revoke` | body [`RevokeBody`](#revokebody) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/rotate_data_keys` | body [`UnlockOnlyBody`](#unlockonlybody) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/rotate_master_keys` | body [`InitBody`](#initbody) | `opaque` |
-| `POST` | `/api/user_auth/admin/keys/rotate_passphrase` | body [`RotatePassphraseBody`](#rotatepassphrasebody) | `opaque` |
-| `GET` | `/api/user_auth/admin/keys/status` | none | `opaque` |
-| `POST` | `/api/user_auth/admin/promote` | body [`UsernameRequest`](#usernamerequest) | `opaque` |
-| `GET` | `/api/user_auth/admin/sessions` | query [`SessionsQuery`](#sessionsquery) | `opaque` |
-| `POST` | `/api/user_auth/admin/sessions/revoke` | body [`RevokeSessionBody`](#revokesessionbody) | `opaque` |
-| `GET` | `/api/user_auth/admin/users` | none | `opaque` |
-| `POST` | `/api/user_auth/admin/users/disable` | body [`UsernameBody`](#usernamebody) | `opaque` |
-| `POST` | `/api/user_auth/admin/users/enable` | body [`UsernameBody`](#usernamebody) | `opaque` |
-| `POST` | `/api/user_auth/admin/users/reset_2fa` | body [`UsernameBody`](#usernamebody) | `opaque` |
-| `POST` | `/api/user_auth/admin/users/reset_password` | body [`UsernameBody`](#usernamebody) | `opaque` |
-| `POST` | `/api/user_auth/admin/users/unlock` | body [`UsernameBody`](#usernamebody) | `opaque` |
+| `POST` | `/api/user_auth/2fa/confirm` | body [`Confirm2faRequest`](#confirm2farequest) | [`AuthSuccessResponse`](#authsuccessresponse) |
+| `POST` | `/api/user_auth/2fa/enroll` | none | [`Enroll2faResponse`](#enroll2faresponse) |
+| `GET` | `/api/user_auth/admin/audit` | query [`AuditQuery`](#auditquery) | Vec&lt;[`AuditEvent`](#auditevent)&gt; |
+| `POST` | `/api/user_auth/admin/demote` | body [`UsernameRequest`](#usernamerequest) | [`AuthSuccessResponse`](#authsuccessresponse) |
+| `POST` | `/api/user_auth/admin/keys/factors` | body [`EnrolBody`](#enrolbody) | [`FactorInfo`](#factorinfo) |
+| `POST` | `/api/user_auth/admin/keys/init` | body [`InitBody`](#initbody) | [`InitReport`](#initreport) |
+| `POST` | `/api/user_auth/admin/keys/passkey` | body [`PasskeyStartBody`](#passkeystartbody) | [`PasskeyStartResponse`](#passkeystartresponse) |
+| `GET` | `/api/user_auth/admin/keys/passkey/{ticket}` | none | [`PasskeyPollResponse`](#passkeypollresponse) |
+| `POST` | `/api/user_auth/admin/keys/recovery_codes` | body [`IssueBody`](#issuebody) | [`IssuedCode`](#issuedcode) |
+| `POST` | `/api/user_auth/admin/keys/revoke` | body [`RevokeBody`](#revokebody) | [`FactorInfo`](#factorinfo) |
+| `POST` | `/api/user_auth/admin/keys/rotate_data_keys` | body [`UnlockOnlyBody`](#unlockonlybody) | Vec&lt;[`EpochStarted`](#epochstarted)&gt; |
+| `POST` | `/api/user_auth/admin/keys/rotate_master_keys` | body [`InitBody`](#initbody) | [`MasterKeysRotated`](#masterkeysrotated) |
+| `POST` | `/api/user_auth/admin/keys/rotate_passphrase` | body [`RotatePassphraseBody`](#rotatepassphrasebody) | [`Rewrapped`](#rewrapped) |
+| `GET` | `/api/user_auth/admin/keys/status` | none | [`KeysStatusResponse`](#keysstatusresponse) |
+| `POST` | `/api/user_auth/admin/promote` | body [`UsernameRequest`](#usernamerequest) | [`AuthSuccessResponse`](#authsuccessresponse) |
+| `GET` | `/api/user_auth/admin/sessions` | query [`SessionsQuery`](#sessionsquery) | Vec&lt;[`SessionView`](#sessionview)&gt; |
+| `POST` | `/api/user_auth/admin/sessions/revoke` | body [`RevokeSessionBody`](#revokesessionbody) | [`RevokeSessionResponse`](#revokesessionresponse) |
+| `GET` | `/api/user_auth/admin/users` | none | Vec&lt;[`UserView`](#userview)&gt; |
+| `POST` | `/api/user_auth/admin/users/disable` | body [`UsernameBody`](#usernamebody) | [`UserView`](#userview) |
+| `POST` | `/api/user_auth/admin/users/enable` | body [`UsernameBody`](#usernamebody) | [`UserView`](#userview) |
+| `POST` | `/api/user_auth/admin/users/reset_2fa` | body [`UsernameBody`](#usernamebody) | [`UserView`](#userview) |
+| `POST` | `/api/user_auth/admin/users/reset_password` | body [`UsernameBody`](#usernamebody) | [`ResetPasswordResponse`](#resetpasswordresponse) |
+| `POST` | `/api/user_auth/admin/users/unlock` | body [`UsernameBody`](#usernamebody) | [`UserView`](#userview) |
 | `GET` | `/api/user_auth/keys/passkey/{ticket}` | none | `opaque` |
-| `POST` | `/api/user_auth/keys/passkey/{ticket}/result` | body [`PasskeyResultBody`](#passkeyresultbody) | `opaque` |
-| `POST` | `/api/user_auth/login` | body [`LoginRequest`](#loginrequest) | `opaque` |
-| `POST` | `/api/user_auth/logout` | none | `opaque` |
-| `GET` | `/api/user_auth/me` | none | `opaque` |
-| `POST` | `/api/user_auth/password` | body [`ChangePasswordBody`](#changepasswordbody) | `opaque` |
-| `POST` | `/api/user_auth/recover` | body [`RecoverRequest`](#recoverrequest) | `opaque` |
-| `POST` | `/api/user_auth/recovery_codes` | none | `opaque` |
-| `POST` | `/api/user_auth/register` | body [`RegisterRequest`](#registerrequest) | `opaque` |
-| `POST` | `/api/user_auth/sessions/revoke` | body [`OwnSessionBody`](#ownsessionbody) | `opaque` |
-| `POST` | `/api/user_auth/sessions/revoke_all` | body [`UsernameRequest`](#usernamerequest) | `opaque` |
-| `POST` | `/api/user_auth/sessions/revoke_mine` | none | `opaque` |
-| `ANY` | `/api/user_auth/{*path}` | none | `opaque` |
+| `POST` | `/api/user_auth/keys/passkey/{ticket}/result` | body [`PasskeyResultBody`](#passkeyresultbody) | `no body` |
+| `POST` | `/api/user_auth/login` | body [`LoginRequest`](#loginrequest) | [`LoginResponse`](#loginresponse) |
+| `POST` | `/api/user_auth/logout` | none | [`AuthSuccessResponse`](#authsuccessresponse) |
+| `GET` | `/api/user_auth/me` | none | [`MeResponse`](#meresponse) |
+| `POST` | `/api/user_auth/password` | body [`ChangePasswordBody`](#changepasswordbody) | [`ChangePasswordResponse`](#changepasswordresponse) |
+| `POST` | `/api/user_auth/recover` | body [`RecoverRequest`](#recoverrequest) | [`AuthSuccessResponse`](#authsuccessresponse) |
+| `POST` | `/api/user_auth/recovery_codes` | none | [`RegenerateRecoveryCodesResponse`](#regeneraterecoverycodesresponse) |
+| `POST` | `/api/user_auth/register` | body [`RegisterRequest`](#registerrequest) | [`RegisterResponse`](#registerresponse) |
+| `POST` | `/api/user_auth/sessions/revoke` | body [`OwnSessionBody`](#ownsessionbody) | [`RevokeSessionResponse`](#revokesessionresponse) |
+| `POST` | `/api/user_auth/sessions/revoke_all` | body [`UsernameRequest`](#usernamerequest) | [`RevokedSessionsResponse`](#revokedsessionsresponse) |
+| `POST` | `/api/user_auth/sessions/revoke_mine` | none | [`RevokedSessionsResponse`](#revokedsessionsresponse) |
+| `ANY` | `/api/user_auth/{*path}` | none | [`UserAuthDisabledResponse`](#userauthdisabledresponse) |
 
 ### /users
 
@@ -966,6 +966,18 @@ Defined in `src/memory/introspection.rs`. Change in an association/edge
 | `reason` | `String` | yes |  |
 | `timestamp` | `DateTime<Utc>` | yes |  |
 
+### AuditEvent
+
+Defined in `src/user_auth/mod.rs`. One administrative action, kept in the `user_auth` store.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `at` | `DateTime<Utc>` | yes |  |
+| `actor` | `String` | yes |  |
+| `action` | `String` | yes |  |
+| `target` | `Option<String>` | no |  |
+| `detail` | `String` | yes | JSON text; bincode cannot carry a `serde_json::Value`. |
+
 ### AuditQuery
 
 Defined in `src/handlers/user_admin.rs`.
@@ -973,6 +985,14 @@ Defined in `src/handlers/user_admin.rs`.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `limit` | `Option<usize>` | no |  |
+
+### AuthSuccessResponse
+
+Defined in `src/handlers/user_auth.rs`. `{"success": true}` — the reply of the user-auth routes whose success carries nothing beyond the fact (2FA confirm, recover, logout, admin promote / demote).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
 
 ### BackendCensus
 
@@ -1325,6 +1345,15 @@ Defined in `src/handlers/user_admin.rs`.
 |---|---|---|---|
 | `current_password` | `String` | yes |  |
 | `new_password` | `String` | yes |  |
+
+### ChangePasswordResponse
+
+Defined in `src/handlers/user_admin.rs`. The reply of `POST /api/user_auth/password`; `sessions_revoked` counts the caller's other sessions that ended.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `sessions_revoked` | `usize` | yes |  |
 
 ### ChangeType
 
@@ -2429,6 +2458,16 @@ Defined in `src/handlers/keys.rs`.
 | `label` | `Option<String>` | no |  |
 | `secret` | `String` | yes |  |
 
+### Enroll2faResponse
+
+Defined in `src/handlers/user_auth.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `provisioning_uri` | `String` | yes |  |
+| `recovery_codes` | `Vec<String>` | yes |  |
+
 ### EntityCard
 
 Defined in `src/handlers/ui.rs`.
@@ -2628,6 +2667,16 @@ Defined in `src/graph_memory.rs`. Episodic node representing a discrete experien
 | `entity_refs` | `Vec<Uuid>` | yes | Entities extracted from this episode |
 | `source` | [`EpisodeSource`](#episodesource) | yes | Source type |
 | `metadata` | `HashMap<String, String>` | yes | Additional metadata |
+
+### EpochStarted
+
+Defined in `src/keyring.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `scope` | `String` | yes |  |
+| `path` | `PathBuf` | yes |  |
+| `epoch` | `u32` | yes |  |
 
 ### ExecuteResponse
 
@@ -2861,6 +2910,17 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 | `Procedure` | none | Procedure: "to deploy, run cargo build --release" |
 | `Definition` | none | Definition: "MemoryId is a UUID wrapper" |
 | `Pattern` | none | Pattern: "errors often occur after deployment" |
+
+### FactorInfo
+
+Defined in `src/keystore.rs`. A wrap of the master key, described without anything secret.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `provider` | `String` | yes |  |
+| `id` | `String` | yes |  |
+| `label` | `Option<String>` | no |  |
+| `created_at` | `Option<String>` | no |  |
 
 ### FactsByEntityRequest
 
@@ -3779,6 +3839,17 @@ Defined in `src/handlers/keys.rs`.
 | `passphrase` | `String` | yes |  |
 | `label` | `Option<String>` | no |  |
 
+### InitReport
+
+Defined in `src/keyring.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `keyring` | `PathBuf` | yes |  |
+| `ring` | `String` | yes |  |
+| `enrolled` | Vec&lt;[`ManagedKeystore`](#managedkeystore)&gt; | yes |  |
+| `recovery` | [`IssuedCode`](#issuedcode) | yes |  |
+
 ### InsertRowsRequest
 
 Defined in `src/handlers/datasets.rs`.
@@ -3867,6 +3938,50 @@ Defined in `src/handlers/keys.rs`.
 |---|---|---|---|
 | `unlock` | [`UnlockBody`](#unlockbody) | yes |  |
 | `label` | `Option<String>` | no |  |
+
+### IssuedCode
+
+Defined in `src/keyring.rs`. A recovery code issued once. The code is shown or downloaded once and never stored.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `label` | `Option<String>` | no |  |
+| `code` | `String` | yes |  |
+| `kit` | `String` | yes |  |
+
+### KeyStatus
+
+Defined in `src/keyring.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `keyring` | Option&lt;[`KeystoreSummary`](#keystoresummary)&gt; | no |  |
+| `keystores` | Vec&lt;[`KeystoreSummary`](#keystoresummary)&gt; | yes |  |
+
+### KeysStatusResponse
+
+Defined in `src/handlers/keys.rs`. The reply of `GET /api/user_auth/admin/keys/status`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `status` | [`KeyStatus`](#keystatus) | yes |  |
+| `keyring_unsealed` | `Option<String>` | no | The id of the ring key this server holds, `None` when it started without one. |
+
+### KeystoreSummary
+
+Defined in `src/keyring.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `scope` | `String` | yes |  |
+| `path` | `PathBuf` | yes |  |
+| `generation` | `Option<u64>` | no |  |
+| `active_epoch` | `Option<u32>` | no |  |
+| `epochs` | `Vec<u32>` | yes |  |
+| `factors` | Vec&lt;[`FactorInfo`](#factorinfo)&gt; | yes |  |
+| `ring` | `Option<String>` | no | The id of this keystore's ring wrap; `None` when the keyring cannot open it. |
+| `error` | `Option<String>` | no | Why the file could not be read. A keystore that does not parse is reported, never left out. |
 
 ### Knows
 
@@ -4341,6 +4456,17 @@ Defined in `src/handlers/user_auth.rs`.
 | `password` | `String` | yes |  |
 | `totp` | `Option<String>` | no | default when absent |
 
+### LoginResponse
+
+Defined in `src/handlers/user_auth.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `session_token` | `String` | yes |  |
+| `expires_at` | `chrono::DateTime<Utc>` | yes |  |
+| `role` | `&'static str` | yes |  |
+
 ### LtpStatus
 
 Defined in `src/graph_memory.rs`. Long-Term Potentiation status for edges (PIPE-4)
@@ -4353,6 +4479,15 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 | `Burst` | `{ detected_at: DateTime<Utc> }` | Burst potentiated: 5+ activations in 24 hours Temporary protection (2x slower decay) that expires after 48h Represents early-phase LTP (protein synthesis independent) |
 | `Weekly` | none | Weekly potentiated: 3+/week for 2+ weeks Moderate protection (3x slower decay) Represents late-phase LTP (habit formation) |
 | `Full` | none | Fully potentiated: 10+ activations OR 5+ over 30 days Maximum protection (10x slower decay) Represents systems consolidation (semantic memory) |
+
+### ManagedKeystore
+
+Defined in `src/keyring.rs`. A keystore the keyring manages: a tenant's store keystore or the global one.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `scope` | `String` | yes |  |
+| `path` | `PathBuf` | yes |  |
 
 ### MapperEdgeSummary
 
@@ -4415,6 +4550,26 @@ Defined in `src/handlers/gap_analysis.rs`.
 | `cluster_count` | `usize` | yes |  |
 | `edge_count` | `usize` | yes |  |
 | `duration_ms` | `u64` | yes |  |
+
+### MasterKeysRotated
+
+Defined in `src/keyring.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `keyring` | `PathBuf` | yes |  |
+| `keystores` | Vec&lt;[`ManagedKeystore`](#managedkeystore)&gt; | yes |  |
+| `dropped` | Vec&lt;[`FactorInfo`](#factorinfo)&gt; | yes | Factors the old master keys carried that the new ones do not: re-enrol any still wanted. |
+| `recovery` | [`IssuedCode`](#issuedcode) | yes |  |
+
+### MeResponse
+
+Defined in `src/handlers/user_admin.rs`. The reply of `GET /api/user_auth/me`: the caller's account and sessions.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `user` | [`UserView`](#userview) | yes |  |
+| `sessions` | Vec&lt;[`SessionView`](#sessionview)&gt; | yes |  |
 
 ### MediaRef
 
@@ -5100,6 +5255,18 @@ Defined in `src/handlers/user_admin.rs`.
 |---|---|---|---|
 | `session_id` | `String` | yes |  |
 
+### PasskeyPollResponse
+
+Defined in `src/handlers/keys.rs`. The reply of `GET /api/user_auth/admin/keys/passkey/{ticket}`.
+
+Enum, internally tagged: the payload's fields plus `"state": <variant>`.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `waiting` | none |  |
+| `done` | { factor: [`FactorInfo`](#factorinfo) } |  |
+| `failed` | `{ error: String }` |  |
+
 ### PasskeyResultBody
 
 Defined in `src/handlers/keys.rs`.
@@ -5118,6 +5285,15 @@ Defined in `src/handlers/keys.rs`.
 |---|---|---|---|
 | `unlock` | [`UnlockBody`](#unlockbody) | yes |  |
 | `label` | `Option<String>` | no |  |
+
+### PasskeyStartResponse
+
+Defined in `src/handlers/keys.rs`. The reply of `POST /api/user_auth/admin/keys/passkey`: the ticket to poll and the path of the page that finishes the enrolment.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `ticket` | `String` | yes |  |
+| `path` | `String` | yes |  |
 
 ### PersistencePairSummary
 
@@ -6039,6 +6215,14 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 | `llm` | none | Apply only the LLM refiner; skip the cross-encoder. |
 | `stacked` | none | Cross-encoder first, then LLM refiner over its output. |
 
+### RegenerateRecoveryCodesResponse
+
+Defined in `src/handlers/user_admin.rs`. The reply of `POST /api/user_auth/recovery_codes`: the new batch, shown this once.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `recovery_codes` | `Vec<String>` | yes |  |
+
 ### RegisterRequest
 
 Defined in `src/handlers/user_auth.rs`.
@@ -6047,6 +6231,16 @@ Defined in `src/handlers/user_auth.rs`.
 |---|---|---|---|
 | `username` | `String` | yes |  |
 | `password` | `String` | yes |  |
+
+### RegisterResponse
+
+Defined in `src/handlers/user_auth.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `user_id` | `Uuid` | yes |  |
+| `role` | `&'static str` | yes |  |
 
 ### RegisteredAlignment
 
@@ -6396,6 +6590,15 @@ Defined in `src/memory/introspection.rs`. Time period for a report
 | `start` | `DateTime<Utc>` | yes |  |
 | `end` | `DateTime<Utc>` | yes |  |
 
+### ResetPasswordResponse
+
+Defined in `src/handlers/user_admin.rs`. The reply of `POST /api/user_auth/admin/users/reset_password`: the temporary password, shown this once.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `username` | `String` | yes |  |
+| `temporary_password` | `String` | yes |  |
+
 ### ResolvedEntity
 
 Defined in `src/handlers/prompt_gen.rs`.
@@ -6507,6 +6710,32 @@ Defined in `src/handlers/user_admin.rs`.
 |---|---|---|---|
 | `username` | `String` | yes |  |
 | `session_id` | `String` | yes |  |
+
+### RevokeSessionResponse
+
+Defined in `src/handlers/user_admin.rs`. `{"revoked": id}` — the reply of the session revocation routes, naming the public id of the session that ended.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `revoked` | `String` | yes |  |
+
+### RevokedSessionsResponse
+
+Defined in `src/handlers/user_auth.rs`. `{"success": true, "removed": n}` — the reply of the session revocation routes; `removed` counts the sessions deleted.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `success` | `bool` | yes |  |
+| `removed` | `usize` | yes |  |
+
+### Rewrapped
+
+Defined in `src/keyring.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `keyring` | `PathBuf` | yes |  |
+| `keystores` | Vec&lt;[`ManagedKeystore`](#managedkeystore)&gt; | yes |  |
 
 ### RichContext
 
@@ -6843,6 +7072,17 @@ Defined in `src/memory/sessions.rs`. Temporal context for a session
 | `year` | `i32` | yes | Year |
 | `label` | `String` | yes | Human-readable label like "Morning session of Dec 20th" |
 | `relative` | `String` | yes | Relative time label like "Today", "Yesterday", "Last week" |
+
+### SessionView
+
+Defined in `src/handlers/user_admin.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `expires_at` | `DateTime<Utc>` | yes |  |
+| `current` | `bool` | yes |  |
 
 ### SessionsQuery
 
@@ -7838,6 +8078,15 @@ Defined in `src/handlers/remember.rs`. Upsert response
 | `was_update` | `bool` | yes |  |
 | `version` | `u32` | yes |  |
 
+### UserAuthDisabledResponse
+
+Defined in `src/handlers/user_auth.rs`. The `503` body of every `/api/user_auth/*` path while `VELD_USER_AUTH_ENABLED` is off; see [`disabled_fallback`].
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `error` | `&'static str` | yes |  |
+| `detail` | `&'static str` | yes |  |
+
 ### UserContext
 
 Defined in `src/memory/types.rs`. User-specific context
@@ -7981,6 +8230,24 @@ Defined in `src/memory/todos.rs`. Overall todo stats for a user
 | `overdue` | `usize` | yes |  |
 | `due_today` | `usize` | yes |  |
 | `projects` | `usize` | yes |  |
+
+### UserView
+
+Defined in `src/handlers/user_admin.rs`.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | `String` | yes |  |
+| `username` | `String` | yes |  |
+| `role` | `&'static str` | yes |  |
+| `created_at` | `DateTime<Utc>` | yes |  |
+| `last_login_at` | `Option<DateTime<Utc>>` | no |  |
+| `totp` | `&'static str` | yes | `active`, `pending` or `none`. |
+| `recovery_codes_remaining` | `usize` | yes |  |
+| `disabled_at` | `Option<DateTime<Utc>>` | no |  |
+| `locked_until` | `Option<DateTime<Utc>>` | no |  |
+| `failed_attempts` | `u32` | yes |  |
+| `sessions` | `usize` | yes |  |
 
 ### UsernameBody
 
