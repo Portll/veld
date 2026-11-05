@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps LM Studio serving veld's embedders (macOS launchd agent): scripts/lmstudio-embedders.sh at
+  login and every five minutes.
+
+  Installation (per-user):
+    1. Copy the script out of the checkout, so a branch switch does not change what launchd runs:
+         install -m 755 scripts/lmstudio-embedders.sh ~/.config/veld/lmstudio-embedders.sh
+    2. Copy this file, substituting __SCRIPT_PATH__ and __USER__ (launchd does not expand ~):
+         sed -e "s|__SCRIPT_PATH__|$HOME/.config/veld/lmstudio-embedders.sh|" -e "s|__USER__|$USER|" \
+           packaging/macos/net.portll.lmstudio-embedders.plist \
+           > ~/Library/LaunchAgents/net.portll.lmstudio-embedders.plist
+    3. Load and start:
+         launchctl load -w ~/Library/LaunchAgents/net.portll.lmstudio-embedders.plist
+
+  Uninstall:
+         launchctl unload -w ~/Library/LaunchAgents/net.portll.lmstudio-embedders.plist
+         rm ~/Library/LaunchAgents/net.portll.lmstudio-embedders.plist
+
+  Logs:  ~/Library/Logs/lmstudio-embedders.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.portll.lmstudio-embedders</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>__SCRIPT_PATH__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/__USER__/Library/Logs/lmstudio-embedders.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/__USER__/Library/Logs/lmstudio-embedders.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
