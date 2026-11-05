@@ -19080,50 +19080,50 @@
       "file": "src/memory/facets.rs",
       "doc": "One typed place layer — where in physical, organizational, or conceptual space.",
       "kind": "enum",
-      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "representation": "internally tagged: the payload's fields plus `\"kind\": <variant>`",
       "variants": [
         {
-          "name": "Repo",
+          "name": "repo",
           "payload": "{ slug: String, branch: Option<String>, commit: Option<String>, remote: Option<String>, pull_request: Option<String>, dirty: Option<bool> }",
           "doc": "A version-control repository. Absorbs the first-pass `RepositoryContext`."
         },
         {
-          "name": "Module",
+          "name": "module",
           "payload": "{ path: String }",
           "doc": "A module / package / namespace within a project."
         },
         {
-          "name": "File",
+          "name": "file",
           "payload": "{ path: String, symbol: Option<String> }",
           "doc": "A single source file, optionally scoped to a symbol."
         },
         {
-          "name": "Geo",
+          "name": "geo",
           "payload": "{ lat: f64, lon: f64, alt: Option<f64> }",
           "doc": "A geographic location (robotics, geolocation-tagged memory)."
         },
         {
-          "name": "Host",
+          "name": "host",
           "payload": "{ name: String, environment: Option<String> }",
           "doc": "A network host or deployment environment."
         },
         {
-          "name": "Url",
+          "name": "url",
           "payload": "{ href: String }",
           "doc": "A web URL."
         },
         {
-          "name": "Named",
+          "name": "named",
           "payload": "{ label: String }",
           "doc": "A free-form named place when nothing else fits."
         },
         {
-          "name": "LocalFrame",
+          "name": "local_frame",
           "payload": "{ frame: String, x: f32, y: f32, z: f32, orientation: Option<Orientation> }",
           "doc": "A position in a named local cartesian frame (robot frame, site frame, floor plan, etc.). Absorbs the legacy `Experience.local_position` flat field — the migrator emits `frame: \"robot\"` for that source."
         },
         {
-          "name": "GeoFix",
+          "name": "geo_fix",
           "payload": "{ lat: f64, lon: f64, alt: Option<f64>, accuracy_m: Option<f32>, speed_m_s: Option<f32>, course_deg: Option<f32>, captured_at: Option<DateTime<Utc>> }",
           "doc": "A geographic fix with full GPS/INS metadata — for callers that have it. `Place::Geo` stays the simple-case variant; `GeoFix` is the rich one. `resolved_geo()` reads both."
         }
@@ -20861,23 +20861,23 @@
       "file": "src/memory/compression.rs",
       "doc": "Reason a fact was administratively purged. Closed enum (no `Other` escape hatch) to keep `purge_reason` non-leaky: free-form operator notes belong in the audit log, not on the fact record.",
       "kind": "enum",
-      "representation": "externally tagged: a bare string for a unit variant, `{\"<variant>\": <payload>}` otherwise",
+      "representation": "internally tagged: the payload's fields plus `\"kind\": <variant>`",
       "variants": [
         {
-          "name": "UserRequest",
+          "name": "user_request",
           "doc": "Explicit user request to remove specific content."
         },
         {
-          "name": "AdminCleanup",
+          "name": "admin_cleanup",
           "doc": "Operator-initiated cleanup not tied to a particular pattern."
         },
         {
-          "name": "PatternMatch",
+          "name": "pattern_match",
           "payload": "{ pattern_hash: String }",
           "doc": "Matched a substring pattern. Pattern is stored as a SHA-256 hash to avoid leaking content into the record; the raw pattern (if forensics needs it) lives in the audit log keyed by purge event id."
         },
         {
-          "name": "ConfidenceFloor",
+          "name": "confidence_floor",
           "payload": "{ threshold: f32 }",
           "doc": "Calibrated confidence fell below the given threshold."
         }

@@ -12,6 +12,10 @@
 //! `src/handlers/types.rs` for handler files, then the file a `use` line or a fully qualified
 //! path points at, then a name unique in the crate. A name that is still ambiguous is listed
 //! with every candidate so the reader is told rather than guessed for.
+//!
+//! A type whose hand-written `Serialize` impl hands a human-readable format to a
+//! `#[serde(remote = "...")]` mirror (it branches on `is_human_readable()`, as `Place` does) is
+//! documented in that mirror's shape, which is the JSON a client sends and receives.
 
 use anyhow::{Context, Result};
 use quote::ToTokens;
@@ -291,6 +295,7 @@ struct SerdeAttrs {
     tag: Option<String>,
     content: Option<String>,
     untagged: bool,
+    remote: Option<String>,
 }
 
 fn serde_attrs(attrs: &[Attribute]) -> SerdeAttrs {
@@ -338,6 +343,8 @@ fn serde_attrs(attrs: &[Attribute]) -> SerdeAttrs {
                         out.tag = value;
                     } else if nv.path.is_ident("content") {
                         out.content = value;
+                    } else if nv.path.is_ident("remote") {
+                        out.remote = value;
                     }
                 }
                 Meta::List(list) => {
@@ -672,6 +679,189 @@ fn describe_enum(item: &ItemEnum, file: &str) -> TypeDoc {
     }
 }
 
+/// The mirror named in each `Mirror::serialize(..)` or `Mirror::deserialize(..)` call, in
+/// source order.
+#[derive(Default)]
+struct MirrorCalls {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for MirrorCalls {
+    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+        if let Expr::Path(ExprPath { path, .. }) = call.func.as_ref() {
+            let mut segments = path.segments.iter().rev();
+            if let (Some(method), Some(mirror)) = (segments.next(), segments.next()) {
+                if method.ident == "serialize" || method.ident == "deserialize" {
+                    self.names.push(mirror.ident.to_string());
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// The mirrors called in the arm of `if s.is_human_readable() { .. } else { .. }` that a
+/// human-readable format such as JSON enters.
+#[derive(Default)]
+struct HumanReadableArm {
+    branches: bool,
+    mirrors: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for HumanReadableArm {
+    fn visit_expr_if(&mut self, expr: &'ast syn::ExprIf) {
+        let (negated, cond) = match expr.cond.as_ref() {
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => (true, u.expr.as_ref()),
+            cond => (false, cond),
+        };
+        if !matches!(cond, Expr::MethodCall(call) if call.method == "is_human_readable") {
+            syn::visit::visit_expr_if(self, expr);
+            return;
+        }
+        self.branches = true;
+        let mut calls = MirrorCalls::default();
+        if negated {
+            if let Some((_, otherwise)) = &expr.else_branch {
+                calls.visit_expr(otherwise);
+            }
+        } else {
+            calls.visit_block(&expr.then_branch);
+        }
+        self.mirrors.extend(calls.names);
+    }
+}
+
+/// Which of `mirrors` (the `#[serde(remote)]` definitions of the impl's type) a hand-written
+/// serde impl hands JSON to: the one called in the human-readable arm when the impl branches
+/// on `is_human_readable()`, otherwise the one it calls. `None` unless exactly one qualifies.
+fn json_mirror(imp: &syn::ItemImpl, mirrors: &BTreeMap<String, &Item>) -> Option<String> {
+    let mut arm = HumanReadableArm::default();
+    arm.visit_item_impl(imp);
+    let called = if arm.branches {
+        arm.mirrors
+    } else {
+        let mut calls = MirrorCalls::default();
+        calls.visit_item_impl(imp);
+        calls.names
+    };
+    let hits: BTreeSet<String> = called
+        .into_iter()
+        .filter(|name| mirrors.contains_key(name))
+        .collect();
+    if hits.len() == 1 {
+        hits.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// For `impl Serialize for T` or `impl Deserialize<'de> for T` where `T` has remote mirrors:
+/// `T`, whether the impl is the `Serialize` one, and the mirror it hands JSON to.
+fn serde_impl_mirror(
+    imp: &syn::ItemImpl,
+    remotes: &BTreeMap<String, BTreeMap<String, &Item>>,
+) -> Option<(String, bool, String)> {
+    let (_, trait_path, _) = imp.trait_.as_ref()?;
+    let serialize = match trait_path.segments.last()?.ident.to_string().as_str() {
+        "Serialize" => true,
+        "Deserialize" => false,
+        _ => return None,
+    };
+    let (target, _) = last_segment(&imp.self_ty)?;
+    let mirror = json_mirror(imp, remotes.get(&target)?)?;
+    Some((target, serialize, mirror))
+}
+
+/// Types in `items` whose JSON is shaped by a `#[serde(remote = "...")]` mirror rather than by
+/// their own attributes, each mapped to that mirror. `Place` (src/memory/facets.rs) is one: its
+/// serde impls send JSON through an internally tagged mirror and bincode, which cannot decode an
+/// internally tagged enum, through an externally tagged one. The `Serialize` impl decides when
+/// the `Deserialize` impl names a different mirror.
+fn json_mirrors(items: &[Item]) -> BTreeMap<String, &Item> {
+    let mut remotes: BTreeMap<String, BTreeMap<String, &Item>> = BTreeMap::new();
+    for item in items {
+        let (ident, attrs) = match item {
+            Item::Enum(e) => (&e.ident, &e.attrs),
+            Item::Struct(s) => (&s.ident, &s.attrs),
+            _ => continue,
+        };
+        if let Some(remote) = serde_attrs(attrs).remote {
+            let target = match remote.rsplit_once("::") {
+                Some((_, name)) => name.trim().to_string(),
+                None => remote.trim().to_string(),
+            };
+            remotes
+                .entry(target)
+                .or_default()
+                .insert(ident.to_string(), item);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for item in items {
+        if let Item::Impl(imp) = item {
+            if let Some((target, serialize, mirror)) = serde_impl_mirror(imp, &remotes) {
+                let def = remotes[&target][&mirror];
+                if serialize {
+                    out.insert(target, def);
+                } else {
+                    out.entry(target).or_insert(def);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `attrs` with its doc comments replaced by those of `source`.
+fn docs_from(attrs: &[Attribute], source: &[Attribute]) -> Vec<Attribute> {
+    let docs = source.iter().filter(|a| a.path().is_ident("doc"));
+    let rest = attrs.iter().filter(|a| !a.path().is_ident("doc"));
+    docs.chain(rest).cloned().collect()
+}
+
+/// Each field in `fields` given the doc comments of its namesake in `source`, or of the field
+/// in the same position for a tuple.
+fn field_docs_from(fields: &mut Fields, source: &Fields) {
+    for (i, field) in fields.iter_mut().enumerate() {
+        let namesake = match &field.ident {
+            Some(ident) => source.iter().find(|f| f.ident.as_ref() == Some(ident)),
+            None => source.iter().nth(i),
+        };
+        if let Some(namesake) = namesake {
+            field.attrs = docs_from(&field.attrs, &namesake.attrs);
+        }
+    }
+}
+
+/// `def` in its JSON form: the shape and serde attributes of `mirror`, under `def`'s name and
+/// with `def`'s doc comments, which the mirror does not repeat. `None` when one of the two is
+/// a struct and the other an enum.
+fn describe_json_form(def: &Item, mirror: &Item, file: &str) -> Option<TypeDoc> {
+    match (def, mirror) {
+        (Item::Enum(def), Item::Enum(mirror)) => {
+            let mut form = mirror.clone();
+            form.ident = def.ident.clone();
+            form.attrs = docs_from(&form.attrs, &def.attrs);
+            for variant in form.variants.iter_mut() {
+                let namesake = def.variants.iter().find(|v| v.ident == variant.ident);
+                if let Some(namesake) = namesake {
+                    variant.attrs = docs_from(&variant.attrs, &namesake.attrs);
+                    field_docs_from(&mut variant.fields, &namesake.fields);
+                }
+            }
+            Some(describe_enum(&form, file))
+        }
+        (Item::Struct(def), Item::Struct(mirror)) => {
+            let mut form = mirror.clone();
+            form.ident = def.ident.clone();
+            form.attrs = docs_from(&form.attrs, &def.attrs);
+            field_docs_from(&mut form.fields, &def.fields);
+            Some(describe_struct(&form, file))
+        }
+        _ => None,
+    }
+}
+
 fn index_items(items: &[Item], file: &str, index: &mut Index) {
     index
         .files
@@ -681,6 +871,7 @@ fn index_items(items: &[Item], file: &str, index: &mut Index) {
             imports: BTreeMap::new(),
             globs: Vec::new(),
         });
+    let json_forms = json_mirrors(items);
     let mut nested: Vec<(String, &[Item])> = Vec::new();
     for item in items {
         match item {
@@ -691,7 +882,10 @@ fn index_items(items: &[Item], file: &str, index: &mut Index) {
                     .expect("scope exists")
                     .defined
                     .insert(s.ident.to_string());
-                let doc = describe_struct(s, file);
+                let doc = json_forms
+                    .get(&s.ident.to_string())
+                    .and_then(|mirror| describe_json_form(item, mirror, file))
+                    .unwrap_or_else(|| describe_struct(s, file));
                 index.defs.entry(doc.name.clone()).or_default().push(doc);
             }
             Item::Enum(e) => {
@@ -701,7 +895,10 @@ fn index_items(items: &[Item], file: &str, index: &mut Index) {
                     .expect("scope exists")
                     .defined
                     .insert(e.ident.to_string());
-                let doc = describe_enum(e, file);
+                let doc = json_forms
+                    .get(&e.ident.to_string())
+                    .and_then(|mirror| describe_json_form(item, mirror, file))
+                    .unwrap_or_else(|| describe_enum(e, file));
                 index.defs.entry(doc.name.clone()).or_default().push(doc);
             }
             Item::Use(u) => {
@@ -1308,7 +1505,7 @@ fn render_markdown(out: &Output, skipped: usize) -> String {
         }
     }
     md.push_str(
-        "---\n\n*Generated from the handler source; a change to a request or response type reaches this page on the next docs build, and `tests/mcp_tool_roundtrip.rs` is where a tool is held to it.*\n",
+        "---\n\n*Generated from the handler source; a change to a request or response type reaches this page on the next docs build. The tests in `src/mcp/schema_conformance.rs` build a sample of each MCP tool's documented reply from `schemas.json` and deserialise it into the type the tool reads.*\n",
     );
     md
 }

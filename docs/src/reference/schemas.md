@@ -4987,19 +4987,19 @@ Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <paylo
 
 Defined in `src/memory/facets.rs`. One typed place layer — where in physical, organizational, or conceptual space.
 
-Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+Enum, internally tagged: the payload's fields plus `"kind": <variant>`.
 
 | Variant | Payload | Notes |
 |---|---|---|
-| `Repo` | `{ slug: String, branch: Option<String>, commit: Option<String>, remote: Option<String>, pull_request: Option<String>, dirty: Option<bool> }` | A version-control repository. Absorbs the first-pass `RepositoryContext`. |
-| `Module` | `{ path: String }` | A module / package / namespace within a project. |
-| `File` | `{ path: String, symbol: Option<String> }` | A single source file, optionally scoped to a symbol. |
-| `Geo` | `{ lat: f64, lon: f64, alt: Option<f64> }` | A geographic location (robotics, geolocation-tagged memory). |
-| `Host` | `{ name: String, environment: Option<String> }` | A network host or deployment environment. |
-| `Url` | `{ href: String }` | A web URL. |
-| `Named` | `{ label: String }` | A free-form named place when nothing else fits. |
-| `LocalFrame` | `{ frame: String, x: f32, y: f32, z: f32, orientation: Option<Orientation> }` | A position in a named local cartesian frame (robot frame, site frame, floor plan, etc.). Absorbs the legacy `Experience.local_position` flat field — the migrator emits `frame: "robot"` for that source. |
-| `GeoFix` | `{ lat: f64, lon: f64, alt: Option<f64>, accuracy_m: Option<f32>, speed_m_s: Option<f32>, course_deg: Option<f32>, captured_at: Option<DateTime<Utc>> }` | A geographic fix with full GPS/INS metadata — for callers that have it. `Place::Geo` stays the simple-case variant; `GeoFix` is the rich one. `resolved_geo()` reads both. |
+| `repo` | `{ slug: String, branch: Option<String>, commit: Option<String>, remote: Option<String>, pull_request: Option<String>, dirty: Option<bool> }` | A version-control repository. Absorbs the first-pass `RepositoryContext`. |
+| `module` | `{ path: String }` | A module / package / namespace within a project. |
+| `file` | `{ path: String, symbol: Option<String> }` | A single source file, optionally scoped to a symbol. |
+| `geo` | `{ lat: f64, lon: f64, alt: Option<f64> }` | A geographic location (robotics, geolocation-tagged memory). |
+| `host` | `{ name: String, environment: Option<String> }` | A network host or deployment environment. |
+| `url` | `{ href: String }` | A web URL. |
+| `named` | `{ label: String }` | A free-form named place when nothing else fits. |
+| `local_frame` | `{ frame: String, x: f32, y: f32, z: f32, orientation: Option<Orientation> }` | A position in a named local cartesian frame (robot frame, site frame, floor plan, etc.). Absorbs the legacy `Experience.local_position` flat field — the migrator emits `frame: "robot"` for that source. |
+| `geo_fix` | `{ lat: f64, lon: f64, alt: Option<f64>, accuracy_m: Option<f32>, speed_m_s: Option<f32>, course_deg: Option<f32>, captured_at: Option<DateTime<Utc>> }` | A geographic fix with full GPS/INS metadata — for callers that have it. `Place::Geo` stays the simple-case variant; `GeoFix` is the rich one. `resolved_geo()` reads both. |
 
 ### PlanResponse
 
@@ -5378,14 +5378,14 @@ Defined in `src/handlers/types.rs`.
 
 Defined in `src/memory/compression.rs`. Reason a fact was administratively purged. Closed enum (no `Other` escape hatch) to keep `purge_reason` non-leaky: free-form operator notes belong in the audit log, not on the fact record.
 
-Enum, externally tagged: a bare string for a unit variant, `{"<variant>": <payload>}` otherwise.
+Enum, internally tagged: the payload's fields plus `"kind": <variant>`.
 
 | Variant | Payload | Notes |
 |---|---|---|
-| `UserRequest` | none | Explicit user request to remove specific content. |
-| `AdminCleanup` | none | Operator-initiated cleanup not tied to a particular pattern. |
-| `PatternMatch` | `{ pattern_hash: String }` | Matched a substring pattern. Pattern is stored as a SHA-256 hash to avoid leaking content into the record; the raw pattern (if forensics needs it) lives in the audit log keyed by purge event id. |
-| `ConfidenceFloor` | `{ threshold: f32 }` | Calibrated confidence fell below the given threshold. |
+| `user_request` | none | Explicit user request to remove specific content. |
+| `admin_cleanup` | none | Operator-initiated cleanup not tied to a particular pattern. |
+| `pattern_match` | `{ pattern_hash: String }` | Matched a substring pattern. Pattern is stored as a SHA-256 hash to avoid leaking content into the record; the raw pattern (if forensics needs it) lives in the audit log keyed by purge event id. |
+| `confidence_floor` | `{ threshold: f32 }` | Calibrated confidence fell below the given threshold. |
 
 ### Query
 
@@ -7874,4 +7874,4 @@ Defined in `src/handlers/crud.rs`. Reply of `POST /api/wiki/render`.
 
 ---
 
-*Generated from the handler source; a change to a request or response type reaches this page on the next docs build, and `tests/mcp_tool_roundtrip.rs` is where a tool is held to it.*
+*Generated from the handler source; a change to a request or response type reaches this page on the next docs build. The tests in `src/mcp/schema_conformance.rs` build a sample of each MCP tool's documented reply from `schemas.json` and deserialise it into the type the tool reads.*
