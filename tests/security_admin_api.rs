@@ -420,4 +420,29 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         );
     }
     assert_eq!(actions[0], "password_reset_by_admin", "newest first");
+
+    // The success replies keep their wire keys: login and an admin's revoke_all.
+    let login = api.login("bob", temporary, None).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.text);
+    let mut keys: Vec<_> = login.body.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["expires_at", "role", "session_token", "success"]);
+    assert_eq!(login.body["success"], true);
+    let revoked = api
+        .post(
+            "/api/user_auth/sessions/revoke_all",
+            &token,
+            json!({ "username": "bob" }),
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{}", revoked.text);
+    let mut keys: Vec<_> = revoked.body.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["removed", "success"]);
+    assert_eq!(revoked.body["success"], true);
+    assert!(
+        revoked.body["removed"].as_u64().unwrap() >= 1,
+        "{}",
+        revoked.text
+    );
 }

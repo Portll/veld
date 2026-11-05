@@ -26,7 +26,6 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
 
 use super::state::MultiUserMemoryManager;
@@ -90,6 +89,30 @@ pub struct RecoverRequest {
     pub new_password: String,
 }
 
+/// `{"success": true}` — the reply of the user-auth routes whose success
+/// carries nothing beyond the fact (2FA confirm, recover, logout, admin
+/// promote / demote).
+#[derive(Debug, Serialize)]
+pub struct AuthSuccessResponse {
+    pub success: bool,
+}
+
+/// `{"success": true, "removed": n}` — the reply of the session
+/// revocation routes; `removed` counts the sessions deleted.
+#[derive(Debug, Serialize)]
+pub struct RevokedSessionsResponse {
+    pub success: bool,
+    pub removed: usize,
+}
+
+/// The `503` body of every `/api/user_auth/*` path while
+/// `VELD_USER_AUTH_ENABLED` is off; see [`disabled_fallback`].
+#[derive(Debug, Serialize)]
+pub struct UserAuthDisabledResponse {
+    pub error: &'static str,
+    pub detail: &'static str,
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
@@ -149,11 +172,9 @@ pub async fn register(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
-) -> Response {
-    match register_inner(&state, &headers, req).await {
-        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<(StatusCode, Json<RegisterResponse>), AuthError> {
+    let resp = register_inner(&state, &headers, req).await?;
+    Ok((StatusCode::CREATED, Json(resp)))
 }
 
 async fn register_inner(
@@ -216,11 +237,11 @@ async fn register_inner(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `POST /api/user_auth/login`
-pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
-    match login_inner(&state, req).await {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => e.into_response(),
-    }
+pub async fn login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, AuthError> {
+    login_inner(&state, req).await.map(Json)
 }
 
 async fn login_inner(state: &AppState, req: LoginRequest) -> Result<LoginResponse, AuthError> {
@@ -347,11 +368,8 @@ const DUMMY_HASH: &str = "$argon2id$v=19$m=32768,t=2,p=1$JFcMlt9WCXKuoFGBaaG9eg$
 pub async fn enroll_2fa(
     State(state): State<AppState>,
     Extension(user): Extension<crate::user_auth::SessionUser>,
-) -> Response {
-    match enroll_2fa_inner(&state, &user.0).await {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<Json<Enroll2faResponse>, AuthError> {
+    enroll_2fa_inner(&state, &user.0).await.map(Json)
 }
 
 async fn enroll_2fa_inner(
@@ -386,11 +404,9 @@ pub async fn confirm_2fa(
     State(state): State<AppState>,
     Extension(user): Extension<crate::user_auth::SessionUser>,
     Json(req): Json<Confirm2faRequest>,
-) -> Response {
-    match confirm_2fa_inner(&state, &user.0, req).await {
-        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<Json<AuthSuccessResponse>, AuthError> {
+    confirm_2fa_inner(&state, &user.0, req).await?;
+    Ok(Json(AuthSuccessResponse { success: true }))
 }
 
 async fn confirm_2fa_inner(
@@ -421,11 +437,12 @@ async fn confirm_2fa_inner(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `POST /api/user_auth/recover` — public, consumes one recovery code.
-pub async fn recover(State(state): State<AppState>, Json(req): Json<RecoverRequest>) -> Response {
-    match recover_inner(&state, req).await {
-        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
-        Err(e) => e.into_response(),
-    }
+pub async fn recover(
+    State(state): State<AppState>,
+    Json(req): Json<RecoverRequest>,
+) -> Result<Json<AuthSuccessResponse>, AuthError> {
+    recover_inner(&state, req).await?;
+    Ok(Json(AuthSuccessResponse { success: true }))
 }
 
 async fn recover_inner(state: &AppState, req: RecoverRequest) -> Result<(), AuthError> {
@@ -479,19 +496,12 @@ async fn recover_inner(state: &AppState, req: RecoverRequest) -> Result<(), Auth
 pub async fn logout(
     State(state): State<AppState>,
     Extension(token): Extension<crate::user_auth::SessionTokenExt>,
-) -> Response {
-    let Ok(runtime) = runtime(&state) else {
-        return AuthError::Disabled.into_response();
-    };
-    let hash = match session_mod::hash_token(&token.0) {
-        Ok(h) => h,
-        Err(e) => return e.into_response(),
-    };
+) -> Result<Json<AuthSuccessResponse>, AuthError> {
+    let runtime = runtime(&state)?;
+    let hash = session_mod::hash_token(&token.0)?;
     runtime.elevations.drop_session(&hash);
-    if let Err(e) = runtime.store.delete_session_by_hash(&hash) {
-        return e.into_response();
-    }
-    (StatusCode::OK, Json(json!({"success": true}))).into_response()
+    runtime.store.delete_session_by_hash(&hash)?;
+    Ok(Json(AuthSuccessResponse { success: true }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -510,12 +520,14 @@ pub async fn logout(
 /// `{"error": "user_auth_disabled", "detail": "…"}` so an operator
 /// reading logs / clients can pattern-match on the marker without
 /// pulling in the full auth-error vocabulary.
-pub async fn disabled_fallback() -> Response {
-    let body = json!({
-        "error": "user_auth_disabled",
-        "detail": "Set VELD_USER_AUTH_ENABLED=true to enable",
-    });
-    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+pub async fn disabled_fallback() -> (StatusCode, Json<UserAuthDisabledResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(UserAuthDisabledResponse {
+            error: "user_auth_disabled",
+            detail: "Set VELD_USER_AUTH_ENABLED=true to enable",
+        }),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -609,13 +621,10 @@ pub async fn admin_promote(
     State(state): State<AppState>,
     Extension(caller): Extension<crate::user_auth::SessionUser>,
     Json(req): Json<UsernameRequest>,
-) -> Response {
-    let result = runtime(&state)
-        .and_then(|rt| admin_set_role_with_runtime(rt, &caller.0, &req.username, UserRole::Admin));
-    match result {
-        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<Json<AuthSuccessResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    admin_set_role_with_runtime(rt, &caller.0, &req.username, UserRole::Admin)?;
+    Ok(Json(AuthSuccessResponse { success: true }))
 }
 
 /// `POST /api/user_auth/admin/demote` — admin-only.
@@ -626,13 +635,10 @@ pub async fn admin_demote(
     State(state): State<AppState>,
     Extension(caller): Extension<crate::user_auth::SessionUser>,
     Json(req): Json<UsernameRequest>,
-) -> Response {
-    let result = runtime(&state)
-        .and_then(|rt| admin_set_role_with_runtime(rt, &caller.0, &req.username, UserRole::User));
-    match result {
-        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<Json<AuthSuccessResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    admin_set_role_with_runtime(rt, &caller.0, &req.username, UserRole::User)?;
+    Ok(Json(AuthSuccessResponse { success: true }))
 }
 
 /// Inner role-change logic — broken out from the handlers so unit tests
@@ -696,17 +702,13 @@ pub async fn revoke_all_sessions(
     State(state): State<AppState>,
     Extension(caller): Extension<crate::user_auth::SessionUser>,
     Json(req): Json<UsernameRequest>,
-) -> Response {
-    let result = runtime(&state)
-        .and_then(|rt| revoke_all_sessions_with_runtime(rt, &caller.0, &req.username));
-    match result {
-        Ok(removed) => (
-            StatusCode::OK,
-            Json(json!({"success": true, "removed": removed})),
-        )
-            .into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<Json<RevokedSessionsResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    let removed = revoke_all_sessions_with_runtime(rt, &caller.0, &req.username)?;
+    Ok(Json(RevokedSessionsResponse {
+        success: true,
+        removed,
+    }))
 }
 
 fn revoke_all_sessions_with_runtime(
@@ -741,17 +743,13 @@ pub async fn revoke_my_other_sessions(
     State(state): State<AppState>,
     Extension(caller): Extension<crate::user_auth::SessionUser>,
     Extension(token): Extension<crate::user_auth::SessionTokenExt>,
-) -> Response {
-    let result = runtime(&state)
-        .and_then(|rt| revoke_my_other_sessions_with_runtime(rt, &caller.0, &token.0));
-    match result {
-        Ok(removed) => (
-            StatusCode::OK,
-            Json(json!({"success": true, "removed": removed})),
-        )
-            .into_response(),
-        Err(e) => e.into_response(),
-    }
+) -> Result<Json<RevokedSessionsResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    let removed = revoke_my_other_sessions_with_runtime(rt, &caller.0, &token.0)?;
+    Ok(Json(RevokedSessionsResponse {
+        success: true,
+        removed,
+    }))
 }
 
 fn revoke_my_other_sessions_with_runtime(
@@ -955,6 +953,44 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn typed_replies_keep_the_json_keys_they_replaced() {
+        fn keys(value: impl Serialize) -> Vec<String> {
+            let mut keys: Vec<String> = serde_json::to_value(value)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        }
+        assert_eq!(keys(AuthSuccessResponse { success: true }), ["success"]);
+        assert_eq!(
+            keys(RevokedSessionsResponse {
+                success: true,
+                removed: 2
+            }),
+            ["removed", "success"]
+        );
+        assert_eq!(
+            serde_json::to_value(RevokedSessionsResponse {
+                success: true,
+                removed: 2
+            })
+            .unwrap()["removed"],
+            2
+        );
+        assert_eq!(
+            keys(UserAuthDisabledResponse {
+                error: "user_auth_disabled",
+                detail: "x"
+            }),
+            ["detail", "error"]
+        );
     }
 
     // ── Helpers for admin / revoke / throttle tests ─────────────────────
