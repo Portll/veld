@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::HeaderMap,
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
@@ -32,13 +31,6 @@ pub const STEP_UP_HEADER: &str = "x-veld-step-up";
 
 fn runtime(state: &AppState) -> Result<&UserAuthRuntime, AuthError> {
     state.user_auth_runtime.as_ref().ok_or(AuthError::Disabled)
-}
-
-fn respond<T: Serialize>(result: Result<T, AuthError>) -> Response {
-    match result {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(e) => e.into_response(),
-    }
 }
 
 pub(crate) fn require_admin(caller: &UserRecord) -> Result<(), AuthError> {
@@ -148,7 +140,7 @@ fn not_self(caller: &UserRecord, target: &UserRecord) -> Result<(), AuthError> {
 
 // ── Users ───────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct UserView {
     pub id: String,
     pub username: String,
@@ -190,15 +182,15 @@ fn view(runtime: &UserAuthRuntime, user: &UserRecord) -> Result<UserView, AuthEr
 pub async fn list_users(
     State(state): State<AppState>,
     Extension(caller): Extension<SessionUser>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin(&caller.0)?;
-        rt.store
-            .list_users()?
-            .iter()
-            .map(|u| view(rt, u))
-            .collect::<Result<Vec<_>, _>>()
-    }))
+) -> Result<Json<Vec<UserView>>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin(&caller.0)?;
+    rt.store
+        .list_users()?
+        .iter()
+        .map(|u| view(rt, u))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,11 +237,10 @@ pub async fn disable_user(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UsernameBody>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
-        set_disabled_with_runtime(rt, &caller.0, &body.username, true)
-    }))
+) -> Result<Json<UserView>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
+    set_disabled_with_runtime(rt, &caller.0, &body.username, true).map(Json)
 }
 
 /// `POST /api/user_auth/admin/users/enable` — step-up.
@@ -259,11 +250,10 @@ pub async fn enable_user(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UsernameBody>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
-        set_disabled_with_runtime(rt, &caller.0, &body.username, false)
-    }))
+) -> Result<Json<UserView>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
+    set_disabled_with_runtime(rt, &caller.0, &body.username, false).map(Json)
 }
 
 /// A temporary password: 24 characters of base64url, 144 bits.
@@ -275,6 +265,14 @@ fn temporary_password() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
+/// The reply of `POST /api/user_auth/admin/users/reset_password`: the temporary
+/// password, shown this once.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResetPasswordResponse {
+    pub username: String,
+    pub temporary_password: String,
+}
+
 /// `POST /api/user_auth/admin/users/reset_password` — step-up. Returns a temporary
 /// password once and revokes every session of the user.
 pub async fn reset_password(
@@ -283,29 +281,28 @@ pub async fn reset_password(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UsernameBody>,
-) -> Response {
-    let result = async {
-        let rt = runtime(&state)?;
-        require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
-        let mut target = target_user(rt, &body.username)?;
-        not_self(&caller.0, &target)?;
-        let temporary = temporary_password();
-        target.password_hash = password::hash_password_async(&temporary).await?;
-        rt.store.put_user(&target)?;
-        let killed = rt.store.delete_all_sessions_for_user(&target.id)?;
-        rt.store.clear_login_throttle(&target.username)?;
-        rt.login_limiter.reset(&target.username);
-        audit(
-            rt,
-            &caller.0,
-            "password_reset_by_admin",
-            Some(&target.username),
-            json!({ "sessions_revoked": killed }),
-        )?;
-        Ok(json!({ "username": target.username, "temporary_password": temporary }))
-    }
-    .await;
-    respond(result)
+) -> Result<Json<ResetPasswordResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
+    let mut target = target_user(rt, &body.username)?;
+    not_self(&caller.0, &target)?;
+    let temporary = temporary_password();
+    target.password_hash = password::hash_password_async(&temporary).await?;
+    rt.store.put_user(&target)?;
+    let killed = rt.store.delete_all_sessions_for_user(&target.id)?;
+    rt.store.clear_login_throttle(&target.username)?;
+    rt.login_limiter.reset(&target.username);
+    audit(
+        rt,
+        &caller.0,
+        "password_reset_by_admin",
+        Some(&target.username),
+        json!({ "sessions_revoked": killed }),
+    )?;
+    Ok(Json(ResetPasswordResponse {
+        username: target.username,
+        temporary_password: temporary,
+    }))
 }
 
 pub(crate) fn reset_2fa_with_runtime(
@@ -338,11 +335,10 @@ pub async fn reset_2fa(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UsernameBody>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
-        reset_2fa_with_runtime(rt, &caller.0, &body.username)
-    }))
+) -> Result<Json<UserView>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
+    reset_2fa_with_runtime(rt, &caller.0, &body.username).map(Json)
 }
 
 /// `POST /api/user_auth/admin/users/unlock` — step-up. Clears the login lockout.
@@ -352,26 +348,25 @@ pub async fn unlock_user(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<UsernameBody>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
-        let target = target_user(rt, &body.username)?;
-        rt.store.clear_login_throttle(&target.username)?;
-        rt.login_limiter.reset(&target.username);
-        audit(
-            rt,
-            &caller.0,
-            "login_unlock",
-            Some(&target.username),
-            json!({}),
-        )?;
-        view(rt, &target)
-    }))
+) -> Result<Json<UserView>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
+    let target = target_user(rt, &body.username)?;
+    rt.store.clear_login_throttle(&target.username)?;
+    rt.login_limiter.reset(&target.username);
+    audit(
+        rt,
+        &caller.0,
+        "login_unlock",
+        Some(&target.username),
+        json!({}),
+    )?;
+    view(rt, &target).map(Json)
 }
 
 // ── Sessions ────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SessionView {
     pub id: String,
     pub created_at: DateTime<Utc>,
@@ -412,18 +407,24 @@ pub async fn list_sessions(
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     Query(query): Query<SessionsQuery>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin(&caller.0)?;
-        let target = target_user(rt, &query.username)?;
-        session_views(rt, &target, Some(&token.0))
-    }))
+) -> Result<Json<Vec<SessionView>>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin(&caller.0)?;
+    let target = target_user(rt, &query.username)?;
+    session_views(rt, &target, Some(&token.0)).map(Json)
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RevokeSessionBody {
     pub username: String,
     pub session_id: String,
+}
+
+/// `{"revoked": id}` — the reply of the session revocation routes, naming the public
+/// id of the session that ended.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RevokeSessionResponse {
+    pub revoked: String,
 }
 
 /// `POST /api/user_auth/admin/sessions/revoke` — step-up.
@@ -433,24 +434,25 @@ pub async fn revoke_session(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<RevokeSessionBody>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
-        let target = target_user(rt, &body.username)?;
-        if !rt
-            .store
-            .delete_session_by_public_id(&target.id, &body.session_id)?
-        {
-            return Err(AuthError::SessionNotFound);
-        }
-        audit(
-            rt,
-            &caller.0,
-            "session_revoke",
-            Some(&target.username),
-            json!({ "session": body.session_id }),
-        )?;
-        Ok(json!({ "revoked": body.session_id }))
+) -> Result<Json<RevokeSessionResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin_step_up(rt, &caller.0, &token.0, &headers)?;
+    let target = target_user(rt, &body.username)?;
+    if !rt
+        .store
+        .delete_session_by_public_id(&target.id, &body.session_id)?
+    {
+        return Err(AuthError::SessionNotFound);
+    }
+    audit(
+        rt,
+        &caller.0,
+        "session_revoke",
+        Some(&target.username),
+        json!({ "session": body.session_id }),
+    )?;
+    Ok(Json(RevokeSessionResponse {
+        revoked: body.session_id,
     }))
 }
 
@@ -466,27 +468,33 @@ pub async fn read_audit(
     State(state): State<AppState>,
     Extension(caller): Extension<SessionUser>,
     Query(query): Query<AuditQuery>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        require_admin(&caller.0)?;
-        rt.store
-            .recent_audit(query.limit.unwrap_or(100).clamp(1, 1000))
-    }))
+) -> Result<Json<Vec<AuditEvent>>, AuthError> {
+    let rt = runtime(&state)?;
+    require_admin(&caller.0)?;
+    rt.store
+        .recent_audit(query.limit.unwrap_or(100).clamp(1, 1000))
+        .map(Json)
 }
 
 // ── Self-service ────────────────────────────────────────────────────────
+
+/// The reply of `GET /api/user_auth/me`: the caller's account and sessions.
+#[derive(Debug, Serialize)]
+pub struct MeResponse {
+    pub user: UserView,
+    pub sessions: Vec<SessionView>,
+}
 
 /// `GET /api/user_auth/me`
 pub async fn me(
     State(state): State<AppState>,
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        Ok(json!({
-            "user": view(rt, &caller.0)?,
-            "sessions": session_views(rt, &caller.0, Some(&token.0))?,
-        }))
+) -> Result<Json<MeResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    Ok(Json(MeResponse {
+        user: view(rt, &caller.0)?,
+        sessions: session_views(rt, &caller.0, Some(&token.0))?,
     }))
 }
 
@@ -494,6 +502,14 @@ pub async fn me(
 pub struct ChangePasswordBody {
     pub current_password: String,
     pub new_password: String,
+}
+
+/// The reply of `POST /api/user_auth/password`; `sessions_revoked` counts the caller's
+/// other sessions that ended.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChangePasswordResponse {
+    pub success: bool,
+    pub sessions_revoked: usize,
 }
 
 /// `POST /api/user_auth/password` — the current password, and step-up when 2FA is
@@ -504,39 +520,44 @@ pub async fn change_password(
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
     Json(body): Json<ChangePasswordBody>,
-) -> Response {
-    let result = async {
-        let rt = runtime(&state)?;
-        let mut user = caller.0.clone();
-        if body.new_password.len() < 8 {
-            return Err(AuthError::weak_password(
-                "password must be at least 8 characters",
-            ));
-        }
-        if rt.login_limiter.check(&user.username).is_err() {
-            return Err(AuthError::TooManyAttempts);
-        }
-        if !password::verify_password_async(&body.current_password, &user.password_hash).await? {
-            return Err(AuthError::InvalidCredentials);
-        }
-        if user.has_active_totp() {
-            require_step_up(rt, &user, &token.0, &headers, totp::current_unix_time())?;
-        }
-        user.password_hash = password::hash_password_async(&body.new_password).await?;
-        rt.store.put_user(&user)?;
-        let keep = session_mod::hash_token(&token.0)?;
-        let killed = rt.store.delete_other_sessions_for_user(&user.id, &keep)?;
-        audit(
-            rt,
-            &user,
-            "password_change",
-            Some(&user.username),
-            json!({ "sessions_revoked": killed }),
-        )?;
-        Ok(json!({ "success": true, "sessions_revoked": killed }))
+) -> Result<Json<ChangePasswordResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    let mut user = caller.0.clone();
+    if body.new_password.len() < 8 {
+        return Err(AuthError::weak_password(
+            "password must be at least 8 characters",
+        ));
     }
-    .await;
-    respond(result)
+    if rt.login_limiter.check(&user.username).is_err() {
+        return Err(AuthError::TooManyAttempts);
+    }
+    if !password::verify_password_async(&body.current_password, &user.password_hash).await? {
+        return Err(AuthError::InvalidCredentials);
+    }
+    if user.has_active_totp() {
+        require_step_up(rt, &user, &token.0, &headers, totp::current_unix_time())?;
+    }
+    user.password_hash = password::hash_password_async(&body.new_password).await?;
+    rt.store.put_user(&user)?;
+    let keep = session_mod::hash_token(&token.0)?;
+    let killed = rt.store.delete_other_sessions_for_user(&user.id, &keep)?;
+    audit(
+        rt,
+        &user,
+        "password_change",
+        Some(&user.username),
+        json!({ "sessions_revoked": killed }),
+    )?;
+    Ok(Json(ChangePasswordResponse {
+        success: true,
+        sessions_revoked: killed,
+    }))
+}
+
+/// The reply of `POST /api/user_auth/recovery_codes`: the new batch, shown this once.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegenerateRecoveryCodesResponse {
+    pub recovery_codes: Vec<String>,
 }
 
 /// `POST /api/user_auth/recovery_codes` — step-up. A fresh batch of ten codes,
@@ -546,25 +567,23 @@ pub async fn regenerate_recovery_codes(
     Extension(caller): Extension<SessionUser>,
     Extension(token): Extension<SessionTokenExt>,
     headers: HeaderMap,
-) -> Response {
-    let result = async {
-        let rt = runtime(&state)?;
-        require_step_up(rt, &caller.0, &token.0, &headers, totp::current_unix_time())?;
-        let (codes, hashes) = recovery_codes::generate_batch_async().await?;
-        let mut user = caller.0.clone();
-        user.recovery_code_hashes = hashes;
-        rt.store.put_user(&user)?;
-        audit(
-            rt,
-            &user,
-            "recovery_codes_regenerated",
-            Some(&user.username),
-            json!({}),
-        )?;
-        Ok(json!({ "recovery_codes": codes }))
-    }
-    .await;
-    respond(result)
+) -> Result<Json<RegenerateRecoveryCodesResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    require_step_up(rt, &caller.0, &token.0, &headers, totp::current_unix_time())?;
+    let (codes, hashes) = recovery_codes::generate_batch_async().await?;
+    let mut user = caller.0.clone();
+    user.recovery_code_hashes = hashes;
+    rt.store.put_user(&user)?;
+    audit(
+        rt,
+        &user,
+        "recovery_codes_regenerated",
+        Some(&user.username),
+        json!({}),
+    )?;
+    Ok(Json(RegenerateRecoveryCodesResponse {
+        recovery_codes: codes,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,15 +596,16 @@ pub async fn revoke_own_session(
     State(state): State<AppState>,
     Extension(caller): Extension<SessionUser>,
     Json(body): Json<OwnSessionBody>,
-) -> Response {
-    respond(runtime(&state).and_then(|rt| {
-        if !rt
-            .store
-            .delete_session_by_public_id(&caller.0.id, &body.session_id)?
-        {
-            return Err(AuthError::SessionNotFound);
-        }
-        Ok(json!({ "revoked": body.session_id }))
+) -> Result<Json<RevokeSessionResponse>, AuthError> {
+    let rt = runtime(&state)?;
+    if !rt
+        .store
+        .delete_session_by_public_id(&caller.0.id, &body.session_id)?
+    {
+        return Err(AuthError::SessionNotFound);
+    }
+    Ok(Json(RevokeSessionResponse {
+        revoked: body.session_id,
     }))
 }
 
@@ -795,5 +815,65 @@ mod tests {
             .list_sessions_for_user(&alice.id, Utc::now())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn typed_replies_keep_the_json_keys_they_replaced() {
+        fn keys(value: impl Serialize) -> Vec<String> {
+            let mut keys: Vec<String> = serde_json::to_value(value)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        }
+        assert_eq!(
+            keys(ResetPasswordResponse {
+                username: "bob".into(),
+                temporary_password: "t".into(),
+            }),
+            ["temporary_password", "username"]
+        );
+        assert_eq!(
+            keys(RevokeSessionResponse {
+                revoked: "s".into()
+            }),
+            ["revoked"]
+        );
+        let changed = ChangePasswordResponse {
+            success: true,
+            sessions_revoked: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap(),
+            json!({ "success": true, "sessions_revoked": 2 })
+        );
+        assert_eq!(
+            keys(RegenerateRecoveryCodesResponse {
+                recovery_codes: vec!["a".into()],
+            }),
+            ["recovery_codes"]
+        );
+
+        let dir = tempdir().unwrap();
+        let rt = open_runtime(dir.path(), 10);
+        let alice = user("alice", UserRole::User, false);
+        rt.store.create_user(&alice).unwrap();
+        let token = session_for(&rt, &alice);
+        let me = MeResponse {
+            user: view(&rt, &alice).unwrap(),
+            sessions: session_views(&rt, &alice, Some(&token)).unwrap(),
+        };
+        let value = serde_json::to_value(&me).unwrap();
+        assert_eq!(keys(&me), ["sessions", "user"]);
+        assert_eq!(
+            keys(&value["sessions"][0]),
+            ["created_at", "current", "expires_at", "id"]
+        );
+        assert_eq!(value["sessions"][0]["current"], true);
+        assert_eq!(value["user"]["username"], "alice");
     }
 }

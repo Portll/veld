@@ -97,6 +97,21 @@ impl Api {
     }
 }
 
+/// The keys of `handlers::user_admin::UserView`, sorted.
+const USER_VIEW_KEYS: [&str; 11] = [
+    "created_at",
+    "disabled_at",
+    "failed_attempts",
+    "id",
+    "last_login_at",
+    "locked_until",
+    "recovery_codes_remaining",
+    "role",
+    "sessions",
+    "totp",
+    "username",
+];
+
 /// The top-level keys of a JSON object reply, sorted: what a typed reply must keep.
 fn top_keys(body: &Value) -> Vec<String> {
     let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
@@ -374,6 +389,9 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
     );
     let users = api.get("/api/user_auth/admin/users", &token).await;
     assert_eq!(users.body.as_array().unwrap().len(), 2);
+    for user in users.body.as_array().unwrap() {
+        assert_eq!(top_keys(user), USER_VIEW_KEYS);
+    }
     ok(
         &api.post(
             "/api/user_auth/admin/users/disable",
@@ -407,6 +425,7 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         )
         .await;
     ok(&reset, "reset bob's password");
+    assert_eq!(top_keys(&reset.body), ["temporary_password", "username"]);
     let temporary = reset.body["temporary_password"].as_str().unwrap();
     ok(
         &api.login("bob", temporary, None).await,
@@ -442,6 +461,10 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         );
     }
     assert_eq!(actions[0], "password_reset_by_admin", "newest first");
+    assert_eq!(
+        top_keys(&audit.body[0]),
+        ["action", "actor", "at", "detail", "target"]
+    );
 
     // The success replies keep their wire keys: login and an admin's revoke_all.
     let login = api.login("bob", temporary, None).await;
@@ -466,5 +489,52 @@ async fn an_admin_with_2fa_manages_keys_and_logins_over_http() {
         revoked.body["removed"].as_u64().unwrap() >= 1,
         "{}",
         revoked.text
+    );
+
+    // The account's own replies: an admin's list of its sessions, `me`, and ending
+    // one of its own sessions.
+    let sessions = api
+        .get("/api/user_auth/admin/sessions?username=root", &token)
+        .await;
+    ok(&sessions, "root's sessions");
+    assert_eq!(
+        sessions.body.as_array().unwrap().len(),
+        2,
+        "{}",
+        sessions.text
+    );
+    for session in sessions.body.as_array().unwrap() {
+        assert_eq!(
+            top_keys(session),
+            ["created_at", "current", "expires_at", "id"]
+        );
+    }
+    let me = api.get("/api/user_auth/me", &token).await;
+    ok(&me, "me");
+    assert_eq!(top_keys(&me.body), ["sessions", "user"]);
+    assert_eq!(top_keys(&me.body["user"]), USER_VIEW_KEYS);
+    let other = me.body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["current"] == false)
+        .expect("the second session")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ended = api
+        .post(
+            "/api/user_auth/sessions/revoke",
+            &token,
+            json!({ "session_id": other }),
+        )
+        .await;
+    ok(&ended, "end the second session");
+    assert_eq!(top_keys(&ended.body), ["revoked"]);
+    assert_eq!(ended.body["revoked"], other.as_str());
+    assert_eq!(
+        api.get("/api/user_auth/me", &token2).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the ended session is refused"
     );
 }
