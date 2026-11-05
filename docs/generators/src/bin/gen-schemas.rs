@@ -726,7 +726,11 @@ fn build_index(src: &Path, root: &Path) -> Result<Index> {
         defs: BTreeMap::new(),
         files: BTreeMap::new(),
     };
+    // Sorted, so a name defined in several files lists its candidates in the same order on every
+    // filesystem: readdir order differs between APFS and ext4, and the ambiguous-names table and
+    // the CI drift check read that order.
     for entry in walkdir::WalkDir::new(src)
+        .sort_by_file_name()
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))

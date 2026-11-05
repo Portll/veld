@@ -94,6 +94,58 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # The request and response schemas in docs/src/reference/ are generated from the handler source
+  # by docs/generators (syn over src/; it does not build veld). docs.yml regenerates every reference
+  # page but is out of service, and routes and types landed without their schema entries: main at
+  # 3fa6aabb lacked four routes and 28 changed or new types. This job checks schemas.md/json only, so
+  # it carries none of docs.yml's other failures.
+  schema-drift:
+    name: Schema Drift
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+      # A pull request or a push to main checks only when an input of gen-schemas changed; a tag or
+      # a dispatch always checks. A run with no such change passes without building anything.
+      - uses: dorny/paths-filter@v3
+        id: inputs
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
+        with:
+          filters: |
+            schemas:
+              - 'src/**'
+              - 'docs/generators/**'
+              - 'docs/src/reference/schemas.*'
+              - '.github/workflows/ci.yml'
+      - name: Scope
+        id: scope
+        run: echo "check=${{ steps.inputs.outcome == 'skipped' || steps.inputs.outputs.schemas == 'true' }}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.scope.outputs.check == 'true'
+      # Caches docs/generators/target; rust-cache keys it on that workspace's Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.check == 'true'
+        with:
+          workspaces: docs/generators -> target
+          key: gen-schemas
+      - name: Regenerate schemas.md and schemas.json
+        if: steps.scope.outputs.check == 'true'
+        # The generators resolve the repository from their working directory.
+        working-directory: docs/generators
+        run: cargo run --locked --quiet --bin gen-schemas
+      - name: Fail on a diff
+        if: steps.scope.outputs.check == 'true'
+        run: |
+          set -- docs/src/reference/schemas.md docs/src/reference/schemas.json
+          # status also catches a schema file the tree deleted and the generator wrote back.
+          if ! git diff --exit-code -- "$@" || [ -n "$(git status --porcelain -- "$@")" ]; then
+            echo "::error::docs/src/reference/schemas.md/json differ from the handler source. Regenerate them with 'cd docs/generators && cargo run --locked --bin gen-schemas' and commit both files."
+            exit 1
+          fi
+          echo "schemas.md and schemas.json match the handler source" >> "$GITHUB_STEP_SUMMARY"
+
   clippy:
     name: Clippy Analysis
     runs-on: ubuntu-latest
@@ -358,7 +410,7 @@ jobs:
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [version-check, format, clippy, build, test]
+    needs: [version-check, format, schema-drift, clippy, build, test]
     if: always()
     steps:
       - name: Generate final summary
@@ -370,6 +422,7 @@ jobs:
 
           version_icon="${{ needs.version-check.result == 'success' && '✅' || '❌' }}"
           format_icon="${{ needs.format.result == 'success' && '✅' || '❌' }}"
+          schema_icon="${{ needs.schema-drift.result == 'success' && '✅' || '❌' }}"
           clippy_icon="${{ needs.clippy.result == 'success' && '✅' || '❌' }}"
           # A skipped build passes only where the policy skips it: a push or PR that is not a release
           # tag. On a tag or a dispatch the build must run, and a skip there is a failure.
@@ -384,6 +437,7 @@ jobs:
 
           echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Schema drift | $schema_icon ${{ needs.schema-drift.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Build | $build_icon $build_result$([[ "$build_icon" == "⏭" ]] && echo ' (release tags and dispatch only)') |" >> $GITHUB_STEP_SUMMARY
           echo "| Tests | $test_icon $test_result |" >> $GITHUB_STEP_SUMMARY
@@ -391,6 +445,7 @@ jobs:
 
           if [[ "${{ needs.version-check.result }}" == "success" && \
                 "${{ needs.format.result }}" == "success" && \
+                "${{ needs.schema-drift.result }}" == "success" && \
                 "${{ needs.clippy.result }}" == "success" && \
                 "$build_ok" == "true" && \
                 "$test_ok" == "true" ]]; then

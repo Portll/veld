@@ -23,6 +23,15 @@ fi
 step "upstream ledger"
 python3 scripts/upstream/ledger.py check
 
+# CI's schema-drift job; it runs that job's check on every tree, not only on a change to its inputs.
+step "schema drift"
+(cd docs/generators && cargo run --locked --quiet --bin gen-schemas)
+if ! git diff --exit-code -- docs/src/reference/schemas.md docs/src/reference/schemas.json ||
+  [ -n "$(git status --porcelain -- docs/src/reference/schemas.md docs/src/reference/schemas.json)" ]; then
+  echo "schemas.md/json differ from the handler source; regenerate with 'cd docs/generators && cargo run --locked --bin gen-schemas' and commit both files" >&2
+  exit 1
+fi
+
 if [ ! -x scripts/test-local.sh ]; then
   echo "scripts/test-local.sh is missing or not executable; it runs the format, clippy, test and bench legs" >&2
   exit 1
