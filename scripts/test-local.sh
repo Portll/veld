@@ -43,6 +43,8 @@ with, so run the touched module's tests and the whole handler suite as separate 
   scripts/test-local.sh --lib write_gate
   scripts/test-local.sh --test handler_tests
   scripts/test-local.sh --no-default-features --features storage-redb --test handler_tests
+A change under src/mcp/ or src/handlers/ also needs the MCP tools' schema-conformance tests:
+  scripts/test-local.sh --lib mcp::schema_conformance
 Tier 2 runs what CI runs: fmt, clippy, then per feature leg nextest (ci profile), the
 doctests and a bench build, skipping the tests listed in scripts/test-local.known-red.
 It routes by the paths changed since origin/main: the rocksdb-only leg's tests only build
