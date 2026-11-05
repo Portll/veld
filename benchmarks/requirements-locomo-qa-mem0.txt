@@ -1,6 +1,6 @@
 # mem0 OSS 2.x for locomo_qa_eval.py --system mem0, in its own venv (~/.venvs/veld-bench-mem0).
 # The base install: mem0 2.x adds BM25 with fastembed and entity boosts with spaCy, neither
 # pulled in here; the results record which were present.
-mem0ai==2.2.1
+mem0ai==2.0.18
 tiktoken==0.14.0
 requests>=2.28.0
