@@ -13,16 +13,16 @@ use std::sync::Arc;
 
 type AppState = Arc<MultiUserMemoryManager>;
 
-fn facts_default_limit() -> usize {
-    50
-}
+/// The `limit` a fact listing or search gets when the request names none.
+const FACTS_DEFAULT_LIMIT: u32 = 50;
 
 /// Request for listing facts
 #[derive(Debug, Deserialize)]
 pub struct FactsListRequest {
     pub user_id: String,
-    #[serde(default = "facts_default_limit")]
-    pub limit: usize,
+    /// Default 50; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Request for searching facts
@@ -30,8 +30,9 @@ pub struct FactsListRequest {
 pub struct FactsSearchRequest {
     pub user_id: String,
     pub query: String,
-    #[serde(default = "facts_default_limit")]
-    pub limit: usize,
+    /// Default 50; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Request for facts by entity
@@ -39,8 +40,9 @@ pub struct FactsSearchRequest {
 pub struct FactsByEntityRequest {
     pub user_id: String,
     pub entity: String,
-    #[serde(default = "facts_default_limit")]
-    pub limit: usize,
+    /// Default 50; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Response containing facts
@@ -64,7 +66,7 @@ pub async fn list_facts(
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
-    let limit = req.limit;
+    let limit = req.limit.unwrap_or(FACTS_DEFAULT_LIMIT) as usize;
 
     let facts = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
@@ -93,7 +95,7 @@ pub async fn search_facts(
 
     let user_id = req.user_id.clone();
     let query = req.query.clone();
-    let limit = req.limit;
+    let limit = req.limit.unwrap_or(FACTS_DEFAULT_LIMIT) as usize;
 
     let facts = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
@@ -122,7 +124,7 @@ pub async fn facts_by_entity(
 
     let user_id = req.user_id.clone();
     let entity = req.entity.clone();
-    let limit = req.limit;
+    let limit = req.limit.unwrap_or(FACTS_DEFAULT_LIMIT) as usize;
 
     let facts = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
@@ -172,8 +174,9 @@ pub struct TemporalFactsRequest {
     pub user_id: String,
     pub entity: Option<String>,
     pub event: Option<String>,
-    #[serde(default = "facts_default_limit")]
-    pub limit: usize,
+    /// Default 50; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// When true, include facts that have been invalidated by contradiction detection.
     /// Default: false (only return currently-valid facts).
     #[serde(default)]
@@ -185,8 +188,9 @@ pub struct TemporalFactsRequest {
 pub struct TemporalFactsSearchRequest {
     pub user_id: String,
     pub query: String,
-    #[serde(default = "facts_default_limit")]
-    pub limit: usize,
+    /// Default 50; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// When true, include facts that have been invalidated by contradiction detection.
     #[serde(default)]
     pub include_expired: bool,
@@ -252,7 +256,7 @@ pub async fn list_temporal_facts(
     let user_id = req.user_id.clone();
     let entity = req.entity.clone();
     let event = req.event.clone();
-    let limit = req.limit;
+    let limit = req.limit.unwrap_or(FACTS_DEFAULT_LIMIT) as usize;
     let include_expired = req.include_expired;
 
     let facts = tokio::task::spawn_blocking(move || {
@@ -312,7 +316,7 @@ pub async fn search_temporal_facts(
 
     let user_id = req.user_id.clone();
     let query = req.query.clone();
-    let limit = req.limit;
+    let limit = req.limit.unwrap_or(FACTS_DEFAULT_LIMIT) as usize;
     let include_expired = req.include_expired;
 
     let facts = tokio::task::spawn_blocking(move || {
@@ -759,9 +763,8 @@ pub async fn facts_preview_purge(
 // FACT NARRATIVES
 // =============================================================================
 
-fn narratives_default_limit() -> usize {
-    20
-}
+/// The `limit` a fact-narratives request gets when it names none.
+const NARRATIVES_DEFAULT_LIMIT: u32 = 20;
 
 /// Request for fact narratives. Limit is clamped to 50 server-side; values
 /// outside `[1, 50]` are coerced into range (no 400 on overshoot — agents that
@@ -769,8 +772,9 @@ fn narratives_default_limit() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct FactNarrativesRequest {
     pub user_id: String,
-    #[serde(default = "narratives_default_limit")]
-    pub limit: usize,
+    /// Default 20; clamped to 1..=50.
+    #[serde(default)]
+    pub limit: Option<u32>,
     #[serde(default)]
     pub entity_filter: Option<String>,
 }
@@ -807,7 +811,7 @@ pub async fn fact_narratives(
 
     let user_id = req.user_id.clone();
     // Clamp to [1, 50]: zero is treated as 1; values above 50 cap at 50.
-    let limit = req.limit.clamp(1, 50);
+    let limit = req.limit.unwrap_or(NARRATIVES_DEFAULT_LIMIT).clamp(1, 50) as usize;
     let entity_filter = req
         .entity_filter
         .as_deref()

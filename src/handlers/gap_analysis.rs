@@ -71,10 +71,12 @@ pub struct GapAnalysisRequest {
     pub min_edge_strength: f32,
     #[serde(default = "default_max_gaps")]
     pub max_gaps_per_type: usize,
+    /// Default 0; gaps skipped before `limit` applies.
     #[serde(default)]
-    pub offset: usize,
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    pub offset: Option<u32>,
+    /// Default 50; 0 is raised to 1, lowered to 500 (`MAX_GAPS_PER_TYPE`).
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// Minimum embedding similarity to flag a U-shape (default 0.3)
     #[serde(default)]
     pub min_embedding_similarity: Option<f32>,
@@ -98,9 +100,8 @@ pub struct GapAnalysisRequest {
     pub max_nodes: Option<usize>,
 }
 
-fn default_limit() -> usize {
-    50
-}
+/// Page size of the gap, persistence and mapper lists when a request names none.
+const DEFAULT_PAGE_LIMIT: u32 = 50;
 
 fn default_min_strength() -> f32 {
     0.2
@@ -266,8 +267,12 @@ pub async fn analyze_gaps(
         MAX_GAPS_PER_TYPE,
         "max_gaps_per_type",
     )?;
-    let offset = req.offset;
-    let limit = validate_range_usize(req.limit.max(1), MAX_GAPS_PER_TYPE, "limit")?;
+    let offset = req.offset.unwrap_or(0) as usize;
+    let limit = validate_range_usize(
+        (req.limit.unwrap_or(DEFAULT_PAGE_LIMIT) as usize).max(1),
+        MAX_GAPS_PER_TYPE,
+        "limit",
+    )?;
     let scope = requested_scope(&req)?;
 
     let key = GapKey {
@@ -362,15 +367,16 @@ pub struct VoronoiAnalysisRequest {
     pub user_id: String,
     #[serde(default = "default_k")]
     pub k: usize,
+    /// Default 0; most-isolated entities skipped before `limit` applies.
     #[serde(default)]
-    pub offset: usize,
-    #[serde(default = "default_voronoi_limit")]
-    pub limit: usize,
+    pub offset: Option<u32>,
+    /// Default 10; 0 is raised to 1.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
-fn default_voronoi_limit() -> usize {
-    10
-}
+/// Page size of the most-isolated list when a Voronoi request names none.
+const DEFAULT_VORONOI_LIMIT: u32 = 10;
 
 fn default_k() -> usize {
     8
@@ -413,8 +419,8 @@ pub async fn voronoi_analysis(
 
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
-    let offset = req.offset;
-    let limit = req.limit.max(1);
+    let offset = req.offset.unwrap_or(0) as usize;
+    let limit = (req.limit.unwrap_or(DEFAULT_VORONOI_LIMIT) as usize).max(1);
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<VoronoiAnalysisResponse, anyhow::Error> {
@@ -481,10 +487,12 @@ pub struct PersistenceRequest {
     pub step_size: f32,
     #[serde(default = "default_min_persistence")]
     pub min_persistence: f32,
+    /// Default 0; persistence pairs skipped before `limit` applies.
     #[serde(default)]
-    pub offset: usize,
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    pub offset: Option<u32>,
+    /// Default 50; 0 is raised to 1.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 fn default_persistence_step() -> f32 {
@@ -552,8 +560,8 @@ pub async fn persistence_analysis(
 
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
-    let offset = req.offset;
-    let limit = req.limit.max(1);
+    let offset = req.offset.unwrap_or(0) as usize;
+    let limit = (req.limit.unwrap_or(DEFAULT_PAGE_LIMIT) as usize).max(1);
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<PersistenceResponse, anyhow::Error> {
@@ -652,10 +660,12 @@ pub struct MapperRequest {
     pub num_intervals: usize,
     #[serde(default = "default_overlap")]
     pub overlap: f32,
+    /// Default 0; mapper nodes skipped before `limit` applies.
     #[serde(default)]
-    pub offset: usize,
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    pub offset: Option<u32>,
+    /// Default 50; 0 is raised to 1.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 fn default_mapper_filter() -> String {
@@ -721,8 +731,8 @@ pub async fn mapper_analysis(
     let user_id = req.user_id.clone();
     let filter_str = req.filter.clone();
     let state_clone = state.clone();
-    let offset = req.offset;
-    let limit = req.limit.max(1);
+    let offset = req.offset.unwrap_or(0) as usize;
+    let limit = (req.limit.unwrap_or(DEFAULT_PAGE_LIMIT) as usize).max(1);
 
     let result = tokio::task::spawn_blocking(move || -> Result<MapperResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;

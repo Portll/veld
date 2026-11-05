@@ -1396,7 +1396,9 @@ pub async fn get_embedding_backlog(
 #[derive(Debug, Deserialize)]
 pub struct DrainEmbeddingBacklogRequest {
     pub user_id: String,
-    pub limit: Option<usize>,
+    /// Default 50; 0 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
     #[serde(default)]
     pub reconcile: bool,
 }
@@ -1415,7 +1417,7 @@ pub async fn drain_embedding_backlog(
     Json(req): Json<DrainEmbeddingBacklogRequest>,
 ) -> Result<Json<DrainBacklogResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    let limit = req.limit.unwrap_or(50);
+    let limit = req.limit.unwrap_or(50) as usize;
     if limit == 0 {
         return Err(AppError::InvalidInput {
             field: "limit".to_string(),

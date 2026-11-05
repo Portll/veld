@@ -104,12 +104,17 @@ pub async fn advanced_search(
 // MULTIMODAL SEARCH
 // =============================================================================
 
+/// Results a multimodal or robotics search returns when it names no `limit`.
+const DEFAULT_SEARCH_LIMIT: u32 = 10;
+
 #[derive(Debug, Deserialize)]
 pub struct MultiModalSearchRequest {
     pub user_id: String,
     pub query_text: String,
     pub mode: String,
-    pub limit: Option<usize>,
+    /// Default 10; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 pub async fn multimodal_search(
@@ -168,7 +173,7 @@ pub async fn multimodal_search(
 
     let query = MemoryQuery {
         query_text: Some(req.query_text.clone()),
-        max_results: req.limit.unwrap_or(10),
+        max_results: req.limit.unwrap_or(DEFAULT_SEARCH_LIMIT) as usize,
         retrieval_mode,
         ..Default::default()
     };
@@ -209,7 +214,9 @@ pub struct RoboticsSearchRequest {
     pub action_type: Option<String>,
     pub min_reward: Option<f32>,
     pub max_reward: Option<f32>,
-    pub limit: Option<usize>,
+    /// Default 10; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 pub async fn robotics_search(
@@ -273,7 +280,7 @@ pub async fn robotics_search(
         geo_filter,
         action_type: req.action_type.clone(),
         reward_range,
-        max_results: req.limit.unwrap_or(10),
+        max_results: req.limit.unwrap_or(DEFAULT_SEARCH_LIMIT) as usize,
         retrieval_mode,
         ..Default::default()
     };

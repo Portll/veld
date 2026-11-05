@@ -460,7 +460,9 @@ pub async fn revoke_session(
 
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
-    pub limit: Option<usize>,
+    /// Default 100; clamped to 1..=1000.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// `GET /api/user_auth/admin/audit?limit=` — newest first, at most 1000.
@@ -472,7 +474,7 @@ pub async fn read_audit(
     let rt = runtime(&state)?;
     require_admin(&caller.0)?;
     rt.store
-        .recent_audit(query.limit.unwrap_or(100).clamp(1, 1000))
+        .recent_audit(query.limit.unwrap_or(100).clamp(1, 1000) as usize)
         .map(Json)
 }
 

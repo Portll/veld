@@ -23,9 +23,8 @@ fn lineage_max_depth_default() -> usize {
     10
 }
 
-fn lineage_list_limit_default() -> usize {
-    50
-}
+/// Edges listed when a request names no `limit`.
+const LINEAGE_LIST_DEFAULT_LIMIT: u32 = 50;
 
 /// Request to trace lineage from a memory
 #[derive(Debug, Deserialize)]
@@ -58,8 +57,9 @@ pub struct LineageAddEdgeRequest {
 #[derive(Debug, Deserialize)]
 pub struct LineageListRequest {
     pub user_id: String,
-    #[serde(default = "lineage_list_limit_default")]
-    pub limit: usize,
+    /// Default 50; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Request to create a branch
@@ -154,7 +154,7 @@ pub async fn lineage_list_edges(
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
-    let limit = req.limit;
+    let limit = req.limit.unwrap_or(LINEAGE_LIST_DEFAULT_LIMIT) as usize;
 
     let edges = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();

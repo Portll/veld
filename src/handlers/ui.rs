@@ -1234,7 +1234,9 @@ pub struct TagsQuery {
     pub user_id: Option<String>,
     #[serde(default)]
     pub include_hidden: bool,
-    pub limit: Option<usize>,
+    /// Default 300; clamped to 1..=5000.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// GET /api/ui/tags — whole-population tag aggregation with plumbing hidden by default.
@@ -1253,7 +1255,7 @@ pub async fn ui_tags(
         .map_err(AppError::Internal)?;
     let params = TagsParams {
         include_hidden: q.include_hidden,
-        limit: q.limit.unwrap_or(300).clamp(1, 5_000),
+        limit: q.limit.unwrap_or(300).clamp(1, 5_000) as usize,
         ..TagsParams::default()
     };
     let rule = PlumbingRule::from_env();
@@ -1291,7 +1293,9 @@ pub async fn ui_tags(
 pub struct RecallLogQuery {
     pub user_id: Option<String>,
     pub since: Option<DateTime<Utc>>,
-    pub limit: Option<usize>,
+    /// Default 200; clamped to 1..=5000.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// GET /api/ui/recall-log — what was asked, misses included.
@@ -1309,7 +1313,7 @@ pub async fn ui_recall_log(
         .await
         .map_err(AppError::Internal)?;
     let since = q.since.unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let limit = q.limit.unwrap_or(200).clamp(1, 5_000);
+    let limit = q.limit.unwrap_or(200).clamp(1, 5_000) as usize;
     let result = tokio::task::spawn_blocking(move || {
         let guard = memory.read();
         let store = guard.recall_event_store();

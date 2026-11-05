@@ -984,7 +984,7 @@ Defined in `src/handlers/user_admin.rs`.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 100; clamped to 1..=1000. |
 
 ### AuthSuccessResponse
 
@@ -2281,7 +2281,7 @@ Defined in `src/handlers/consolidation.rs`.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 is refused. |
 | `reconcile` | `bool` | no | default when absent |
 
 ### DrainReport
@@ -2490,7 +2490,7 @@ Defined in `src/handlers/graph.rs`.
 | `since` | `Option<chrono::DateTime<chrono::Utc>>` | no |  |
 | `until` | `Option<chrono::DateTime<chrono::Utc>>` | no |  |
 | `bucket` | [`Bucket`](#bucket) | no | default when absent |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 is refused. |
 | `shelf` | Option&lt;[`Shelf`](#shelf)&gt; | no | default when absent |
 
 ### EntityLabel
@@ -2871,7 +2871,7 @@ Defined in `src/handlers/facts.rs`. Request for fact narratives. Limit is clampe
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 20; clamped to 1..=50. |
 | `entity_filter` | `Option<String>` | no | default when absent |
 
 ### FactNarrativesResponse
@@ -2930,7 +2930,7 @@ Defined in `src/handlers/facts.rs`. Request for facts by entity
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `entity` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; no clamp. |
 
 ### FactsListRequest
 
@@ -2939,7 +2939,7 @@ Defined in `src/handlers/facts.rs`. Request for listing facts
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; no clamp. |
 
 ### FactsPreviewPurgeBucket
 
@@ -3015,7 +3015,7 @@ Defined in `src/handlers/facts.rs`. Request for searching facts
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `query` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; no clamp. |
 
 ### FeedPage
 
@@ -3359,8 +3359,8 @@ Defined in `src/handlers/gap_analysis.rs`.
 | `user_id` | `String` | yes |  |
 | `min_edge_strength` | `f32` | no | default when absent |
 | `max_gaps_per_type` | `usize` | no | default when absent |
-| `offset` | `usize` | no | default when absent |
-| `limit` | `usize` | no | default when absent |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; gaps skipped before `limit` applies. |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 is raised to 1, lowered to 500 (`MAX_GAPS_PER_TYPE`). |
 | `min_embedding_similarity` | `Option<f32>` | no | default when absent; score; Minimum embedding similarity to flag a U-shape (default 0.3) |
 | `star_min_spokes` | `Option<usize>` | no | default when absent; Minimum spokes for star gap detection (default 3) |
 | `orbit_min_cluster_size` | `Option<usize>` | no | default when absent; Minimum cluster size for orbit detection (default 3) |
@@ -3425,7 +3425,7 @@ Defined in `src/handlers/graph.rs`. Request to get all entities
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 100; no clamp. |
 | `shelf` | Option&lt;[`Shelf`](#shelf)&gt; | no | default when absent; Keep only entities whose lexical shelf matches, applied before `limit`. |
 | `with_sources` | `bool` | no | default when absent; Join each entity's tag-source provenance (one scan of the tag_source store). |
 | `include_embeddings` | `bool` | no | default when absent; `name_embedding` is 768 floats per row; a client that draws names does not need it. |
@@ -4141,7 +4141,7 @@ Defined in `src/handlers/lineage.rs`. Request to list lineage edges
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; no clamp. |
 
 ### LineageRejectResponse
 
@@ -4289,7 +4289,7 @@ Defined in `src/handlers/files.rs`. Request for listing files
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `Option<usize>` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default none (every file in the project); no clamp. |
 
 ### ListMemoriesQuery
 
@@ -4298,8 +4298,8 @@ Defined in `src/handlers/crud.rs`. Query parameters for GET /api/memories
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `Option<usize>` | no |  |
-| `offset` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 100; lowered to 10000 ([`MAX_LIST_LIMIT`]). |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; items skipped before collecting `limit` results. |
 | `type` | `Option<String>` | no |  |
 | `query` | `Option<String>` | no |  |
 | `tags` | `Option<String>` | no | Comma-separated tags; every one must be present on the memory, matched exactly. See [`parse_tag_filter`]. |
@@ -4311,8 +4311,8 @@ Defined in `src/handlers/crud.rs`. Request for POST /api/memories - list memorie
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `Option<usize>` | no | Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`]. |
-| `offset` | `Option<usize>` | no | Items to skip before collecting `limit` results. Defaults to 0. |
+| `limit` | `Option<u32>` | no | default when absent; Default 100; lowered to 10000 ([`MAX_LIST_LIMIT`]). |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; items skipped before collecting `limit` results. |
 | `type` | `Option<String>` | no |  |
 | `query` | `Option<String>` | no |  |
 | `tags` | `Option<String>` | no | Comma-separated tags; every one must be present on the memory, matched exactly. See [`parse_tag_filter`]. |
@@ -4347,8 +4347,8 @@ Defined in `src/handlers/crud.rs`. Query parameters for listing memories
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `limit` | `Option<usize>` | no | Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`]. |
-| `offset` | `Option<usize>` | no | Items to skip before collecting `limit` results. Defaults to 0. Combine with `total` in the response to page past `MAX_LIST_LIMIT`. |
+| `limit` | `Option<u32>` | no | default when absent; Default 100; lowered to 10000 ([`MAX_LIST_LIMIT`]). |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; items skipped before collecting `limit` results. Combine with `total` in the response to page past `MAX_LIST_LIMIT`. |
 | `type` | `Option<String>` | no |  |
 | `query` | `Option<String>` | no | Text search query - filters by content or tags (case-insensitive) |
 | `tags` | `Option<String>` | no | Comma-separated tags; every one must be present on the memory, matched exactly. See [`parse_tag_filter`]. |
@@ -4387,7 +4387,7 @@ Defined in `src/handlers/sessions.rs`. Request for listing sessions
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 10; no clamp. |
 
 ### ListSessionsResponse
 
@@ -4411,8 +4411,8 @@ Defined in `src/handlers/todos.rs`. Request to list todos with filters
 | `context` | `Option<String>` | no | default when absent |
 | `include_completed` | `Option<bool>` | no | default when absent |
 | `due` | `Option<String>` | no | default when absent |
-| `limit` | `Option<usize>` | no | default when absent |
-| `offset` | `Option<usize>` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 100; 50 when query is set. |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; an offset at or past the number of matching todos returns an empty page. |
 | `parent_id` | `Option<String>` | no | default when absent |
 | `query` | `Option<String>` | no | default when absent |
 | `priority` | `Option<String>` | no | default when absent |
@@ -4520,8 +4520,8 @@ Defined in `src/handlers/gap_analysis.rs`.
 | `filter` | `String` | no | default when absent |
 | `num_intervals` | `usize` | no | default when absent |
 | `overlap` | `f32` | no | default when absent |
-| `offset` | `usize` | no | default when absent |
-| `limit` | `usize` | no | default when absent |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; mapper nodes skipped before `limit` applies. |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 is raised to 1. |
 
 ### MapperResponse
 
@@ -5212,7 +5212,7 @@ Defined in `src/handlers/search.rs`.
 | `user_id` | `String` | yes |  |
 | `query_text` | `String` | yes |  |
 | `mode` | `String` | yes |  |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 10; no clamp. |
 
 ### NerEntityRecord
 
@@ -5319,8 +5319,8 @@ Defined in `src/handlers/gap_analysis.rs`.
 | `user_id` | `String` | yes |  |
 | `step_size` | `f32` | no | default when absent |
 | `min_persistence` | `f32` | no | default when absent |
-| `offset` | `usize` | no | default when absent |
-| `limit` | `usize` | no | default when absent |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; persistence pairs skipped before `limit` applies. |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 is raised to 1. |
 
 ### PersistenceResponse
 
@@ -5446,7 +5446,7 @@ Defined in `src/handlers/recall.rs`. Request for proactive context - returns rel
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `context` | `String` | yes |  |
-| `max_results` | `usize` | no | default when absent |
+| `max_results` | `Option<u32>` | no | default when absent; Default 5; 0 or more than 10,000 is refused. |
 | `semantic_threshold` | `f32` | no | default when absent; Minimum semantic similarity threshold (0.0-1.0) |
 | `entity_match_weight` | `f32` | no | default when absent; score; Weight for entity matching in relevance scoring |
 | `recency_weight` | `f32` | no | default when absent; score; Weight for recency boost |
@@ -5812,7 +5812,7 @@ Defined in `src/handlers/datasets.rs`. Parametrised SELECT.
 | `user_id` | `Option<String>` | no |  |
 | `where` | `Option<String>` | no |  |
 | `params` | `Vec<serde_json::Value>` | no | default when absent |
-| `limit` | `Option<u32>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 1000; lowered to 1000 (`MAX_QUERY_LIMIT`). |
 
 ### QueryResponse
 
@@ -5904,7 +5904,7 @@ Defined in `src/handlers/recall.rs`. Recall memories by date range
 | `user_id` | `String` | yes |  |
 | `start` | `chrono::DateTime<chrono::Utc>` | yes | Start of date range (inclusive) - ISO 8601 format |
 | `end` | `chrono::DateTime<chrono::Utc>` | yes | End of date range (inclusive) - ISO 8601 format |
-| `limit` | `Option<usize>` | no | Maximum number of results (default: 50) |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 or more than 10,000 is refused. |
 
 ### RecallByTagsRequest
 
@@ -5914,7 +5914,7 @@ Defined in `src/handlers/recall.rs`. Recall memories by tags
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `tags` | `Vec<String>` | yes | Tags to search for (returns memories matching ANY of these tags) |
-| `limit` | `Option<usize>` | no | Maximum number of results (default: 50) |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 or more than 10,000 is refused. |
 | `include_embeddings` | `bool` | no | default when absent; Both embedding vectors are about 17 KB per memory; a caller that reads text does not need them. |
 | `include_derived` | `bool` | no | default when absent; Also match tags veld derived from the content (NER, keywords, ingest hints). Off by default: a keyword such as `handoff` or `decision` pulled out of the text would otherwise answer for the writer's own tag of the same name. |
 | `include_annotations` | `bool` | no | default when absent; The write-time NER records and co-occurrence pairs the graph was built from: per-token type, span and confidence, about 39 KB per memory on the live store and three quarters of a tag-recall response. Readers of the text do not need them. |
@@ -5989,7 +5989,7 @@ Defined in `src/handlers/ui.rs`.
 |---|---|---|---|
 | `user_id` | `Option<String>` | no |  |
 | `since` | `Option<DateTime<Utc>>` | no |  |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 200; clamped to 1..=5000. |
 
 ### RecallLogReport
 
@@ -6049,7 +6049,7 @@ Defined in `src/handlers/types.rs`. Simplified recall request - just query text
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `query` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 5; 0 or more than 10,000 is refused. |
 | `mode` | `String` | no | default when absent; Retrieval mode: "semantic", "associative", or "hybrid" (default) |
 | `rrf_k` | `Option<f32>` | no | default when absent; RRF k parameter for reciprocal rank fusion (default: 20.0) Higher k = more equal weighting; lower k = sharper top-rank discrimination |
 | `rerank_count` | `Option<usize>` | no | default when absent; Number of top results to rerank with cross-encoder (FIX-11, default: 20) |
@@ -6158,7 +6158,7 @@ Defined in `src/handlers/replication.rs`.
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `after_lsn` | `Option<u64>` | no | default when absent |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 500 (`replication::FEED_LIMIT`); clamped to 1..=5000. |
 
 ### RecoverRequest
 
@@ -6783,7 +6783,7 @@ Defined in `src/handlers/search.rs`.
 | `action_type` | `Option<String>` | no |  |
 | `min_reward` | `Option<f32>` | no |  |
 | `max_reward` | `Option<f32>` | no |  |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 10; no clamp. |
 
 ### Role
 
@@ -6885,7 +6885,7 @@ Defined in `src/handlers/files.rs`. Request to search files
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `query` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 10; no clamp. |
 
 ### SecondaryIndexSummary
 
@@ -7385,7 +7385,7 @@ Defined in `src/handlers/graph.rs`.
 | `user_id` | `String` | yes |  |
 | `min_records` | `Option<usize>` | no |  |
 | `min_tags` | `Option<usize>` | no |  |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; 0 is refused. |
 
 ### StatsQuery
 
@@ -7497,7 +7497,7 @@ Defined in `src/handlers/ui.rs`.
 |---|---|---|---|
 | `user_id` | `Option<String>` | no |  |
 | `include_hidden` | `bool` | no | default when absent |
-| `limit` | `Option<usize>` | no |  |
+| `limit` | `Option<u32>` | no | default when absent; Default 300; clamped to 1..=5000. |
 
 ### TagsReport
 
@@ -7566,7 +7566,7 @@ Defined in `src/handlers/facts.rs`. Request for listing/filtering temporal facts
 | `user_id` | `String` | yes |  |
 | `entity` | `Option<String>` | no |  |
 | `event` | `Option<String>` | no |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; no clamp. |
 | `include_expired` | `bool` | no | default when absent; When true, include facts that have been invalidated by contradiction detection. Default: false (only return currently-valid facts). |
 
 ### TemporalFactsResponse
@@ -7586,7 +7586,7 @@ Defined in `src/handlers/facts.rs`. Request for searching temporal facts
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `query` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 50; no clamp. |
 | `include_expired` | `bool` | no | default when absent; When true, include facts that have been invalidated by contradiction detection. |
 
 ### TierMoveRequest
@@ -7840,7 +7840,7 @@ Defined in `src/handlers/types.rs`. Request for tracked retrieval (returns track
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `query` | `String` | yes |  |
-| `limit` | `usize` | no | default when absent |
+| `limit` | `Option<u32>` | no | default when absent; Default 5; 0 or more than 10,000 is refused. |
 | `mode` | `String` | no | default when absent |
 | `competition_mode` | Option&lt;crate::memory::[`CompetitionMode`](#competitionmode)&gt; | no | default when absent |
 
@@ -8329,8 +8329,8 @@ Defined in `src/handlers/gap_analysis.rs`.
 |---|---|---|---|
 | `user_id` | `String` | yes |  |
 | `k` | `usize` | no | default when absent |
-| `offset` | `usize` | no | default when absent |
-| `limit` | `usize` | no | default when absent |
+| `offset` | `Option<u32>` | no | default when absent; Default 0; most-isolated entities skipped before `limit` applies. |
+| `limit` | `Option<u32>` | no | default when absent; Default 10; 0 is raised to 1. |
 
 ### VoronoiAnalysisResponse
 

@@ -139,7 +139,9 @@ pub struct RecordsQuery {
     pub user_id: String,
     #[serde(default, deserialize_with = "empty_as_none")]
     pub after_lsn: Option<u64>,
-    pub limit: Option<usize>,
+    /// Default 500 (`replication::FEED_LIMIT`); clamped to 1..=5000.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 fn empty_as_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
@@ -173,7 +175,10 @@ pub async fn records(
         ));
     }
     state.note_feed_cursor(&q.user_id, q.after_lsn);
-    let limit = q.limit.unwrap_or(replication::FEED_LIMIT).clamp(1, 5000);
+    let limit = q
+        .limit
+        .map_or(replication::FEED_LIMIT, |n| n as usize)
+        .clamp(1, 5000);
     let after_lsn = q.after_lsn;
     let page = {
         let state = state.clone();

@@ -106,6 +106,8 @@ pub struct QueryRequest {
     pub where_clause: Option<String>,
     #[serde(default)]
     pub params: Vec<serde_json::Value>,
+    /// Default 1000; lowered to 1000 (`MAX_QUERY_LIMIT`).
+    #[serde(default)]
     pub limit: Option<u32>,
 }
 

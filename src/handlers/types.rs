@@ -143,8 +143,9 @@ pub struct RememberResponse {
 pub struct RecallRequest {
     pub user_id: String,
     pub query: String,
-    #[serde(default = "default_recall_limit")]
-    pub limit: usize,
+    /// Default 5; 0 or more than 10,000 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// Retrieval mode: "semantic", "associative", or "hybrid" (default)
     #[serde(default = "default_recall_mode")]
     pub mode: String,
@@ -180,9 +181,8 @@ pub struct RecallRequest {
     pub layers: Option<String>,
 }
 
-pub fn default_recall_limit() -> usize {
-    5
-}
+/// The `limit` a recall or tracked recall gets when the request names none.
+pub const DEFAULT_RECALL_LIMIT: u32 = 5;
 
 pub fn default_recall_mode() -> String {
     "hybrid".to_string()
@@ -535,8 +535,9 @@ pub struct RetrieveResponse {
 pub struct TrackedRetrieveRequest {
     pub user_id: String,
     pub query: String,
-    #[serde(default = "default_recall_limit")]
-    pub limit: usize,
+    /// Default 5; 0 or more than 10,000 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
     #[serde(default = "default_recall_mode")]
     pub mode: String,
     #[serde(default)]
@@ -1067,7 +1068,7 @@ mod tests {
         let req: RecallRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.user_id, "test-user");
         assert_eq!(req.query, "search query");
-        assert_eq!(req.limit, 5); // default
+        assert_eq!(req.limit, None); // the handler resolves it to DEFAULT_RECALL_LIMIT
         assert_eq!(req.mode, "hybrid"); // default
         assert!(req.competition_mode.is_none());
     }
@@ -1082,7 +1083,7 @@ mod tests {
             "competition_mode": "resolve_strongest"
         });
         let req: RecallRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.limit, 10);
+        assert_eq!(req.limit, Some(10));
         assert_eq!(req.mode, "semantic");
         assert_eq!(
             req.competition_mode,

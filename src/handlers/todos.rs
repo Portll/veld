@@ -280,10 +280,12 @@ pub struct ListTodosRequest {
     pub include_completed: Option<bool>,
     #[serde(default)]
     pub due: Option<String>,
+    /// Default 100; 50 when query is set.
     #[serde(default)]
-    pub limit: Option<usize>,
+    pub limit: Option<u32>,
+    /// Default 0; an offset at or past the number of matching todos returns an empty page.
     #[serde(default)]
-    pub offset: Option<usize>,
+    pub offset: Option<u32>,
     #[serde(default)]
     pub parent_id: Option<String>,
     #[serde(default)]
@@ -1430,7 +1432,7 @@ pub async fn list_todos(
                     None
                 };
 
-            let limit = req.limit.unwrap_or(50);
+            let limit = req.limit.unwrap_or(50) as usize;
             state
                 .todo_store
                 .search_todos(&req.user_id, query, query_embedding.as_deref(), limit * 2)
@@ -1550,8 +1552,8 @@ pub async fn list_todos(
 
     // Apply pagination
     let total_count = todos.len();
-    let offset = req.offset.unwrap_or(0);
-    let limit = req.limit.unwrap_or(100);
+    let offset = req.offset.unwrap_or(0) as usize;
+    let limit = req.limit.unwrap_or(100) as usize;
 
     if offset > 0 && offset < todos.len() {
         todos = todos.into_iter().skip(offset).collect();

@@ -18,7 +18,7 @@ use super::todos::ReminderItem;
 use super::types::{
     MemoryEvent, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory, RecallRequest,
     RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
-    TrackedRetrieveResponse,
+    TrackedRetrieveResponse, DEFAULT_RECALL_LIMIT,
 };
 use super::utils::{is_bare_question, is_boilerplate_response, strip_system_noise};
 use crate::errors::{AppError, ValidationErrorExt};
@@ -372,8 +372,9 @@ pub struct ContextSummaryResponse {
 pub struct ProactiveContextRequest {
     pub user_id: String,
     pub context: String,
-    #[serde(default = "default_proactive_max_results")]
-    pub max_results: usize,
+    /// Default 5; 0 or more than 10,000 is refused.
+    #[serde(default)]
+    pub max_results: Option<u32>,
     /// Minimum semantic similarity threshold (0.0-1.0)
     #[serde(default = "default_semantic_threshold")]
     pub semantic_threshold: f32,
@@ -433,9 +434,11 @@ pub struct ProactiveContextRequest {
     pub repo: Option<String>,
 }
 
-fn default_proactive_max_results() -> usize {
-    5
-}
+/// The `max_results` a proactive-context request gets when it names none.
+const DEFAULT_PROACTIVE_MAX_RESULTS: u32 = 5;
+
+/// The `limit` a tag or date recall gets when the request names none.
+const DEFAULT_FILTER_RECALL_LIMIT: u32 = 50;
 
 fn default_semantic_threshold() -> f32 {
     0.05 // Minimum absolute score for quality gate on composite pipeline scores
@@ -598,8 +601,9 @@ pub struct RecallByTagsRequest {
     pub user_id: String,
     /// Tags to search for (returns memories matching ANY of these tags)
     pub tags: Vec<String>,
-    /// Maximum number of results (default: 50)
-    pub limit: Option<usize>,
+    /// Default 50; 0 or more than 10,000 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// Both embedding vectors are about 17 KB per memory; a caller that reads text does not
     /// need them.
     #[serde(default)]
@@ -627,8 +631,9 @@ pub struct RecallByDateRequest {
     pub start: chrono::DateTime<chrono::Utc>,
     /// End of date range (inclusive) - ISO 8601 format
     pub end: chrono::DateTime<chrono::Utc>,
-    /// Maximum number of results (default: 50)
-    pub limit: Option<usize>,
+    /// Default 50; 0 or more than 10,000 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 // =============================================================================
@@ -648,7 +653,8 @@ pub async fn recall(
 ) -> Result<Json<RecallResponse>, AppError> {
     let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    validation::validate_max_results(req.limit).map_validation_err("limit")?;
+    let limit = req.limit.unwrap_or(DEFAULT_RECALL_LIMIT) as usize;
+    validation::validate_max_results(limit).map_validation_err("limit")?;
     let repo_for_recall = req
         .repo
         .as_deref()
@@ -666,7 +672,6 @@ pub async fn recall(
         .await
         .map_err(AppError::Internal)?;
 
-    let limit = req.limit;
     let mode = req.mode.clone();
     let retrieval_mode_for_recall = parse_retrieval_mode(&mode);
     let rrf_k_for_recall = req.rrf_k.map(|k| k.clamp(1.0, 200.0));
@@ -1358,7 +1363,8 @@ pub async fn proactive_context(
     Json(mut req): Json<ProactiveContextRequest>,
 ) -> Result<Json<ProactiveContextResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    validation::validate_max_results(req.max_results).map_validation_err("max_results")?;
+    let max_results = req.max_results.unwrap_or(DEFAULT_PROACTIVE_MAX_RESULTS) as usize;
+    validation::validate_max_results(max_results).map_validation_err("max_results")?;
     validation::validate_weight("semantic_threshold", req.semantic_threshold)
         .map_validation_err("semantic_threshold")?;
     validation::validate_weight("entity_match_weight", req.entity_match_weight)
@@ -1839,7 +1845,6 @@ pub async fn proactive_context(
     // The pipeline already applies: RRF fusion + hebbian + recency + feedback (PIPE-9)
     // No double-scoring needed - just use the scores from recall() directly
     let context_clone = req.context.clone();
-    let max_results = req.max_results;
     let user_id_for_query = req.user_id.clone();
     let entity_names_for_recall = context_entity_names.clone();
     let entity_match_weight = req.entity_match_weight;
@@ -2840,7 +2845,8 @@ pub async fn recall_tracked(
 ) -> Result<Json<TrackedRetrieveResponse>, AppError> {
     let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    validation::validate_max_results(req.limit).map_validation_err("limit")?;
+    let limit = req.limit.unwrap_or(DEFAULT_RECALL_LIMIT) as usize;
+    validation::validate_max_results(limit).map_validation_err("limit")?;
 
     let memory = state
         .get_user_memory_async(&req.user_id)
@@ -2848,7 +2854,6 @@ pub async fn recall_tracked(
         .map_err(AppError::Internal)?;
 
     let query_text = req.query.clone();
-    let limit = req.limit;
     let user_id = req.user_id.clone();
     let retrieval_mode = parse_retrieval_mode(&req.mode);
     let evidence_source = state
@@ -3026,9 +3031,8 @@ pub async fn recall_by_tags(
 ) -> Result<Json<RetrieveResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    if let Some(limit) = req.limit {
-        validation::validate_max_results(limit).map_validation_err("limit")?;
-    }
+    let limit = req.limit.unwrap_or(DEFAULT_FILTER_RECALL_LIMIT) as usize;
+    validation::validate_max_results(limit).map_validation_err("limit")?;
 
     if req.tags.is_empty() {
         return Err(AppError::InvalidInput {
@@ -3043,7 +3047,6 @@ pub async fn recall_by_tags(
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let limit = req.limit.unwrap_or(50);
 
     let raw_memories = if req.include_derived {
         memory_guard.recall_by_tags(&req.tags, limit)
@@ -3109,9 +3112,8 @@ pub async fn recall_by_date(
 ) -> Result<Json<RetrieveResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    if let Some(limit) = req.limit {
-        validation::validate_max_results(limit).map_validation_err("limit")?;
-    }
+    let limit = req.limit.unwrap_or(DEFAULT_FILTER_RECALL_LIMIT) as usize;
+    validation::validate_max_results(limit).map_validation_err("limit")?;
 
     if req.end < req.start {
         return Err(AppError::InvalidInput {
@@ -3126,7 +3128,6 @@ pub async fn recall_by_date(
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let limit = req.limit.unwrap_or(50);
 
     // Use recall_by_date which increments the retrieval counter
     let raw_memories = memory_guard

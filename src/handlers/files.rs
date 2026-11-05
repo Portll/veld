@@ -21,16 +21,16 @@ use std::sync::Arc;
 
 type AppState = Arc<MultiUserMemoryManager>;
 
-fn default_search_limit() -> usize {
-    10
-}
+/// The `limit` a file search gets when the request names none.
+const DEFAULT_SEARCH_LIMIT: u32 = 10;
 
 /// Request for listing files
 #[derive(Debug, Deserialize)]
 pub struct ListFilesRequest {
     pub user_id: String,
+    /// Default none (every file in the project); no clamp.
     #[serde(default)]
-    pub limit: Option<usize>,
+    pub limit: Option<u32>,
 }
 
 /// Request to scan/index a codebase
@@ -47,8 +47,9 @@ pub struct IndexCodebaseRequest {
 pub struct SearchFilesRequest {
     pub user_id: String,
     pub query: String,
-    #[serde(default = "default_search_limit")]
-    pub limit: usize,
+    /// Default 10; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Response for file list operations
@@ -126,7 +127,11 @@ pub async fn list_project_files(
 
     let files = state
         .file_store
-        .list_by_project(&req.user_id, &project.id, req.limit)
+        .list_by_project(
+            &req.user_id,
+            &project.id,
+            req.limit.map(|limit| limit as usize),
+        )
         .map_err(AppError::Internal)?;
 
     let total = files.len();
@@ -412,7 +417,7 @@ pub async fn search_project_files(
                     .any(|k| k.to_lowercase().contains(&query_lower))
                 || f.summary.to_lowercase().contains(&query_lower)
         })
-        .take(req.limit)
+        .take(req.limit.unwrap_or(DEFAULT_SEARCH_LIMIT) as usize)
         .collect();
 
     let total = matching_files.len();

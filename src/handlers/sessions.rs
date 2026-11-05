@@ -20,9 +20,8 @@ use std::sync::Arc;
 
 type AppState = Arc<MultiUserMemoryManager>;
 
-fn default_sessions_limit() -> usize {
-    10
-}
+/// The `limit` a session listing gets when the request names none.
+const DEFAULT_SESSIONS_LIMIT: u32 = 10;
 
 fn default_end_reason() -> String {
     "user_ended".to_string()
@@ -32,8 +31,9 @@ fn default_end_reason() -> String {
 #[derive(Debug, Deserialize)]
 pub struct ListSessionsRequest {
     pub user_id: String,
-    #[serde(default = "default_sessions_limit")]
-    pub limit: usize,
+    /// Default 10; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// Response for listing sessions
@@ -86,9 +86,10 @@ pub async fn list_sessions(
 ) -> Result<Json<ListSessionsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let sessions = state
-        .session_store
-        .get_user_sessions(&req.user_id, req.limit);
+    let sessions = state.session_store.get_user_sessions(
+        &req.user_id,
+        req.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT) as usize,
+    );
     let count = sessions.len();
 
     Ok(Json(ListSessionsResponse {

@@ -69,6 +69,9 @@ fn wants_full_content(params: &HashMap<String, String>) -> bool {
 /// through this API, and the response gave no sign of it.
 const MAX_LIST_LIMIT: usize = 10_000;
 
+/// Items a list request returns when it names no `limit`.
+const DEFAULT_LIST_LIMIT: u32 = 100;
+
 /// Ceiling on the content preview in `ListMemoryItem::content`. `content_truncated` and
 /// `content_length` say when the cut happened, so a caller cannot mistake the preview for the
 /// record (shodh-memory 9233dcd).
@@ -77,11 +80,13 @@ const LIST_CONTENT_PREVIEW_CHARS: usize = 500;
 /// Query parameters for listing memories
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
-    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
-    pub limit: Option<usize>,
-    /// Items to skip before collecting `limit` results. Defaults to 0. Combine with `total`
+    /// Default 100; lowered to 10000 ([`MAX_LIST_LIMIT`]).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Default 0; items skipped before collecting `limit` results. Combine with `total`
     /// in the response to page past `MAX_LIST_LIMIT`.
-    pub offset: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<u32>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     /// Text search query - filters by content or tags (case-insensitive)
@@ -104,10 +109,12 @@ pub struct ListResponse {
 #[derive(Debug, Deserialize)]
 pub struct ListMemoriesRequest {
     pub user_id: String,
-    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
-    pub limit: Option<usize>,
-    /// Items to skip before collecting `limit` results. Defaults to 0.
-    pub offset: Option<usize>,
+    /// Default 100; lowered to 10000 ([`MAX_LIST_LIMIT`]).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Default 0; items skipped before collecting `limit` results.
+    #[serde(default)]
+    pub offset: Option<u32>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
@@ -469,8 +476,8 @@ pub async fn list_memories(
     );
 
     let total = filtered.len();
-    let limit = query.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
-    let offset = query.offset.unwrap_or(0);
+    let limit = (query.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize).min(MAX_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0) as usize;
 
     let memories: Vec<ListMemoryItem> = filtered
         .into_iter()
@@ -496,8 +503,12 @@ pub async fn list_memories_post(
 #[derive(Debug, Deserialize)]
 pub struct ListMemoriesQuery {
     pub user_id: String,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
+    /// Default 100; lowered to 10000 ([`MAX_LIST_LIMIT`]).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Default 0; items skipped before collecting `limit` results.
+    #[serde(default)]
+    pub offset: Option<u32>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
@@ -603,8 +614,8 @@ async fn list_memories_inner(
     );
 
     let total = filtered.len();
-    let limit = req.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
-    let offset = req.offset.unwrap_or(0);
+    let limit = (req.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize).min(MAX_LIST_LIMIT);
+    let offset = req.offset.unwrap_or(0) as usize;
 
     let memories: Vec<ListMemoryItem> = filtered
         .into_iter()

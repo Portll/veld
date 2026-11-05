@@ -155,7 +155,9 @@ pub async fn get_episode(
 #[derive(Debug, Deserialize)]
 pub struct GetAllEntitiesRequest {
     pub user_id: String,
-    pub limit: Option<usize>,
+    /// Default 100; no clamp.
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// Keep only entities whose lexical shelf matches, applied before `limit`.
     #[serde(default)]
     pub shelf: Option<Shelf>,
@@ -250,7 +252,7 @@ pub async fn get_all_entities(
     };
 
     let total = entities.len();
-    let limit = req.limit.unwrap_or(100);
+    let limit = req.limit.unwrap_or(100) as usize;
     let mut rows = Vec::new();
     let mut shelf_counts: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
@@ -301,7 +303,9 @@ pub struct EntityFrequencyRequest {
     pub until: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub bucket: Bucket,
-    pub limit: Option<usize>,
+    /// Default 50; 0 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
     #[serde(default)]
     pub shelf: Option<Shelf>,
 }
@@ -323,7 +327,7 @@ pub async fn get_entity_frequency(
             reason: "since must be before until".to_string(),
         });
     }
-    let limit = req.limit.unwrap_or(50);
+    let limit = req.limit.unwrap_or(50) as usize;
     if limit == 0 {
         return Err(AppError::InvalidInput {
             field: "limit".to_string(),
@@ -851,7 +855,9 @@ pub struct StampedCoresRequest {
     pub user_id: String,
     pub min_records: Option<usize>,
     pub min_tags: Option<usize>,
-    pub limit: Option<usize>,
+    /// Default 50; 0 is refused.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// POST /api/graph/tags/stamped-cores - Tags that sit on exactly the same records.
@@ -868,7 +874,7 @@ pub async fn get_stamped_cores(
     let thresholds = CoreThresholds {
         min_records: req.min_records.unwrap_or(defaults.min_records),
         min_tags: req.min_tags.unwrap_or(defaults.min_tags),
-        limit: req.limit.unwrap_or(defaults.limit),
+        limit: req.limit.map_or(defaults.limit, |limit| limit as usize),
     };
     for (field, value) in [
         ("min_records", thresholds.min_records),
