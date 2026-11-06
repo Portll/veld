@@ -811,10 +811,9 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
-            let name = file.name();
 
             // Look for the DLL file
-            if name.ends_with("onnxruntime.dll") {
+            if file.name()?.ends_with("onnxruntime.dll") {
                 let dest_path = dest_dir.join("onnxruntime.dll");
                 let mut outfile = fs::File::create(&dest_path)?;
                 std::io::copy(&mut file, &mut outfile)?;
