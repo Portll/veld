@@ -7,7 +7,7 @@
     "dev": "bun --watch run src/index.ts"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
+    "node-telegram-bot-api": "^2.1.0",
     "screenshot-desktop": "^1.15.0",
     "systeminformation": "^5.23.5",
     "open": "^11.0.4"
