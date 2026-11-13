@@ -118,6 +118,25 @@ pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(chrono::Utc::now)
 }
 
+/// Width of the TCM drift space every `WhenFacet.context_drift` snapshot lives in.
+pub(crate) const TCM_DIMS: usize = 16;
+
+/// An embedding folded into the TCM drift space by summing coordinates into `TCM_DIMS`
+/// buckets, L2-normalised. Writes drift with it and recall cues with it, so the two compare.
+pub(crate) fn tcm_projection(emb: &[f32]) -> Vec<f32> {
+    let mut proj = vec![0.0f32; TCM_DIMS];
+    for (i, &v) in emb.iter().enumerate() {
+        proj[i % TCM_DIMS] += v;
+    }
+    let norm = proj.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-6 {
+        for x in proj.iter_mut() {
+            *x /= norm;
+        }
+    }
+    proj
+}
+
 /// `VELD_RECALL_READONLY=1` — recall performs NO usage writes: no access-count persistence,
 /// no co-retrieval edge reinforcement, no interference accumulation, no retrieval-counter
 /// bump. Set by the eval harness (`recall_harness::runner` pins it at startup): eval repeats
@@ -500,7 +519,7 @@ pub struct MemorySystem {
     /// slowly-drifting subjective-context vector, updated ENCODE-side only
     /// (never at retrieval, so it cannot self-confirm toward what gets
     /// retrieved). Snapshotted onto each memory's `WhenFacet.context_drift` at
-    /// encode; retrieval scores graded contiguity = cosine(current drift,
+    /// encode; retrieval scores graded contiguity = cosine(query projection,
     /// snapshot), replacing brittle `episode_id` equality.
     tcm_context: Arc<parking_lot::RwLock<Vec<f32>>>,
 
@@ -2240,7 +2259,10 @@ impl MemorySystem {
         // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
         // Based on TEMPR approach (Hindsight paper achieving 89.6% on LoCoMo)
         if experience.temporal_refs.is_empty() {
-            let temporal = crate::memory::query_parser::extract_temporal_refs(&experience.content);
+            let temporal = crate::memory::query_parser::extract_temporal_refs_at(
+                &experience.content,
+                created_at.unwrap_or_else(chrono::Utc::now),
+            );
             for temp_ref in temporal.refs {
                 experience.temporal_refs.push(temp_ref.date.to_string());
             }
@@ -2248,7 +2270,7 @@ impl MemorySystem {
 
         // Create memory entry (zero-copy with Arc)
         // CRITICAL: Move experience instead of clone to avoid 2-10KB allocation
-        let memory = Arc::new(match external_id {
+        let mut memory = match external_id {
             Some(eid) => Memory::new_with_external_id(
                 memory_id.clone(),
                 experience,
@@ -2268,7 +2290,9 @@ impl MemorySystem {
                 None, // actor_id
                 created_at,
             ),
-        });
+        };
+        self.snapshot_inline_context_drift(&mut memory, defer_embedding);
+        let memory = Arc::new(memory);
 
         // FIX-R2: Compute elaboration score at encoding time.
         // Measures how contextualized this memory is (S-rep=0.0 vs C-rep=1.0).
@@ -2659,6 +2683,17 @@ impl MemorySystem {
         ))
     }
 
+    /// A write that embeds inline is an encode too; without this only the deferred path's
+    /// memories carried a drift snapshot, and `episode_tcm` read nothing on a sync-written store.
+    fn snapshot_inline_context_drift(&self, memory: &mut Memory, defer_embedding: bool) {
+        if defer_embedding {
+            return;
+        }
+        if let Some(embedding) = memory.experience.embeddings.as_deref() {
+            memory.when.context_drift = self.update_tcm_context(embedding);
+        }
+    }
+
     /// Update the per-user TCM drift state (E6) from a memory's embedding and
     /// return the current snapshot. ENCODE-DRIVEN ONLY — never called from the
     /// retrieval path, so the drifting context cannot self-confirm toward what
@@ -2666,24 +2701,14 @@ impl MemorySystem {
     /// `D` dims; the state is an exponential drift (`RHO`) of those projections,
     /// L2-normalized so retrieval can read graded contiguity as a cosine.
     fn update_tcm_context(&self, emb: &[f32]) -> Vec<f32> {
-        const D: usize = 16;
         const RHO: f32 = 0.9;
-        let mut proj = vec![0.0f32; D];
-        for (i, &v) in emb.iter().enumerate() {
-            proj[i % D] += v;
-        }
-        let pn = proj.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if pn > 1e-6 {
-            for x in proj.iter_mut() {
-                *x /= pn;
-            }
-        }
+        let proj = tcm_projection(emb);
         let mut c = self.tcm_context.write();
-        if c.len() != D {
+        if c.len() != TCM_DIMS {
             // First encode (or a dimension change): seed the drift state.
             *c = proj;
         } else {
-            for k in 0..D {
+            for k in 0..TCM_DIMS {
                 c[k] = RHO * c[k] + (1.0 - RHO) * proj[k];
             }
             let cn = c.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -3460,14 +3485,17 @@ impl MemorySystem {
 
         // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
         if experience.temporal_refs.is_empty() {
-            let temporal = crate::memory::query_parser::extract_temporal_refs(&experience.content);
+            let temporal = crate::memory::query_parser::extract_temporal_refs_at(
+                &experience.content,
+                created_at.unwrap_or_else(chrono::Utc::now),
+            );
             for temp_ref in temporal.refs {
                 experience.temporal_refs.push(temp_ref.date.to_string());
             }
         }
 
         // Create memory with agent context
-        let memory = Arc::new(match external_id {
+        let mut memory = match external_id {
             Some(eid) => Memory::new_with_external_id(
                 memory_id.clone(),
                 experience,
@@ -3487,7 +3515,9 @@ impl MemorySystem {
                 None, // actor_id
                 created_at,
             ),
-        });
+        };
+        self.snapshot_inline_context_drift(&mut memory, defer_embedding);
+        let memory = Arc::new(memory);
 
         // FIX-R2: Compute elaboration score at encoding time
         memory.set_elaboration_score(Self::compute_elaboration_score(&memory));
@@ -7658,8 +7688,10 @@ impl MemorySystem {
             }
 
             // TEMPORAL EXTRACTION: Re-extract dates when content changes
-            let temporal =
-                crate::memory::query_parser::extract_temporal_refs(&existing.experience.content);
+            let temporal = crate::memory::query_parser::extract_temporal_refs_at(
+                &existing.experience.content,
+                existing.created_at,
+            );
             existing.experience.temporal_refs.clear();
             for temp_ref in temporal.refs {
                 existing
@@ -7718,8 +7750,10 @@ impl MemorySystem {
 
             // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
             if experience.temporal_refs.is_empty() {
-                let temporal =
-                    crate::memory::query_parser::extract_temporal_refs(&experience.content);
+                let temporal = crate::memory::query_parser::extract_temporal_refs_at(
+                    &experience.content,
+                    provenance.created_at.unwrap_or_else(chrono::Utc::now),
+                );
                 for temp_ref in temporal.refs {
                     experience.temporal_refs.push(temp_ref.date.to_string());
                 }
@@ -12537,3 +12571,58 @@ mod space_registry_tests {
 mod gap_scale_bench;
 #[cfg(test)]
 mod gap_scale_tests;
+
+#[cfg(test)]
+mod temporal_ref_anchor_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn a_backdated_memory_resolves_relative_dates_against_its_own_timestamp() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        let written = chrono::DateTime::parse_from_rfc3339("2023-05-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let exp = Experience {
+            content: "I went to the support group yesterday".to_string(),
+            ..Default::default()
+        };
+        let id = sys.remember(exp, Some(written)).expect("remember");
+        let memory = sys.get_memory(&id).expect("stored memory");
+        assert_eq!(
+            memory.experience.temporal_refs,
+            vec!["2023-05-07".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod tcm_snapshot_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn a_sync_write_snapshots_the_drift_it_was_encoded_in() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        let mut embedding = vec![0.0f32; 384];
+        embedding[3] = 1.0;
+        let exp = Experience {
+            content: "The support group met on Tuesday".to_string(),
+            embeddings: Some(embedding.clone()),
+            ..Default::default()
+        };
+        let id = sys.remember(exp, None).expect("remember");
+        let memory = sys.get_memory(&id).expect("stored memory");
+        assert_eq!(memory.when.context_drift, tcm_projection(&embedding));
+    }
+}

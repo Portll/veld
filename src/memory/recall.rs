@@ -2441,12 +2441,15 @@ impl super::MemorySystem {
             if early_dials_snapshot.signal_enabled("bm25_specificity_discount") {
                 let mut discounted = 0usize;
                 let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                let pool_best_bm25 = ids
+                    .iter()
+                    .filter_map(|id| attr.get(id).map(|a| a.bm25_contribution))
+                    .fold(0.0_f32, f32::max);
                 for id in &ids {
                     let a = attr.get(id);
                     let has_entity_overlap = a.map(|a| a.entity_overlap).unwrap_or(false);
                     let bm25 = a.map(|a| a.bm25_contribution).unwrap_or(0.0);
-                    // Very high BM25 (>0.5) but no entity overlap = peripheral mention
-                    if bm25 > 0.5 && !has_entity_overlap {
+                    if peripheral_bm25(bm25, pool_best_bm25) && !has_entity_overlap {
                         if let Some(score) = fused.get_mut(id) {
                             *score *= 0.95; // 5% discount
                             discounted += 1;
@@ -3043,6 +3046,10 @@ impl super::MemorySystem {
         let dials_snapshot = self.cognitive_dials.read().clone();
         let hebbian_family_on = super::ablation::is_enabled("hebbian");
         let graph_strength_on = super::ablation::is_enabled("graph_strength");
+        // The live drift state tracks the latest writes, not the query, so cueing with it
+        // boosted whatever was written last for every query alike.
+        let tcm_cue =
+            (!query_embedding.is_empty()).then(|| super::tcm_projection(&query_embedding));
 
         // R2 (LTR) SHADOW CAPTURE side-map. The `with_unified_score` closure
         // (re-bound each loop iteration) borrows this by reference and inserts one
@@ -3261,19 +3268,15 @@ impl super::MemorySystem {
                     0.0
                 };
 
-                // Signal 9: graded temporal-context contiguity (E6 TCM). When the
-                // memory carries a context_drift snapshot and a live drift state
-                // exists, boost by cosine proximity between the current subjective
-                // context and the memory's encoding context — graded contiguity
-                // replacing brittle episode_id equality. Falls back to binary
-                // episode_id coherence for memories without a snapshot (pre-E6 or
-                // sync-path) or before any encode has seeded the drift state.
+                // Signal 9: graded temporal-context contiguity (E6 TCM). A memory whose
+                // encoding context (its drift snapshot) resembles the query is boosted, so a
+                // turn that followed query-relevant turns rises with them. Falls back to
+                // episode_id equality for a memory without a snapshot (pre-E6).
                 // [signal: episode_tcm] Gated by disabled_signals dial; default = always on.
                 let episode_boost = if dials_snapshot.signal_enabled("episode_tcm") {
-                    let cur = self.tcm_context.read();
                     let md = &mem.when.context_drift;
-                    if !cur.is_empty() && md.len() == cur.len() {
-                        let dot: f32 = cur.iter().zip(md.iter()).map(|(a, b)| a * b).sum();
+                    if let Some(cue) = tcm_cue.as_ref().filter(|cue| cue.len() == md.len()) {
+                        let dot: f32 = cue.iter().zip(md.iter()).map(|(a, b)| a * b).sum();
                         dot.max(0.0) * 0.08
                     } else {
                         mem.experience
@@ -3357,7 +3360,7 @@ impl super::MemorySystem {
                 // Signal 18: Temporal fact density — more temporal refs = more anchored
                 // [signal: temporal_fact_density] Gated by disabled_signals dial; default = always on.
                 let temporal_density = if dials_snapshot.signal_enabled("temporal_fact_density") {
-                    (mem.experience.temporal_refs.len() as f32 / 5.0).min(1.0) * 0.02
+                    temporal_density_share(mem.experience.temporal_refs.len(), temporal_gate)
                 } else {
                     0.0
                 };
@@ -6055,6 +6058,22 @@ impl super::MemorySystem {
     }
 }
 
+/// Dates make a memory relevant to a question about time, not to every question; ungated,
+/// this ranked dated turns above undated ones for every query alike.
+fn temporal_density_share(temporal_refs: usize, temporal_query: bool) -> f32 {
+    if !temporal_query {
+        return 0.0;
+    }
+    (temporal_refs as f32 / 5.0).min(1.0) * 0.02
+}
+
+/// Layer 4.527 discounts a lexical match only when it is among the pool's strongest. BM25 is
+/// unnormalised (a hit usually scores well above 1), so a fixed 0.5 bar reached every lexical
+/// hit that named no entity.
+fn peripheral_bm25(bm25: f32, pool_best: f32) -> bool {
+    pool_best > 0.0 && bm25 / pool_best > 0.5
+}
+
 /// Person-name evidence in a memory for Layer 5.37, in `[0, 1]`: half the share of its
 /// extracted entities that are people, half the number of distinct people capped at four.
 /// Uses the rule-based extractor the write path falls back to when neural NER is off, which
@@ -8176,5 +8195,30 @@ mod recursive_graph_read_tests {
             "recall blocked behind a writer queued on the outer guard"
         );
         assert!(outcome.unwrap().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod temporal_density_tests {
+    use super::temporal_density_share;
+
+    #[test]
+    fn dates_earn_a_share_only_on_a_temporal_query() {
+        assert_eq!(temporal_density_share(3, false), 0.0);
+        assert!((temporal_density_share(3, true) - 0.012).abs() < 1e-6);
+        assert!((temporal_density_share(9, true) - 0.02).abs() < 1e-6);
+        assert_eq!(temporal_density_share(0, true), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod peripheral_bm25_tests {
+    use super::peripheral_bm25;
+
+    #[test]
+    fn only_the_pools_strongest_lexical_matches_are_peripheral() {
+        assert!(!peripheral_bm25(3.0, 12.0));
+        assert!(peripheral_bm25(9.0, 12.0));
+        assert!(!peripheral_bm25(0.0, 0.0));
     }
 }

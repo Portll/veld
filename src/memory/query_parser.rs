@@ -298,7 +298,13 @@ const RELATIVE_PHRASES: &[&str] = &[
 /// - Day of week: "on Monday", "last Tuesday"
 /// - Month/year: "in May", "last year", "2023"
 pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
-    let now = Utc::now();
+    extract_temporal_refs_at(text, crate::memory::scoring_now())
+}
+
+/// [`extract_temporal_refs`] with relative phrases resolved against `now`. A write passes the
+/// memory's own timestamp: a backdated memory's "yesterday" is the day before it was written,
+/// not the day before it was imported.
+pub fn extract_temporal_refs_at(text: &str, now: DateTime<Utc>) -> TemporalExtraction {
     let mut refs = Vec::new();
     let mut earliest: Option<NaiveDate> = None;
     let mut latest: Option<NaiveDate> = None;
@@ -6229,6 +6235,16 @@ mod tests {
             !extraction.bounds().is_empty(),
             "Expected bounds for 'yesterday' after B1 pass added"
         );
+    }
+
+    #[test]
+    fn relative_phrases_resolve_against_the_given_anchor() {
+        let written = chrono::DateTime::parse_from_rfc3339("2023-05-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let extraction = extract_temporal_refs_at("I went to the support group yesterday", written);
+        let dates: Vec<NaiveDate> = extraction.refs.iter().map(|r| r.date).collect();
+        assert_eq!(dates, vec![NaiveDate::from_ymd_opt(2023, 5, 7).unwrap()]);
     }
 
     // -------------------------------------------------------------------------
