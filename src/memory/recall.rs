@@ -2465,46 +2465,6 @@ impl super::MemorySystem {
             }
 
             // ===========================================================================
-            // LAYER 4.53: SPECIFICITY PENALTY
-            // ===========================================================================
-            // Retrospective/summary memories mention many topics and score well on
-            // BM25 for ANY query. Penalize memories whose content is much longer than
-            // the mean — they're likely summaries, not primary sources.
-            // This is the key signal that differentiates "we decided to use Rust"
-            // (specific, focused) from "things that didn't go well: Rust, MongoDB..."
-            // (broad retrospective).
-            // [signal: length_penalty] Gated by disabled_signals dial; default = always on.
-            if early_dials_snapshot.signal_enabled("length_penalty") {
-                let mut lengths: Vec<(MemoryId, usize)> = Vec::new();
-                for id in fused.keys() {
-                    if let Some(view) = candidates.get(id) {
-                        lengths.push((id.clone(), view.memory.experience.content.len()));
-                    }
-                }
-                if lengths.len() >= 5 {
-                    // Summed as integers: an f32 sum would depend on the map's iteration order.
-                    let total_len: usize = lengths.iter().map(|(_, l)| *l).sum();
-                    let mean_len: f32 = total_len as f32 / lengths.len() as f32;
-                    for (id, len) in &lengths {
-                        let ratio = *len as f32 / mean_len.max(1.0);
-                        // Memories 50%+ longer than mean get penalized (0.85-0.70x)
-                        // Memories shorter than mean get boosted (up to 1.15x)
-                        if ratio > 1.5 {
-                            let penalty = 1.0 - (ratio - 1.5).min(1.0) * 0.30;
-                            if let Some(score) = fused.get_mut(id) {
-                                *score *= penalty.max(0.70);
-                            }
-                        } else if ratio < 0.8 {
-                            // Shorter, focused memories get a small boost
-                            if let Some(score) = fused.get_mut(id) {
-                                *score *= 1.0 + (0.8 - ratio) * 0.20;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ===========================================================================
             // LAYER 4.535: LIGHT POLLUTION FILTER (Entity Concentration Ratio)
             // ===========================================================================
             // Light pollution: broad overview memories mention many topics and
@@ -7495,8 +7455,8 @@ mod vector_rung_tests {
 
     /// LoCoMo conv-26 shape: the turn the question asks about is the oldest and the longest,
     /// and the turns nearer in time share the question's words and speaker. Every fusion
-    /// stage after the vector leg (temporal facts, entity overlap, the length penalty,
-    /// temporal topic dedup) prefers those; the vector rung must not run any of them.
+    /// stage after the vector leg (temporal facts, entity overlap, temporal
+    /// topic dedup) prefers those; the vector rung must not run any of them.
     #[test]
     fn the_vector_rung_returns_the_stored_vectors_in_cosine_order() {
         let (sys, _tmp) = fresh_system();

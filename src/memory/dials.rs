@@ -320,7 +320,7 @@ pub struct CognitiveDials {
     /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
     /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
     /// `valence_credibility`, `session_continuity`, `hebbian`, `query_coverage`,
-    /// `people_density`, `prf`, `entity_overlap`, `length_penalty`,
+    /// `people_density`, `prf`, `entity_overlap`,
     /// `temporal_topic_dedup`, `temporal_fact_boost`, `temporal_fact_untimed_fallback`.
     #[serde(default)]
     pub disabled_signals: HashSet<String>,
@@ -1119,7 +1119,6 @@ mod tests {
             "prf",
             "duplicate_derank",
             "entity_overlap",
-            "length_penalty",
             "temporal_topic_dedup",
             "temporal_fact_boost",
             "temporal_fact_untimed_fallback",
