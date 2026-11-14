@@ -174,3 +174,11 @@ conv-50_q155
 conv-26_q0
 conv-26_q25
 conv-26_q98
+#
+# 2026-11-14, commitwork-8f: per-case rows printed while analysing the leave-one-out signal sweep
+# for the length_penalty removal (1ceb1e67).
+conv-26_q1
+conv-26_q2
+conv-26_q3
+conv-26_q4
+conv-26_q5
