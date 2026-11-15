@@ -104,7 +104,7 @@ pub struct RunInputs {
 /// belong to the corpus (e.g. system-injected memories) are emitted as
 /// `"<unknown:...>"` sentinels so divergence in those slots is still
 /// observable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CaseRankList {
     pub case_id: String,
     pub retrieved: Vec<String>,

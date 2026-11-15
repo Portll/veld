@@ -156,6 +156,12 @@ struct Args {
     #[arg(long)]
     per_case_output: Option<PathBuf>,
 
+    /// Optional path to write each case's ranked corpus ids (JSON array) for
+    /// the highest layer of repeat 0, gold or not. Diagnostic side output, so
+    /// a case that loses p@1 shows what took rank 1.
+    #[arg(long)]
+    ranks_output: Option<PathBuf>,
+
     /// Allowed regression in percent of baseline. Default: 2.0%.
     #[arg(long, default_value_t = 2.0)]
     tolerance: f64,
@@ -787,9 +793,19 @@ fn run(args: &Args) -> Result<i32> {
 
     let ReportWithRanks {
         mut report,
+        ranks,
         per_case_by_layer,
-        ..
     } = run_smoke_suite_with_ranks(&inputs).context("running smoke suite")?;
+
+    if let Some(ranks_path) = &args.ranks_output {
+        let json = serde_json::to_vec_pretty(&ranks).context("serialising rank lists to JSON")?;
+        std::fs::write(ranks_path, &json)
+            .with_context(|| format!("writing rank lists to {}", ranks_path.display()))?;
+        eprintln!(
+            "recall-eval: rank lists written to {}",
+            ranks_path.display()
+        );
+    }
 
     // Per-case diagnostics are written before the baseline comparison so they
     // are always captured, even on a regressing run that exits non-zero. The

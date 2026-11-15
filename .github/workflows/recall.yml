@@ -289,6 +289,11 @@ jobs:
           if [ "$RECORD" != "true" ] && [ "$SUITE" = "locomo-gate" ]; then
             gate_args=(--baseline tests/recall/locomo-gate-baseline.json --tolerance "$TOLERANCE")
           fi
+          # Hold-out rank lists would expose which hold-out turns rank first, so only the gate suite writes them.
+          rank_args=()
+          if [ "$SUITE" = "locomo-gate" ]; then
+            rank_args=(--ranks-output "ranks-${{ matrix.engine }}.json")
+          fi
           ./target/release/recall-eval \
             --suite "$SUITE" \
             --layer "$LAYER" \
@@ -296,6 +301,7 @@ jobs:
             --output "current-${{ matrix.engine }}.json" \
             --per-case-output "per-case-${{ matrix.engine }}.json" \
             "${gate_args[@]}" \
+            "${rank_args[@]}" \
             --storage ./recall-storage 2>&1 | tee "recall-eval-${{ matrix.engine }}.log"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
@@ -322,6 +328,7 @@ jobs:
           path: |
             current-${{ matrix.engine }}.json
             per-case-${{ matrix.engine }}.json
+            ranks-${{ matrix.engine }}.json
             recall-eval-${{ matrix.engine }}.log
             recall-diff-${{ matrix.engine }}.md
           if-no-files-found: warn
