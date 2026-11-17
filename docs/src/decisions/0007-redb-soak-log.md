@@ -1,3 +1,10 @@
+---
+title: redb live soak log
+status: living
+date: 2026-10-21
+evidence-for: 0007
+---
+
 # 0007 — redb live soak log
 
 Evidence for the last open gate in [ADR 0007](0007-rocksdb-default-engine.md): fourteen days of

@@ -8,8 +8,12 @@ date: 2026-05-28
 
 Each decision below is a single, dated record explaining *why* a particular
 architectural choice was made. The format follows the spirit of Michael Nygard's
-ADRs: context, decision, consequences. We add status (`accepted`, `superseded`,
-`deferred`) and a chronological ID.
+ADRs: context, decision, consequences. We add status (`proposed`, `accepted`,
+`superseded`, `deferred`, `draft`) and a chronological ID.
+
+A page that gathers evidence for a decision, such as the
+[redb live soak log](0007-redb-soak-log.md) for 0007, carries `evidence-for: NNNN`
+in its frontmatter instead of an `id`, and takes no place in the ID sequence.
 
 If you supersede a decision, do not delete the old record — write a new ADR
 pointing back at it with `supersedes:` in the frontmatter and add
