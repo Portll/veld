@@ -596,7 +596,14 @@ pub struct ReinforceFeedbackResponse {
 pub struct RecallByTagsRequest {
     pub user_id: String,
     /// Tags to search for (returns memories matching ANY of these tags)
+    #[serde(default)]
     pub tags: Vec<String>,
+    /// Tags a memory must carry every one of, on top of matching `tags`; with `tags` empty a
+    /// memory matches on these alone. Applied before `limit`, so `kind:decision` with
+    /// `project:veld` returns the newest decisions in that project, not the newest decisions
+    /// of any project with the rest filtered out afterwards.
+    #[serde(default)]
+    pub all_tags: Vec<String>,
     /// Maximum number of results (default: 50)
     pub limit: Option<usize>,
     /// Both embedding vectors are about 17 KB per memory; a caller that reads text does not
@@ -654,6 +661,14 @@ pub async fn recall(
         .map(validation::validate_repo)
         .transpose()
         .map_validation_err("repo")?;
+    if let Some(floor) = req.min_score {
+        if !(0.0..=1.0).contains(&floor) {
+            return Err(AppError::InvalidInput {
+                field: "min_score".to_string(),
+                reason: format!("min_score must be within 0..=1, got {floor}"),
+            });
+        }
+    }
 
     let memory = state
         .get_user_memory_async(&req.user_id)
@@ -706,7 +721,9 @@ pub async fn recall(
 
             // 2. Semantic prospective matching (fixes C5: was keyword-only)
             // Skip semantic matching if embedding failed — keyword matching still works
-            let matched_tasks = if let Some(ref query_embedding) = query_embedding_opt {
+            let matched_tasks = if req.fast {
+                Vec::new()
+            } else if let Some(ref query_embedding) = query_embedding_opt {
                 let embed_fn =
                     |text: &str| -> Option<Vec<f32>> { memory_guard.compute_embedding(text).ok() };
                 prospective_for_recall
@@ -780,6 +797,7 @@ pub async fn recall(
                 layers: layers_for_recall,
                 evidence_source: Some(evidence_source),
                 query_embedding: recall_embedding_opt,
+                fast: req.fast,
                 ..Default::default()
             };
 
@@ -808,15 +826,18 @@ pub async fn recall(
     // Convert to response format
     let total = memories.len();
     let top_score = memories.first().and_then(|m| m.score);
-    let recall_memories: Vec<RecallMemory> = memories
+    let mut recall_memories: Vec<RecallMemory> = memories
         .iter()
         .enumerate()
         .map(|(rank, m)| recall_memory_view(m, rank, total, top_score))
         .collect();
+    if let Some(floor) = req.min_score {
+        recall_memories.retain(|m| m.score >= floor);
+    }
 
     // Search todos semantically using the embedding already computed for recall
     let todos: Vec<RecallTodo> = {
-        if let Some(emb) = query_embedding_opt {
+        if let Some(emb) = query_embedding_opt.filter(|_| !req.fast) {
             state
                 .todo_store
                 .search_similar(&req.user_id, &emb, 5)
@@ -860,7 +881,9 @@ pub async fn recall(
     };
 
     // Fetch related semantic facts from entities mentioned in recalled memories
-    let facts: Vec<RecallFact> = {
+    let facts: Vec<RecallFact> = if req.fast {
+        Vec::new()
+    } else {
         // Collect all unique entities from recalled memories
         let mut all_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
         for mem in &recall_memories {
@@ -938,7 +961,7 @@ pub async fn recall(
     let lineage: Vec<RecallLineageEdge> = {
         let recalled_ids: std::collections::HashSet<String> =
             recall_memories.iter().map(|m| m.id.clone()).collect();
-        if recalled_ids.len() >= 2 {
+        if !req.fast && recalled_ids.len() >= 2 {
             let memory = memory.clone();
             let user_id = req.user_id.clone();
             let ids = recalled_ids.clone();
@@ -1157,7 +1180,7 @@ pub async fn recall(
     let meta_opt = memory.read().last_query_metacognition();
     // Outside the closure below, so a slow store not yet open is opened on the blocking pool.
     let gap_store = match &meta_opt {
-        Some(meta) if !meta.focal_entities.is_empty() => {
+        Some(meta) if !req.fast && !meta.focal_entities.is_empty() => {
             state.get_user_slow_store_async(&req.user_id).await.ok()
         }
         _ => None,
@@ -1223,7 +1246,9 @@ pub async fn recall(
     // B4: temporal answer-derivation. Additive — memories/count are already
     // final. Runs in spawn_blocking because derive_answer_for_user_query acquires
     // a read lock on the memory substrate.
-    let derived_answer = {
+    let derived_answer = if req.fast {
+        None
+    } else {
         let state_for_da = state.clone();
         let user_id_for_da = req.user_id.clone();
         let query_for_da = req.query.clone();
@@ -3017,7 +3042,7 @@ pub async fn reinforce_feedback(
 
 /// POST /api/recall/tags - Recall memories by tags
 ///
-/// Returns memories matching ANY of the provided tags.
+/// Returns memories matching ANY of `tags` and ALL of `all_tags`.
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn recall_by_tags(
     State(state): State<AppState>,
@@ -3029,10 +3054,10 @@ pub async fn recall_by_tags(
         validation::validate_max_results(limit).map_validation_err("limit")?;
     }
 
-    if req.tags.is_empty() {
+    if req.tags.is_empty() && req.all_tags.is_empty() {
         return Err(AppError::InvalidInput {
             field: "tags".to_string(),
-            reason: "At least one tag must be provided".to_string(),
+            reason: "At least one tag must be provided in tags or all_tags".to_string(),
         });
     }
 
@@ -3044,12 +3069,9 @@ pub async fn recall_by_tags(
     let memory_guard = memory_sys.read();
     let limit = req.limit.unwrap_or(50);
 
-    let raw_memories = if req.include_derived {
-        memory_guard.recall_by_tags(&req.tags, limit)
-    } else {
-        memory_guard.recall_by_authored_tags(&req.tags, limit)
-    }
-    .map_err(AppError::Internal)?;
+    let raw_memories = memory_guard
+        .recall_by_tag_filter(&req.tags, &req.all_tags, limit, !req.include_derived)
+        .map_err(AppError::Internal)?;
     let count = raw_memories.len();
 
     // Serialize memories to JSON for response
@@ -3073,9 +3095,13 @@ pub async fn recall_by_tags(
         .collect();
 
     info!(
-        "📋 Recall by tags: user={}, tags={:?}, found={}",
-        req.user_id, req.tags, count
+        "📋 Recall by tags: user={}, tags={:?}, all_tags={:?}, found={}",
+        req.user_id, req.tags, req.all_tags, count
     );
+    let mut preview = format!("tags: {}", req.tags.join(", "));
+    if !req.all_tags.is_empty() {
+        preview.push_str(&format!("; all of: {}", req.all_tags.join(", ")));
+    }
 
     // Broadcast RETRIEVE event for real-time dashboard
     state.emit_event(MemoryEvent {
@@ -3083,7 +3109,7 @@ pub async fn recall_by_tags(
         timestamp: chrono::Utc::now(),
         user_id: req.user_id.clone(),
         memory_id: None,
-        content_preview: Some(format!("tags: {}", req.tags.join(", "))),
+        content_preview: Some(preview),
         memory_type: Some("by_tags".to_string()),
         importance: None,
         count: Some(count),

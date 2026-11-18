@@ -177,6 +177,15 @@ pub struct RecallRequest {
     /// "+rerank", "+facts" or "full". Omitted means full, the production pipeline.
     #[serde(default)]
     pub layers: Option<String>,
+    /// Latency-bounded recall for prompt hooks: the vector and BM25 legs only, and no
+    /// reminders, todos, facts or lineage in the response.
+    #[serde(default)]
+    pub fast: bool,
+    /// Drop memories whose `score` is below this floor, in 0..=1. `score` is relative to the
+    /// top result of this recall, so the floor trims a long tail; it is not a calibrated
+    /// relevance threshold.
+    #[serde(default)]
+    pub min_score: Option<f32>,
 }
 
 pub fn default_recall_limit() -> usize {

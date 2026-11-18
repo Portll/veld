@@ -366,7 +366,7 @@ impl super::MemorySystem {
     ///
     /// Returns memories that have ANY of the specified tags, newest first.
     pub fn recall_by_tags(&self, tags: &[String], limit: usize) -> Result<Vec<Memory>> {
-        self.recall_by_tags_matching(tags, limit, false)
+        self.recall_by_tag_filter(tags, &[], limit, false)
     }
 
     /// As [`Self::recall_by_tags`], but a memory matches only through a tag its writer chose
@@ -374,19 +374,32 @@ impl super::MemorySystem {
     /// from its content. A memory with no ledger row predates the ledger and still matches: its
     /// sources are unknown, not derived.
     pub fn recall_by_authored_tags(&self, tags: &[String], limit: usize) -> Result<Vec<Memory>> {
-        self.recall_by_tags_matching(tags, limit, true)
+        self.recall_by_tag_filter(tags, &[], limit, true)
     }
 
-    fn recall_by_tags_matching(
+    /// Memories carrying ANY tag in `any_of` and EVERY tag in `all_of`, newest first. An empty
+    /// `any_of` adds no constraint of its own; with both empty nothing matches. The conjunction
+    /// applies before `limit`, so a narrow pair such as `kind:decision` with `project:veld` is
+    /// not starved by the newest memories carrying only one of them. `authored_only` is as in
+    /// [`Self::recall_by_authored_tags`] and holds for every tag in `all_of`.
+    pub fn recall_by_tag_filter(
         &self,
-        tags: &[String],
+        any_of: &[String],
+        all_of: &[String],
         limit: usize,
         authored_only: bool,
     ) -> Result<Vec<Memory>> {
-        let criteria = storage::SearchCriteria::ByTags(tags.to_vec());
-        let mut memories = self.advanced_search(criteria)?;
+        let seed = match (any_of, all_of) {
+            ([], [first, ..]) => vec![first.clone()],
+            _ => any_of.to_vec(),
+        };
+        let mut memories = self.advanced_search(storage::SearchCriteria::ByTags(seed))?;
+        let required: Vec<String> = all_of.iter().map(|tag| tag.to_lowercase()).collect();
+        if !required.is_empty() {
+            memories.retain(|memory| carries_every_tag(&memory.experience.tags, &required));
+        }
         if authored_only {
-            memories.retain(|memory| self.matches_an_authored_tag(memory, tags));
+            memories.retain(|memory| self.matches_authored_tags(memory, any_of, &required));
         }
         // A broad tag matches far more than `limit`; truncating in id order returned the same
         // arbitrary lowest-UUID slice on every call, never the recent memories a caller wants.
@@ -404,14 +417,26 @@ impl super::MemorySystem {
         Ok(memories)
     }
 
-    fn matches_an_authored_tag(&self, memory: &Memory, tags: &[String]) -> bool {
+    fn matches_authored_tags(
+        &self,
+        memory: &Memory,
+        any_of: &[String],
+        all_of_lowercase: &[String],
+    ) -> bool {
         match self.tag_source_store.get(&memory.id) {
-            Ok(Some(sources)) => sources.tags.iter().any(|sourced| {
-                sourced.source.is_authored()
-                    && tags
+            Ok(Some(sources)) => {
+                let authored: HashSet<String> = sources
+                    .tags
+                    .iter()
+                    .filter(|sourced| sourced.source.is_authored())
+                    .map(|sourced| sourced.tag.to_lowercase())
+                    .collect();
+                let matches_any = any_of.is_empty()
+                    || any_of
                         .iter()
-                        .any(|tag| tag.eq_ignore_ascii_case(&sourced.tag))
-            }),
+                        .any(|tag| authored.contains(&tag.to_lowercase()));
+                matches_any && all_of_lowercase.iter().all(|tag| authored.contains(tag))
+            }
             Ok(None) => true,
             Err(error) => {
                 tracing::warn!(
@@ -669,14 +694,13 @@ impl super::MemorySystem {
         let use_graph = matches!(
             query.retrieval_mode,
             RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
-        ) && query
-            .layer_mode()
-            .allows(crate::memory::types::LayerMode::PlusSpreading);
+        ) && query.runs(crate::memory::types::LayerMode::PlusSpreading);
         let onto_confident = onto_intent.confidence >= crate::constants::ONTOLOGICAL_MIN_CONFIDENCE;
 
         // Query words resolved to graph entities once, for the ontology density gate below
         // and Layer 2. Only the nouns and path-shaped words seed Layer 2's walk; adjectives
-        // and verbs count toward the density that weighs the graph leg in fusion.
+        // and verbs count toward the density that weighs the graph leg in fusion. A fast
+        // query runs neither Layer 2 nor the ontology rerank, so it reads no graph here.
         //
         // Every graph read on the recall path is recursive: `/api/relevant` and
         // `/api/stream` call recall while holding this graph's read guard, and a plain read
@@ -684,7 +708,7 @@ impl super::MemorySystem {
         let resolved_entities: Option<ResolvedQueryEntities> = self
             .graph_memory
             .as_ref()
-            .filter(|_| use_graph || onto_confident)
+            .filter(|_| use_graph || (onto_confident && !query.fast))
             .map(|graph| {
                 let focal_words: Vec<&str> = query_analysis
                     .focal_entities
@@ -719,7 +743,7 @@ impl super::MemorySystem {
         // Compute graph density for ontological gating (consistent with Layer 2 in graph_retrieval.rs).
         // Dense/young graphs have too many noisy L1 edges for type filtering to help.
         // Short-circuit: skip the RocksDB density lookups entirely when confidence is too low.
-        let (graph_density_for_rerank, use_ontology_rerank) = if !onto_confident {
+        let (graph_density_for_rerank, use_ontology_rerank) = if !onto_confident || query.fast {
             (None, false)
         } else if let Some(graph) = self.graph_memory.as_ref() {
             let g = graph.read_recursive();
@@ -734,9 +758,7 @@ impl super::MemorySystem {
             };
             let use_rerank = !density
                 .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD)
-                && query
-                    .layer_mode()
-                    .allows(crate::memory::types::LayerMode::PlusRerank);
+                && query.runs(crate::memory::types::LayerMode::PlusRerank);
             (density, use_rerank)
         } else {
             (None, false)
@@ -757,9 +779,7 @@ impl super::MemorySystem {
 
         let attribute_boost_ids: HashSet<MemoryId> = match &query_type {
             query_parser::QueryType::Attribute(attr_query)
-                if query
-                    .layer_mode()
-                    .allows(crate::memory::types::LayerMode::PlusBm25) =>
+                if query.runs(crate::memory::types::LayerMode::PlusBm25) =>
             {
                 tracing::debug!(
                     "Layer 0.5: Attribute query detected - entity='{}', attribute='{}', synonyms={:?}",
@@ -861,9 +881,7 @@ impl super::MemorySystem {
 
         // A PlusFacts stage, like Layer 0.7: below that rung it contributes nothing.
         let temporal_fact_boost_ids: HashSet<MemoryId> = if temporal_gate
-            && query
-                .layer_mode()
-                .allows(crate::memory::types::LayerMode::PlusFacts)
+            && query.runs(crate::memory::types::LayerMode::PlusFacts)
         {
             if let Some(user_id) = query
                 .user_id
@@ -1070,9 +1088,7 @@ impl super::MemorySystem {
                 std::collections::HashMap::new();
 
             // Layer 0.7 is a PlusFacts stage; below that rung it contributes nothing.
-            let facts_allowed = query
-                .layer_mode()
-                .allows(crate::memory::types::LayerMode::PlusFacts)
+            let facts_allowed = query.runs(crate::memory::types::LayerMode::PlusFacts)
                 && !super::ablation::fact_layers_disabled();
 
             if let Some(user_id) = &query.user_id.clone().filter(|_| facts_allowed) {
@@ -1445,6 +1461,7 @@ impl super::MemorySystem {
             rrf_k: query.rrf_k,
             rerank_count: query.rerank_count,
             dual_index: query.dual_index,
+            fast: query.fast,
         };
 
         // ===========================================================================
@@ -1458,7 +1475,7 @@ impl super::MemorySystem {
         let vector_only = !query
             .layer_mode()
             .allows(crate::memory::types::LayerMode::PlusSpreading);
-        let sub_queries = if vector_only {
+        let sub_queries = if vector_only || query.fast {
             vec![query_text.to_string()]
         } else {
             query_parser::decompose_query(query_text, &query_analysis)
@@ -1559,6 +1576,7 @@ impl super::MemorySystem {
                     rrf_k: query.rrf_k,
                     rerank_count: query.rerank_count,
                     dual_index: query.dual_index,
+                    fast: query.fast,
                 };
 
                 let sub_results = self
@@ -1846,9 +1864,7 @@ impl super::MemorySystem {
             let bm25_query_text = query_parser::expand_abstract_terms_for_bm25(query_text);
             let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
 
-            let bm25_allowed = query
-                .layer_mode()
-                .allows(crate::memory::types::LayerMode::PlusBm25);
+            let bm25_allowed = query.runs(crate::memory::types::LayerMode::PlusBm25);
             let hybrid_search_results = if bm25_allowed {
                 self.hybrid_search
                     .search_with_dynamic_weights(
@@ -2939,10 +2955,12 @@ impl super::MemorySystem {
             // it, so a reply that shares no word with the query reaches the
             // cross-encoder and is judged on its own text. After every fused-score
             // adjustment, before the cut it has to survive. Full pipeline only, so the
-            // layer-attribution rungs below Full measure what they did before.
+            // layer-attribution rungs below Full measure what they did before. A fast query
+            // skips it: it reads each top result's turn neighbours from storage.
             let neighbours = if query
                 .layer_mode()
                 .allows(crate::memory::types::LayerMode::Full)
+                && !query.fast
             {
                 self.neighbour_candidates(&res)
             } else {
@@ -3649,9 +3667,7 @@ impl super::MemorySystem {
         if memories.len() > 1
             && ce_w >= crate::constants::CE_BLEND_SKIP_BELOW
             && layer53_use_reranking.unwrap_or(crate::constants::RERANK_ENABLED_DEFAULT)
-            && query
-                .layer_mode()
-                .allows(crate::memory::types::LayerMode::PlusRerank)
+            && query.runs(crate::memory::types::LayerMode::PlusRerank)
         {
             if let Some(reranker) = self.hybrid_search.reranker() {
                 // An explicit rerank_count (dial or query) is the budget; absent one, the
@@ -6326,6 +6342,12 @@ impl super::MemorySystem {
         // Rebuild result preserving MMR order but keeping original scores
         selected.iter().map(|&idx| memories[idx].clone()).collect()
     }
+}
+
+/// Lowercased to match the tag index, which both engines key by `to_lowercase`.
+fn carries_every_tag(carried: &[String], required_lowercase: &[String]) -> bool {
+    let carried: HashSet<String> = carried.iter().map(|tag| tag.to_lowercase()).collect();
+    required_lowercase.iter().all(|tag| carried.contains(tag))
 }
 
 /// Dates make a memory relevant to a question about time, not to every question; ungated,

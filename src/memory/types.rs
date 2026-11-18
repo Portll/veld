@@ -3571,6 +3571,11 @@ pub struct Query {
     /// Pre-extracted entity names, so a harness can hold NER constant while
     /// varying the stages under test.
     pub ner_entities: Option<Vec<String>>,
+    /// Latency-bounded recall for prompt hooks: the vector and BM25 legs only, whatever
+    /// `layers` says. Spreading activation, query decomposition, cross-encoder and
+    /// ontology rerank, and the fact layers are skipped; they are the stages that take a
+    /// recall past a hook's budget.
+    pub fast: bool,
 
     // === Evidence ===
     /// Who is recalling (session id, tool name, ingest id). Named on every synapse
@@ -3728,6 +3733,7 @@ impl Default for Query {
             query_embedding: None,
             layers: None,
             ner_entities: None,
+            fast: false,
             time_range: None,
             as_of: None,
             experience_types: None,
@@ -3777,6 +3783,16 @@ impl Query {
     /// The ablation rung this query runs at. None means the full pipeline.
     pub fn layer_mode(&self) -> LayerMode {
         self.layers.unwrap_or(LayerMode::Full)
+    }
+
+    /// Does this query run the given stage: its rung allows it, and a fast query keeps
+    /// only the vector and BM25 legs.
+    pub fn runs(&self, stage: LayerMode) -> bool {
+        let skipped_when_fast = matches!(
+            stage,
+            LayerMode::PlusSpreading | LayerMode::PlusRerank | LayerMode::PlusFacts
+        );
+        self.layer_mode().allows(stage) && !(self.fast && skipped_when_fast)
     }
 
     /// Check if a memory matches all query filters
@@ -6542,7 +6558,31 @@ mod space_vector_tests {
 
 #[cfg(test)]
 mod query_filter_tests {
-    use super::{Experience, Memory, MemoryId, Place, Query};
+    use super::{Experience, LayerMode, Memory, MemoryId, Place, Query};
+
+    #[test]
+    fn a_fast_query_runs_only_the_vector_and_bm25_legs() {
+        let fast = Query {
+            fast: true,
+            ..Default::default()
+        };
+        assert!(fast.runs(LayerMode::VamanaOnly));
+        assert!(fast.runs(LayerMode::PlusBm25));
+        for skipped in [
+            LayerMode::PlusSpreading,
+            LayerMode::PlusRerank,
+            LayerMode::PlusFacts,
+        ] {
+            assert!(!fast.runs(skipped), "{skipped:?}");
+            assert!(Query::default().runs(skipped), "{skipped:?}");
+        }
+        let vamana_only = Query {
+            fast: true,
+            layers: Some(LayerMode::VamanaOnly),
+            ..Default::default()
+        };
+        assert!(!vamana_only.runs(LayerMode::PlusBm25));
+    }
 
     #[test]
     fn has_selective_filters_ignores_defaults_and_empty_tags() {

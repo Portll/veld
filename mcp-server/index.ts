@@ -793,7 +793,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "recall_by_tags",
         description:
-          "Find memories by tags, newest first. Returns memories whose writer gave them ANY of the provided tags, e.g. 'decision', 'learning', 'error', 'project:veld'.",
+          "Find memories by tags, newest first. Returns memories whose writer gave them ANY of `tags` and ALL of `all_tags`, e.g. tags ['kind:decision'] with all_tags ['project:veld'] for the newest decisions in one project.",
         inputSchema: {
           type: "object",
           properties: {
@@ -802,6 +802,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description:
                 "Tags to search for (returns memories matching ANY of these tags)",
+            },
+            all_tags: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Tags a memory must carry every one of, applied before the limit. With tags empty, a memory matches on these alone.",
             },
             limit: {
               type: "number",
@@ -815,7 +821,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               default: false,
             },
           },
-          required: ["tags"],
         },
       },
       {
@@ -2218,32 +2223,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "recall_by_tags": {
         const {
-          tags,
+          tags = [],
+          all_tags = [],
           limit: rawTagLimit = 50,
           include_derived = false,
         } = args as {
-          tags: string[];
+          tags?: string[];
+          all_tags?: string[];
           limit?: number;
           include_derived?: boolean;
         };
 
-        if (!Array.isArray(tags) || tags.length === 0) {
+        if (
+          !Array.isArray(tags) ||
+          !Array.isArray(all_tags) ||
+          tags.length + all_tags.length === 0
+        ) {
           return {
             content: [
               {
                 type: "text",
-                text: "Error: 'tags' is required and must contain at least one tag",
+                text: "Error: give at least one tag in 'tags' or 'all_tags'",
               },
             ],
             isError: true,
           };
         }
+        const tagLabel = [
+          tags.length > 0 ? `any of ${tags.join(", ")}` : "",
+          all_tags.length > 0 ? `all of ${all_tags.join(", ")}` : "",
+        ]
+          .filter(Boolean)
+          .join("; ");
 
         const tagLimit = Math.max(1, Math.min(Math.floor(rawTagLimit), MAX_LIMIT));
         const tagResult = await apiCall<{ memories: Memory[]; count: number }>(
           "/api/recall/tags",
           "POST",
-          { user_id: USER_ID, tags, limit: tagLimit, include_derived },
+          { user_id: USER_ID, tags, all_tags, limit: tagLimit, include_derived },
         );
         const tagMemories = tagResult.memories || [];
 
@@ -2252,13 +2269,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
               {
                 type: "text",
-                text: `No memories found matching tags: ${tags.join(", ")}`,
+                text: `No memories found matching tags: ${tagLabel}`,
               },
             ],
           };
         }
 
-        let tagResponse = `Recall by tags: ${tags.join(", ")}\n`;
+        let tagResponse = `Recall by tags: ${tagLabel}\n`;
         tagResponse += `Found ${tagMemories.length} memories\n\n`;
         tagMemories.forEach((m, i) => {
           const content = getContent(m);

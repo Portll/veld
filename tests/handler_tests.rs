@@ -642,6 +642,153 @@ async fn recall_by_tags_matches_derived_tags_only_when_asked() {
 }
 
 #[tokio::test]
+async fn recall_by_tags_applies_all_tags_before_the_limit() {
+    let h = Harness::new();
+    for (content, tags, created_at) in [
+        (
+            "Veld keeps RocksDB as the default engine.",
+            vec!["kind:decision", "project:veld"],
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "Spine renders each context block once.",
+            vec!["kind:decision", "project:spine"],
+            "2026-02-01T00:00:00Z",
+        ),
+        (
+            "Spine dedupes corrections across blocks.",
+            vec!["kind:decision", "project:spine"],
+            "2026-03-01T00:00:00Z",
+        ),
+        (
+            "Veld status note with no decision in it.",
+            vec!["project:veld"],
+            "2026-04-01T00:00:00Z",
+        ),
+    ] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({
+                    "user_id": "all-tags-user",
+                    "content": content,
+                    "tags": tags,
+                    "created_at": created_at
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+    }
+    let recall = |request: serde_json::Value| {
+        let mut body = json!({"user_id": "all-tags-user", "limit": 1});
+        body.as_object_mut()
+            .expect("request object")
+            .extend(request.as_object().expect("extra object").clone());
+        authed_post("/api/recall/tags", body)
+    };
+    let contents = |body: &serde_json::Value| -> Vec<String> {
+        body["memories"]
+            .as_array()
+            .expect("memories array")
+            .iter()
+            .map(|m| {
+                m["experience"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let (status, any_and_all) = json_of(
+        h.app(),
+        recall(json!({"tags": ["kind:decision"], "all_tags": ["project:veld"]})),
+    )
+    .await;
+    let (_, all_only) = json_of(
+        h.app(),
+        recall(json!({"all_tags": ["KIND:decision", "project:veld"]})),
+    )
+    .await;
+    let (empty_status, _) = json_of(h.app(), recall(json!({"tags": [], "all_tags": []}))).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "recall by tags failed: {any_and_all}"
+    );
+    assert_eq!(
+        contents(&any_and_all),
+        ["Veld keeps RocksDB as the default engine."]
+    );
+    assert_eq!(
+        contents(&all_only),
+        ["Veld keeps RocksDB as the default engine."]
+    );
+    assert_eq!(empty_status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn recall_by_tags_all_tags_honours_include_derived() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "derived-all-tags-user",
+                "content": "The quokka migration moved the quokka ledger onto the quokka cluster in Wellington.",
+                "tags": ["caller-chosen"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+    let recall = |all_tags: Vec<&str>, include_derived: bool| {
+        authed_post(
+            "/api/recall/tags",
+            json!({
+                "user_id": "derived-all-tags-user",
+                "all_tags": all_tags,
+                "include_derived": include_derived
+            }),
+        )
+    };
+    let (_, by_caller_tag) = json_of(h.app(), recall(vec!["caller-chosen"], false)).await;
+    let derived = by_caller_tag["memories"][0]["experience"]["tags"]
+        .as_array()
+        .expect("stored tags")
+        .iter()
+        .filter_map(|t| t.as_str())
+        .find(|t| !t.eq_ignore_ascii_case("caller-chosen"))
+        .unwrap_or_else(|| panic!("no derived tag was stored: {by_caller_tag}"))
+        .to_string();
+
+    let (_, default_match) = json_of(
+        h.app(),
+        recall(vec!["caller-chosen", derived.as_str()], false),
+    )
+    .await;
+    let (_, derived_match) = json_of(
+        h.app(),
+        recall(vec!["caller-chosen", derived.as_str()], true),
+    )
+    .await;
+
+    assert_eq!(by_caller_tag["count"], 1, "{by_caller_tag}");
+    assert_eq!(
+        default_match["count"], 0,
+        "derived `{derived}`: {default_match}"
+    );
+    assert_eq!(
+        derived_match["count"], 1,
+        "derived `{derived}`: {derived_match}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_memory_type_is_rejected_not_stored_as_observation() {
     let h = Harness::new();
     let (status, body) = json_of(
@@ -1170,6 +1317,106 @@ async fn recall_with_repo_returns_only_that_repos_memories() {
     let unscoped = ids_in(&body);
     for id in [&one, &two, &none] {
         assert!(unscoped.contains(id), "{id} missing unscoped: {body:#}");
+    }
+}
+
+#[tokio::test]
+async fn fast_recall_returns_memories_without_side_lookups() {
+    let h = Harness::new();
+    let user = "fast-recall";
+    let [billing, _, _] = remember_across_repos(&h, user).await;
+    let query = "quokka lantern protocol billing worker retries";
+    for (uri, req) in [
+        ("/api/todos/add", json!({"user_id": user, "content": query})),
+        (
+            "/api/remind",
+            json!({"user_id": user, "content": "Check the quokka billing pager.",
+                   "trigger": {"type": "context", "keywords": ["quokka"]}}),
+        ),
+    ] {
+        let (status, body) = json_of(h.app(), authed_post(uri, req)).await;
+        assert!(status.is_success(), "{uri}: {body}");
+    }
+    let recall = |fast: bool| {
+        authed_post(
+            "/api/recall",
+            json!({"user_id": user, "query": query, "limit": 10, "fast": fast,
+                   "competition_mode": "coexist"}),
+        )
+    };
+
+    let (status, full) = json_of(h.app(), recall(false)).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    for side in ["todos", "triggered_reminders"] {
+        assert!(
+            full[side].as_array().is_some_and(|v| !v.is_empty()),
+            "{side} missing from the full recall: {full:#}"
+        );
+    }
+
+    let (status, fast) = json_of(h.app(), recall(true)).await;
+    assert_eq!(status, StatusCode::OK, "{fast}");
+    assert!(ids_in(&fast).contains(&billing), "{fast:#}");
+    for side in [
+        "todos",
+        "facts",
+        "triggered_reminders",
+        "lineage",
+        "derived_answer",
+    ] {
+        assert!(
+            fast.get(side).is_none_or(|v| v.is_null()),
+            "{side} in a fast recall: {fast:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recall_min_score_drops_the_tail_and_rejects_out_of_range() {
+    let h = Harness::new();
+    let user = "min-score-recall";
+    remember_across_repos(&h, user).await;
+    let recall = |min_score: Option<f32>| {
+        let mut req = json!({"user_id": user, "query": "quokka lantern billing worker retries",
+                             "limit": 10, "competition_mode": "coexist"});
+        if let Some(floor) = min_score {
+            req["min_score"] = json!(floor);
+        }
+        authed_post("/api/recall", req)
+    };
+    let scored = |body: &serde_json::Value| -> Vec<(String, f64)> {
+        body["memories"]
+            .as_array()
+            .expect("memories array")
+            .iter()
+            .map(|m| {
+                let id = m["id"].as_str().expect("id").to_string();
+                (id, m["score"].as_f64().expect("score"))
+            })
+            .collect()
+    };
+
+    let (status, unfloored) = json_of(h.app(), recall(None)).await;
+    assert_eq!(status, StatusCode::OK, "{unfloored}");
+    let unfloored = scored(&unfloored);
+    assert!(
+        unfloored.iter().filter(|(_, s)| *s < 0.99).count() >= 1,
+        "the fixture needs a tail below the top score: {unfloored:?}"
+    );
+
+    let (status, floored) = json_of(h.app(), recall(Some(1.0))).await;
+    assert_eq!(status, StatusCode::OK, "{floored}");
+    let floored = scored(&floored);
+    assert!(!floored.is_empty(), "the top result reads 1.0");
+    assert!(
+        floored.len() < unfloored.len(),
+        "{floored:?} vs {unfloored:?}"
+    );
+    assert!(floored.iter().all(|(_, s)| *s >= 1.0), "{floored:?}");
+
+    for bad in [-0.1_f32, 1.5] {
+        let (status, body) = json_of(h.app(), recall(Some(bad))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "min_score {bad}: {body}");
     }
 }
 
