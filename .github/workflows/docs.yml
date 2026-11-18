@@ -141,7 +141,9 @@ jobs:
           fail: true
 
       - name: Build rustdoc
-        run: cargo doc --no-deps --workspace
+        # veld-py's cdylib is also named `veld`, so documenting both collides on one output
+        # path; the book documents the Rust crate.
+        run: cargo doc --no-deps --workspace --exclude veld-py
 
       - name: Stitch rustdoc into the book
         run: |
