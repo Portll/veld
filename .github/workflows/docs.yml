@@ -47,7 +47,10 @@ jobs:
       - name: Install mdBook and preprocessors
         run: |
           cargo install --locked mdbook --version "^0.4"
-          cargo install --locked mdbook-mermaid mdbook-toc
+          # mdbook-mermaid 0.17 and mdbook-toc 0.15 speak mdBook 0.5's preprocessor protocol
+          # and fail to parse 0.4's input, so they stay on the last releases built for 0.4.
+          cargo install --locked mdbook-mermaid --version "~0.16.2"
+          cargo install --locked mdbook-toc --version "~0.14.2"
 
       - name: Install LLVM
         # The default build links RocksDB, whose bindgen step needs libclang; without it
