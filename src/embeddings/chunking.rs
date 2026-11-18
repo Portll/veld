@@ -11,19 +11,28 @@
 //!
 //! This module implements two chunking strategies:
 //!
-//! ## 1. Fixed-Size Overlapping Chunking (`chunk_text`)
-//! - Split text into ~200 token chunks (leaving room for special tokens)
-//! - 50 token overlap between chunks for context continuity
-//! - Good for general prose and documents
+//! ## 1. Heading-Based Chunking with a Fixed-Size Fallback (`chunk_text`)
+//! - Markdown is cut at its ATX headings (never inside fenced code); tiny sections join their
+//!   neighbours, and every chunk carries its enclosing headings as a prefix
+//! - A section longer than one chunk, and text with fewer than two sections, get sentence-aware
+//!   fixed-size chunks (`ChunkConfig::chunk_size`) with `ChunkConfig::overlap` between them
 //!
 //! ## 2. Semantic Chunking (`semantic_chunk_text`)
 //! - Splits on natural boundaries (paragraphs, dialogue turns, sections)
 //! - Preserves conversational context - never splits mid-turn
 //! - Better for dialogue, structured text, logs, and multi-speaker content
 //!
+//! # Example (Heading-Based)
+//!
+//! A design note with a title and two long sections becomes:
+//! ```text
+//! ["# Recall\n## Scoring\n<scoring, first part>"] ["# Recall\n## Scoring\n<scoring, rest>"]
+//! ["# Recall\n## Tags\n<tags>"]
+//! ```
+//!
 //! # Example (Fixed-Size)
 //!
-//! A 1000-token memory becomes ~6 chunks:
+//! A 1000-token memory with no headings becomes ~6 overlapping chunks:
 //! ```text
 //! [0-200] [150-350] [300-500] [450-650] [600-800] [750-1000]
 //! ```
@@ -181,10 +190,25 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
-/// Chunk text into overlapping segments for embedding
+/// Chunk text for embedding.
 ///
-/// Uses sentence-aware splitting to avoid breaking mid-sentence when possible.
+/// Text that fits one chunk is returned whole. Markdown with at least two sections (ATX headings
+/// outside fenced code, plus any text before the first heading) is cut at its headings, so a
+/// chunk holds one topic rather than the tail of one and the head of the next; see
+/// `heading_chunks`. Anything else gets sentence-aware fixed-size chunks with overlap.
 pub fn chunk_text(text: &str, config: &ChunkConfig) -> ChunkResult {
+    let text = text.trim();
+    if text.len() > config.chunk_size {
+        let sections = markdown_sections(text);
+        if sections.len() >= 2 {
+            return heading_chunks(text, &sections, config);
+        }
+    }
+    fixed_size_chunks(text, config)
+}
+
+/// Sentence-aware fixed-size chunks with overlap.
+fn fixed_size_chunks(text: &str, config: &ChunkConfig) -> ChunkResult {
     let text = text.trim();
     let original_length = text.len();
 
@@ -260,6 +284,194 @@ pub fn chunk_text(text: &str, config: &ChunkConfig) -> ChunkResult {
         original_length,
         was_chunked: true,
         covered_length,
+    }
+}
+
+/// One markdown section: a heading line and the body up to the next heading, or the text
+/// before the first heading (`heading: None`).
+#[derive(Debug)]
+struct Section<'a> {
+    start: usize,
+    end: usize,
+    heading: Option<&'a str>,
+    /// Heading lines of the enclosing sections, outermost first.
+    ancestors: Vec<&'a str>,
+}
+
+/// The ATX heading level of `line` (`#` to `######` after at most three spaces, then a space, a
+/// tab or the end of the line), or None. A heading with no text is not counted: a lone `#` in a
+/// memory is far more often a stray character than a section break.
+fn atx_heading_level(line: &str) -> Option<usize> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let level = rest.len() - rest.trim_start_matches('#').len();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let after = &rest[level..];
+    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let title = after.trim().trim_end_matches('#').trim();
+    (!title.is_empty()).then_some(level)
+}
+
+/// The fence a line opens or closes: its character (`` ` `` or `~`) and run length.
+fn code_fence(line: &str) -> Option<(char, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let marker = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let run = rest.len() - rest.trim_start_matches(marker).len();
+    (run >= 3).then_some((marker, run))
+}
+
+/// `text` partitioned into sections at its ATX headings. Lines inside fenced code are never
+/// headings, so a `# comment` in a shell block does not split one.
+fn markdown_sections(text: &str) -> Vec<Section<'_>> {
+    let mut sections: Vec<Section<'_>> = Vec::new();
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    let mut open_fence: Option<(char, usize)> = None;
+    let mut offset = 0usize;
+    for raw in text.split_inclusive('\n') {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let line_start = offset;
+        offset += raw.len();
+        if let Some((marker, run)) = open_fence {
+            if code_fence(line)
+                .is_some_and(|(m, r)| m == marker && r >= run && line.trim().len() == r)
+            {
+                open_fence = None;
+            }
+            continue;
+        }
+        if let Some(fence) = code_fence(line) {
+            open_fence = Some(fence);
+            continue;
+        }
+        let Some(level) = atx_heading_level(line) else {
+            continue;
+        };
+        if line_start > 0 && sections.is_empty() {
+            sections.push(Section {
+                start: 0,
+                end: line_start,
+                heading: None,
+                ancestors: Vec::new(),
+            });
+        }
+        if let Some(last) = sections.last_mut() {
+            last.end = line_start;
+        }
+        stack.retain(|(open_level, _)| *open_level < level);
+        let heading = line.trim();
+        sections.push(Section {
+            start: line_start,
+            end: text.len(),
+            heading: Some(heading),
+            ancestors: stack.iter().map(|(_, h)| *h).collect(),
+        });
+        stack.push((level, heading));
+    }
+    sections
+}
+
+/// `trail` joined one heading per line, dropping the outermost headings until it fits `room`.
+fn fit_trail(trail: &[&str], room: usize) -> String {
+    (0..=trail.len())
+        .map(|skip| trail[skip..].join("\n"))
+        .find(|joined| joined.len() <= room)
+        .unwrap_or_default()
+}
+
+fn with_trail(trail: &str, body: &str) -> String {
+    if trail.is_empty() {
+        body.to_string()
+    } else {
+        format!("{trail}\n{body}")
+    }
+}
+
+/// Chunks cut at markdown headings.
+///
+/// Sections are grouped first: a section shorter than `min_chunk_size` (a bare title, a heading
+/// with one line under it) joins the sections after it until the group reaches that size, and a
+/// tiny last group joins the one before it. No chunk spans two groups and none overlaps another.
+///
+/// Each chunk is prefixed with the headings of its enclosing sections, so a piece of
+/// `## Install` under `# Veld` still says it is about Veld; outermost headings are dropped when
+/// they do not fit. A group within `chunk_size` is one chunk. A longer group is cut by
+/// `fixed_size_chunks` at the size its prefix leaves, and every piece after the first also repeats
+/// the group's own heading, which the first piece already opens with.
+fn heading_chunks(text: &str, sections: &[Section<'_>], config: &ChunkConfig) -> ChunkResult {
+    let raw_span = |first: usize, last: usize| &text[sections[first].start..sections[last].end];
+
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut first = 0;
+    while first < sections.len() {
+        let mut last = first;
+        while raw_span(first, last).trim().len() < config.min_chunk_size
+            && last + 1 < sections.len()
+        {
+            last += 1;
+        }
+        groups.push((first, last));
+        first = last + 1;
+    }
+    if let [.., previous, (tail_first, tail_last)] = groups[..] {
+        if raw_span(tail_first, tail_last).trim().len() < config.min_chunk_size {
+            groups.pop();
+            groups.pop();
+            groups.push((previous.0, tail_last));
+        }
+    }
+
+    let trail_cap = config.chunk_size / 4;
+    let mut chunks = Vec::new();
+    // Groups partition `text`, so whitespace trimmed off a group is still counted as covered.
+    let mut covered_length = 0usize;
+    for (first, last) in groups {
+        let raw = raw_span(first, last);
+        let body = raw.trim();
+        let outer = &sections[first].ancestors;
+        if body.len() <= config.chunk_size {
+            let room = config.chunk_size.saturating_sub(body.len() + 1);
+            chunks.push(with_trail(&fit_trail(outer, room.min(trail_cap)), body));
+            covered_length += raw.len();
+            continue;
+        }
+
+        let lead = fit_trail(outer, trail_cap);
+        let mut continuation_trail = sections[last].ancestors.clone();
+        continuation_trail.extend(sections[last].heading);
+        let continuation = fit_trail(&continuation_trail, trail_cap);
+        let piece_size = config
+            .chunk_size
+            .saturating_sub(lead.len().max(continuation.len()) + 1)
+            .max(1);
+        let piece_config = ChunkConfig {
+            chunk_size: piece_size,
+            overlap: config.overlap.min(piece_size / 2),
+            min_chunk_size: config.min_chunk_size.min(piece_size / 2),
+        };
+        let pieces = fixed_size_chunks(body, &piece_config);
+        covered_length += pieces.covered_length + (raw.len() - body.len());
+        for (index, piece) in pieces.chunks.iter().enumerate() {
+            let trail = if index == 0 { &lead } else { &continuation };
+            chunks.push(with_trail(trail, piece));
+        }
+    }
+
+    ChunkResult {
+        chunks,
+        original_length: text.len(),
+        was_chunked: true,
+        covered_length: covered_length.min(text.len()),
     }
 }
 
@@ -917,6 +1129,181 @@ mod tests {
                 found,
                 "Sentence {i} not found in any chunk! Coverage gap detected."
             );
+        }
+    }
+
+    fn section(title: &str, sentence: &str, repeat: usize) -> String {
+        format!("{title}\n\n{}\n", sentence.repeat(repeat).trim_end())
+    }
+
+    #[test]
+    fn markdown_is_cut_at_its_headings_with_the_enclosing_headings_as_prefix() {
+        let text = [
+            "# Recall".to_string(),
+            section(
+                "## Scoring",
+                "Scores blend twenty signals into one rank. ",
+                6,
+            ),
+            section("## Tags", "Tag recall filters on authored tags first. ", 6),
+        ]
+        .join("\n");
+        let result = chunk_text(&text, &ChunkConfig::default());
+
+        assert!(result.was_chunked);
+        assert_eq!(result.chunks.len(), 2, "{:#?}", result.chunks);
+        assert!(result.chunks[0].starts_with("# Recall\n## Scoring\n\nScores"));
+        assert!(!result.chunks[0].contains("Tag recall"));
+        assert!(result.chunks[1].starts_with("# Recall\n## Tags"));
+        assert!(!result.chunks[1].contains("Scores blend"));
+        assert_eq!(result.covered_length, result.original_length);
+    }
+
+    #[test]
+    fn a_heading_inside_fenced_code_does_not_split() {
+        let script = "echo build\n".repeat(40);
+        let text = format!(
+            "## Setup\n\nRun this once.\n\n```sh\n# install the toolchain\n{script}```\n\n{}",
+            section("## Usage", "Call the binary with a config path. ", 4)
+        );
+        let sections = markdown_sections(text.trim());
+        let headings: Vec<_> = sections.iter().filter_map(|s| s.heading).collect();
+        assert_eq!(headings, ["## Setup", "## Usage"]);
+
+        let result = chunk_text(&text, &ChunkConfig::default());
+        let fenced = result
+            .chunks
+            .iter()
+            .find(|c| c.contains("# install the toolchain"))
+            .expect("the fenced comment is in some chunk");
+        assert!(
+            fenced.starts_with("## Setup\n\nRun this once."),
+            "{fenced:?}"
+        );
+    }
+
+    #[test]
+    fn hashtags_and_empty_hashes_are_not_headings() {
+        for line in ["#tag", "#", "##", "    # indented code", "#######seven"] {
+            assert_eq!(atx_heading_level(line), None, "{line:?}");
+        }
+        for (line, level) in [("# One", 1), ("   ### Three ###", 3), ("######\tSix", 6)] {
+            assert_eq!(atx_heading_level(line), Some(level), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_section_repeats_its_heading_trail_on_every_piece() {
+        let config = ChunkConfig::default();
+        let text = [
+            "# Veld".to_string(),
+            section(
+                "## Storage",
+                "RocksDB is the default engine and redb is the second one. ",
+                30,
+            ),
+            section(
+                "## Auth",
+                "Keys are checked by middleware before handlers run. ",
+                4,
+            ),
+        ]
+        .join("\n");
+        let result = chunk_text(&text, &config);
+
+        let storage: Vec<_> = result
+            .chunks
+            .iter()
+            .filter(|c| c.contains("RocksDB is the default"))
+            .collect();
+        assert!(storage.len() >= 3, "{:#?}", result.chunks);
+        assert!(storage[0].starts_with("# Veld\n## Storage\n\nRocksDB"));
+        for piece in &storage[1..] {
+            let continued = piece
+                .strip_prefix("# Veld\n## Storage\n")
+                .unwrap_or_else(|| panic!("no heading trail: {piece:?}"));
+            assert!(!continued.starts_with(char::is_whitespace), "{piece:?}");
+        }
+        assert!(result
+            .chunks
+            .iter()
+            .any(|c| c.starts_with("# Veld\n## Auth") && !c.contains("RocksDB")));
+        for chunk in &result.chunks {
+            assert!(
+                chunk.len() <= config.chunk_size + config.min_chunk_size,
+                "{} bytes",
+                chunk.len()
+            );
+        }
+        assert_eq!(result.covered_length, result.original_length);
+    }
+
+    #[test]
+    fn a_tiny_last_section_joins_the_one_before_it() {
+        let text = [
+            section(
+                "## Context",
+                "Recall ranks by fused score before the rerank. ",
+                6,
+            ),
+            section(
+                "## Decision",
+                "We keep fusion order into the rerank stage. ",
+                8,
+            ),
+            "## Owner\n\nveld-44".to_string(),
+        ]
+        .join("\n");
+        let result = chunk_text(&text, &ChunkConfig::default());
+        assert_eq!(result.chunks.len(), 2, "{:#?}", result.chunks);
+        assert!(result.chunks[1].starts_with("## Decision"));
+        assert!(result.chunks[1].ends_with("veld-44"));
+    }
+
+    #[test]
+    fn text_before_the_first_heading_is_its_own_section() {
+        let text = format!(
+            "{}\n\n{}",
+            "A preamble paragraph that says what this note is for. ".repeat(4),
+            section("## Detail", "The detail section holds the body. ", 10)
+        );
+        let result = chunk_text(&text, &ChunkConfig::default());
+        assert_eq!(result.chunks.len(), 2, "{:#?}", result.chunks);
+        assert!(result.chunks[0].starts_with("A preamble"));
+        assert!(result.chunks[1].starts_with("## Detail"));
+    }
+
+    #[test]
+    fn text_with_one_heading_or_none_keeps_fixed_size_chunks() {
+        let config = ChunkConfig::default();
+        let prose = "This is a test sentence with no structure. ".repeat(40);
+        for text in [prose.clone(), format!("# Title\n\n{prose}")] {
+            let fixed = fixed_size_chunks(&text, &config);
+            let chunked = chunk_text(&text, &config);
+            assert_eq!(chunked.chunks, fixed.chunks);
+            assert_eq!(chunked.covered_length, fixed.covered_length);
+        }
+    }
+
+    #[test]
+    fn heading_chunking_terminates_on_degenerate_input() {
+        let inputs = [
+            "# a\n".repeat(400),
+            format!("# a\n{}", "x".repeat(5000)),
+            format!("{}\n# b\n{}", "é".repeat(700), "ü".repeat(700)),
+            format!("```\n{}\n# x\n{}", "y".repeat(600), "# z\nw\n".repeat(100)),
+        ];
+        for text in inputs {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let input = text.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(chunk_text(&input, &ChunkConfig::default()));
+            });
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("chunk_text did not terminate");
+            assert!(!result.chunks.is_empty());
+            assert_eq!(result.covered_length, result.original_length);
         }
     }
 
