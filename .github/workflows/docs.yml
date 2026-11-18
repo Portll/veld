@@ -134,9 +134,10 @@ jobs:
         # transient network errors; external links are checked weekly in a
         # separate scheduled workflow. lychee 0.24 refuses a relative --base, so root-relative
         # links resolve against the book's absolute path.
+        # 404.html is skipped: its links carry site-url (/veld/), which exists only once deployed.
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --offline --root-dir ${{ github.workspace }}/docs/book './docs/book/**/*.html'
+          args: --offline --root-dir ${{ github.workspace }}/docs/book --exclude-path docs/book/404.html './docs/book/**/*.html'
           fail: true
 
       - name: Build rustdoc

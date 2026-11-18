@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use veld_docs_generators::{docs_src_root, generated_header, read_source, repo_root, write_output};
 
 struct Mirror {
-    section_header: &'static str, // e.g. "## Epistemic Hygiene"
+    section_header: &'static str,  // e.g. "## Epistemic Hygiene"
     output_rel_path: &'static str, // relative to docs/src/
 }
 
@@ -72,6 +72,80 @@ fn extract_section(source: &str, header: &str) -> Option<String> {
     Some(body.join("\n").trim().to_string())
 }
 
+const REPO_BLOB_URL: &str = "https://github.com/Portll/veld/blob/main/";
+const REPO_TREE_URL: &str = "https://github.com/Portll/veld/tree/main/";
+const BOOK_SOURCE_PREFIX: &str = "docs/src/";
+
+/// CLAUDE.md links resolve from the repository root, but the mirrored page lives under
+/// docs/src/, where they point at nothing and fail the book's link check. A book page
+/// becomes a page-relative link; any other repository path becomes a GitHub link.
+fn rewrite_links(body: &str, output_rel_path: &str) -> String {
+    let depth = output_rel_path.matches('/').count();
+    let mut in_fence = false;
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if in_fence {
+            lines.push(line.to_string());
+            continue;
+        }
+        let mut out = String::with_capacity(line.len());
+        for (i, segment) in line.split('`').enumerate() {
+            if i > 0 {
+                out.push('`');
+            }
+            if i % 2 == 1 {
+                out.push_str(segment);
+            } else {
+                rewrite_inline_links(segment, depth, &mut out);
+            }
+        }
+        lines.push(out);
+    }
+    lines.join("\n")
+}
+
+fn rewrite_inline_links(text: &str, depth: usize, out: &mut String) {
+    let mut rest = text;
+    while let Some(open) = rest.find("](") {
+        let target_start = open + 2;
+        let Some(len) = rest[target_start..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..target_start]);
+        out.push_str(&rewrite_target(
+            &rest[target_start..target_start + len],
+            depth,
+        ));
+        rest = &rest[target_start + len..];
+    }
+    out.push_str(rest);
+}
+
+fn rewrite_target(target: &str, depth: usize) -> String {
+    let is_external_or_relative = target.contains("://")
+        || target.starts_with("mailto:")
+        || target.starts_with('#')
+        || target.starts_with('/')
+        || target.starts_with("./")
+        || target.starts_with("../");
+    if is_external_or_relative {
+        return target.to_string();
+    }
+    if let Some(book_path) = target.strip_prefix(BOOK_SOURCE_PREFIX) {
+        return format!("{}{book_path}", "../".repeat(depth));
+    }
+    let path = target.split('#').next().unwrap_or(target);
+    let base = if path.ends_with('/') {
+        REPO_TREE_URL
+    } else {
+        REPO_BLOB_URL
+    };
+    format!("{base}{target}")
+}
+
 fn main() -> Result<()> {
     let claude_md = repo_root().join("CLAUDE.md");
     let source = read_source(&claude_md)?;
@@ -90,8 +164,10 @@ fn main() -> Result<()> {
                     "gen-claude-sections",
                 );
                 out.push_str(&format!("# {title}\n\n"));
-                out.push_str("> Mirrored from CLAUDE.md. Edit the source there, not this file.\n\n");
-                out.push_str(&body);
+                out.push_str(
+                    "> Mirrored from CLAUDE.md. Edit the source there, not this file.\n\n",
+                );
+                out.push_str(&rewrite_links(&body, m.output_rel_path));
                 out.push_str("\n");
                 write_output(&output_path, &out)?;
                 mirrored += 1;
@@ -124,4 +200,40 @@ fn main() -> Result<()> {
         "gen-claude-sections: {mirrored} mirrored, {missing} placeholders written, {skipped} existing pages untouched"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_links;
+
+    #[test]
+    fn book_pages_become_page_relative() {
+        assert_eq!(
+            rewrite_links("[0007](docs/src/decisions/0007-x.md#gates)", "guides/a.md"),
+            "[0007](../decisions/0007-x.md#gates)"
+        );
+    }
+
+    #[test]
+    fn repository_files_and_directories_link_to_github() {
+        assert_eq!(
+            rewrite_links(
+                "[c](src/constants.rs#L42) and [d](src/storage/)",
+                "guides/a.md"
+            ),
+            "[c](https://github.com/Portll/veld/blob/main/src/constants.rs#L42) and \
+             [d](https://github.com/Portll/veld/tree/main/src/storage/)"
+        );
+    }
+
+    #[test]
+    fn code_spans_fences_and_absolute_links_are_untouched() {
+        let body = "`[x](src/a.rs)` [`Dials`](docs/src/d.md) [w](https://e.org/a)\n\
+                    ```md\n[y](src/b.rs)\n```";
+        assert_eq!(
+            rewrite_links(body, "guides/a.md"),
+            "`[x](src/a.rs)` [`Dials`](../d.md) [w](https://e.org/a)\n\
+             ```md\n[y](src/b.rs)\n```"
+        );
+    }
 }
