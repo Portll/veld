@@ -7,64 +7,119 @@
     "depth": 30
   },
   "retrieval_dials": {},
-  "git_sha": "60a04008d9d70b42dfe78f3ef193b8550cc5c439",
-  "timestamp": "2026-11-18T08:27:39.223193580Z",
+  "ingest": "synchronous",
+  "similarity_bars": {
+    "dream_band_ceiling": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "dream_band_floor": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "entity_concept_merge": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "fact_dedup_contradiction": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "fact_dedup_invalidation": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "fact_dedup_similar": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "interference_deferred": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "interference_severe_deferred": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "interference_severe_sync": {
+      "evaluated": 660,
+      "fired": 15
+    },
+    "interference_sync": {
+      "evaluated": 15590,
+      "fired": 660
+    },
+    "query_repetition": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "query_topic_change": {
+      "evaluated": 0,
+      "fired": 0
+    },
+    "semantic_merge": {
+      "evaluated": 0,
+      "fired": 0
+    }
+  },
+  "git_sha": "87f16f0bbdf398a9816905615bde94f02cff9034",
+  "timestamp": "2026-11-18T09:11:02.417963471Z",
   "layers": {
     "full": {
-      "ndcg@10": 0.5409104317191702,
-      "recall@10": 0.6409285714285714,
-      "hit@10": 0.7,
-      "precision@10": 0.08899999999999995,
-      "mrr": 0.5300515873015874,
-      "p@1": 0.46,
-      "map": 0.4944305555555556,
-      "latency_p50_ms": 1213.598275,
-      "latency_p95_ms": 1442.929913,
-      "latency_p99_ms": 1599.117417,
-      "latency_min_ms": 798.579249,
-      "latency_max_ms": 1644.8076780000001,
-      "latency_iqr_ms": 228.66928800000005
+      "ndcg@10": 0.582423433755322,
+      "recall@10": 0.6967619047619048,
+      "hit@10": 0.77,
+      "precision@10": 0.09499999999999993,
+      "mrr": 0.5693452380952383,
+      "p@1": 0.48,
+      "map": 0.529276322751323,
+      "latency_p50_ms": 1207.14798,
+      "latency_p95_ms": 1433.071956,
+      "latency_p99_ms": 1539.6545669999998,
+      "latency_min_ms": 895.809447,
+      "latency_max_ms": 1577.953337,
+      "latency_iqr_ms": 200.81122200000004
     }
   },
   "by_category": {
     "multi_hop": {
-      "ndcg@10": 0.4425435283501654,
-      "recall@10": 0.4937142857142857,
-      "hit@10": 0.68,
-      "precision@10": 0.13200000000000003,
-      "mrr": 0.5051587301587301,
-      "p@1": 0.44,
-      "map": 0.37788888888888883,
+      "ndcg@10": 0.41758064931537425,
+      "recall@10": 0.477047619047619,
+      "hit@10": 0.72,
+      "precision@10": 0.12800000000000003,
+      "mrr": 0.48522222222222217,
+      "p@1": 0.4,
+      "map": 0.3460179894179894,
       "case_count": 25
     },
     "open_domain": {
-      "ndcg@10": 0.20452262439700347,
-      "recall@10": 0.325,
-      "hit@10": 0.4,
-      "precision@10": 0.06,
-      "mrr": 0.16,
+      "ndcg@10": 0.2473247201238693,
+      "recall@10": 0.375,
+      "hit@10": 0.5,
+      "precision@10": 0.06999999999999999,
+      "mrr": 0.2166666666666667,
       "p@1": 0.1,
-      "map": 0.15529761904761905,
+      "map": 0.18363095238095237,
       "case_count": 10
     },
     "single_hop": {
-      "ndcg@10": 0.5687144307286408,
-      "recall@10": 0.7142857142857143,
-      "hit@10": 0.7142857142857143,
-      "precision@10": 0.07142857142857145,
-      "mrr": 0.5217006802721088,
-      "p@1": 0.42857142857142855,
-      "map": 0.5217006802721088,
+      "ndcg@10": 0.6751518058831901,
+      "recall@10": 0.8285714285714286,
+      "hit@10": 0.8285714285714286,
+      "precision@10": 0.0828571428571429,
+      "mrr": 0.6252380952380953,
+      "p@1": 0.5142857142857142,
+      "map": 0.6252380952380953,
       "case_count": 35
     },
     "temporal": {
-      "ndcg@10": 0.702574121456347,
-      "recall@10": 0.7833333333333333,
-      "hit@10": 0.8,
-      "precision@10": 0.08333333333333336,
-      "mrr": 0.6838888888888889,
+      "ndcg@10": 0.7233088911832496,
+      "recall@10": 0.8333333333333334,
+      "hit@10": 0.8333333333333334,
+      "precision@10": 0.09000000000000004,
+      "mrr": 0.6917989417989417,
       "p@1": 0.6333333333333333,
-      "map": 0.6727777777777778,
+      "map": 0.6852513227513228,
       "case_count": 30
     }
   },

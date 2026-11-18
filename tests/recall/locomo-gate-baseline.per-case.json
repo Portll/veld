@@ -14,7 +14,48 @@
         "conv-42:D1:7"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D13:6",
+          "gold": false,
+          "score": 0.21341862,
+          "bm25": 103.279236,
+          "vector": 0.6650419,
+          "graph": 0.101314925,
+          "cross_encoder": 0.3633452,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D4:1",
+          "gold": false,
+          "score": 0.18676656,
+          "bm25": 82.92457,
+          "vector": 0.61644286,
+          "graph": 0.0802646,
+          "cross_encoder": 0.30747008,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D8:12",
+          "gold": false,
+          "score": 0.17496404,
+          "bm25": 66.58954,
+          "vector": 0.0,
+          "graph": 0.1444711,
+          "cross_encoder": 0.31866422,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q1",
@@ -35,7 +76,48 @@
         "conv-42:D20:2"
       ],
       "recall_at_50": 0.14285714285714285,
-      "recall_at_100": 0.14285714285714285
+      "recall_at_100": 0.14285714285714285,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:12",
+          "gold": true,
+          "score": 0.36614132,
+          "bm25": 73.769035,
+          "vector": 0.018518519,
+          "graph": 0.6462231,
+          "cross_encoder": 0.7237776,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D14:15",
+          "gold": false,
+          "score": 0.18453692,
+          "bm25": 129.85287,
+          "vector": 0.02857143,
+          "graph": 0.061107382,
+          "cross_encoder": 0.3017435,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:5",
+          "gold": false,
+          "score": 0.18094294,
+          "bm25": 80.44262,
+          "vector": 0.008450705,
+          "graph": 0.0,
+          "cross_encoder": 0.3297686,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q10",
@@ -49,7 +131,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 0.5,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D3:1",
+          "gold": true,
+          "score": 0.35674828,
+          "bm25": 97.870514,
+          "vector": 0.57109225,
+          "graph": 0.85486436,
+          "cross_encoder": 0.6936476,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D2:7",
+          "gold": true,
+          "score": 0.32121754,
+          "bm25": 243.11066,
+          "vector": 0.60357416,
+          "graph": 0.48488247,
+          "cross_encoder": 0.511032,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D16:1",
+          "gold": false,
+          "score": 0.23508546,
+          "bm25": 72.4466,
+          "vector": 0.633695,
+          "graph": 1.0,
+          "cross_encoder": 0.38184455,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q100",
@@ -65,7 +188,48 @@
         "conv-42:D2:12"
       ],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D25:15",
+          "gold": false,
+          "score": 0.19238676,
+          "bm25": 80.803566,
+          "vector": 0.043478265,
+          "graph": 0.9226266,
+          "cross_encoder": 0.31424475,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:27",
+          "gold": false,
+          "score": 0.18337865,
+          "bm25": 88.1287,
+          "vector": 0.045454543,
+          "graph": 0.93366814,
+          "cross_encoder": 0.3026932,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D28:25",
+          "gold": false,
+          "score": 0.17479959,
+          "bm25": 93.320366,
+          "vector": 0.041666668,
+          "graph": 0.9509178,
+          "cross_encoder": 0.29062414,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q101",
@@ -81,37 +245,158 @@
         "conv-42:D3:6"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D21:6",
+          "gold": false,
+          "score": 0.54311866,
+          "bm25": 341.37488,
+          "vector": 0.54340315,
+          "graph": 1.0,
+          "cross_encoder": 0.7947925,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D8:19",
+          "gold": false,
+          "score": 0.41948465,
+          "bm25": 286.87585,
+          "vector": 0.48909262,
+          "graph": 0.6888949,
+          "cross_encoder": 0.5931889,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D21:10",
+          "gold": false,
+          "score": 0.41726404,
+          "bm25": 302.9435,
+          "vector": 0.5215262,
+          "graph": 0.9825543,
+          "cross_encoder": 0.5925729,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q102",
       "category": "single_hop",
       "query": "Which dairy-free dessert flavors does Nate enjoy?",
-      "ndcg_at_k": 0.4306765580733931,
+      "ndcg_at_k": 0.5,
       "recall_at_k": 1.0,
-      "mrr": 0.25,
+      "mrr": 0.3333333333333333,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D21:10",
+          "gold": false,
+          "score": 0.38235986,
+          "bm25": 11.6301,
+          "vector": 0.63663906,
+          "graph": 0.053655315,
+          "cross_encoder": 0.80593175,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:9",
+          "gold": false,
+          "score": 0.35971522,
+          "bm25": 26.811832,
+          "vector": 0.6989207,
+          "graph": 0.35619223,
+          "cross_encoder": 0.69997865,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D3:10",
+          "gold": true,
+          "score": 0.35441142,
+          "bm25": 139.21632,
+          "vector": 0.79032147,
+          "graph": 0.26454687,
+          "cross_encoder": 0.6234153,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q103",
       "category": "single_hop",
       "query": "What did Joanna recently watch and recommend to Nate on February 7, 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
-      "p_at_1": 0.0,
+      "ndcg_at_k": 1.0,
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D3:17"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D3:17",
+          "gold": true,
+          "score": 0.077453226,
+          "bm25": 107.78619,
+          "vector": 0.01764706,
+          "graph": 0.17686835,
+          "cross_encoder": 0.20992523,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D3:16",
+          "gold": false,
+          "score": 0.06824793,
+          "bm25": 140.4793,
+          "vector": 0.023076924,
+          "graph": 1.0,
+          "cross_encoder": 0.1554116,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D3:2",
+          "gold": false,
+          "score": 0.06647696,
+          "bm25": 44.83731,
+          "vector": 0.020408163,
+          "graph": 0.07329442,
+          "cross_encoder": 0.2562487,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q104",
@@ -125,23 +410,103 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D3:17",
+          "gold": true,
+          "score": 0.40855736,
+          "bm25": 205.18008,
+          "vector": 0.047619052,
+          "graph": 1.0,
+          "cross_encoder": 0.78310555,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D5:13",
+          "gold": false,
+          "score": 0.12804542,
+          "bm25": 34.57023,
+          "vector": 0.04347826,
+          "graph": 0.33123052,
+          "cross_encoder": 0.22351415,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D13:17",
+          "gold": false,
+          "score": 0.12040497,
+          "bm25": 38.319775,
+          "vector": 0.02439024,
+          "graph": 0.30966192,
+          "cross_encoder": 0.22385086,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q105",
       "category": "single_hop",
       "query": "What flavor of ice cream did Nate make for his friend on 25 February, 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.5,
+      "recall_at_k": 1.0,
+      "mrr": 0.3333333333333333,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D4:3"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D4:1",
+          "gold": false,
+          "score": 0.33504575,
+          "bm25": 238.40152,
+          "vector": 0.56263036,
+          "graph": 0.054759007,
+          "cross_encoder": 0.3978359,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D4:2",
+          "gold": false,
+          "score": 0.23004454,
+          "bm25": 306.6207,
+          "vector": 0.6387858,
+          "graph": 0.048702165,
+          "cross_encoder": 0.21547104,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D4:3",
+          "gold": true,
+          "score": 0.20120902,
+          "bm25": 142.3432,
+          "vector": 0.5990566,
+          "graph": 0.03510448,
+          "cross_encoder": 0.23561527,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q106",
@@ -157,7 +522,48 @@
         "conv-42:D4:16"
       ],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D4:10",
+          "gold": false,
+          "score": 0.18374594,
+          "bm25": 100.71526,
+          "vector": 0.6004619,
+          "graph": 0.095643066,
+          "cross_encoder": 0.2643518,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D15:1",
+          "gold": false,
+          "score": 0.18263113,
+          "bm25": 82.64842,
+          "vector": 0.6095131,
+          "graph": 0.10388819,
+          "cross_encoder": 0.31627518,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D4:18",
+          "gold": false,
+          "score": 0.173711,
+          "bm25": 112.26012,
+          "vector": 0.5894631,
+          "graph": 0.1192459,
+          "cross_encoder": 0.2403291,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q107",
@@ -171,7 +577,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D28:25",
+          "gold": false,
+          "score": 0.3502556,
+          "bm25": 175.65398,
+          "vector": 0.6336238,
+          "graph": 0.46746725,
+          "cross_encoder": 0.6304678,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:27",
+          "gold": false,
+          "score": 0.22528945,
+          "bm25": 84.4941,
+          "vector": 0.7454548,
+          "graph": 0.8001668,
+          "cross_encoder": 0.36942035,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D5:6",
+          "gold": true,
+          "score": 0.20976979,
+          "bm25": 91.99215,
+          "vector": 0.63281715,
+          "graph": 0.46252716,
+          "cross_encoder": 0.40029234,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q108",
@@ -186,8 +633,49 @@
       "missed": [
         "conv-42:D5:8"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D5:6",
+          "gold": false,
+          "score": 0.14758861,
+          "bm25": 64.98482,
+          "vector": 0.6082003,
+          "graph": 0.3178042,
+          "cross_encoder": 0.28252968,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:15",
+          "gold": false,
+          "score": 0.14306521,
+          "bm25": 81.36563,
+          "vector": 0.61789924,
+          "graph": 0.3160027,
+          "cross_encoder": 0.25149196,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D28:25",
+          "gold": false,
+          "score": 0.14090812,
+          "bm25": 82.107994,
+          "vector": 0.56296456,
+          "graph": 0.32357046,
+          "cross_encoder": 0.25904125,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q109",
@@ -201,7 +689,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D6:2",
+          "gold": true,
+          "score": 0.33247444,
+          "bm25": 150.34677,
+          "vector": 0.66635144,
+          "graph": 0.9692327,
+          "cross_encoder": 0.6016026,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D29:5",
+          "gold": false,
+          "score": 0.14138715,
+          "bm25": 11.405069,
+          "vector": 0.62881076,
+          "graph": 0.94915336,
+          "cross_encoder": 0.30203506,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D28:30",
+          "gold": false,
+          "score": 0.10131003,
+          "bm25": 15.607923,
+          "vector": 0.5463374,
+          "graph": 0.9590635,
+          "cross_encoder": 0.19937405,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q11",
@@ -217,21 +746,103 @@
         "conv-42:D4:4"
       ],
       "recall_at_50": 0.6666666666666666,
-      "recall_at_100": 0.6666666666666666
+      "recall_at_100": 0.6666666666666666,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D2:23",
+          "gold": true,
+          "score": 0.4075866,
+          "bm25": 83.85533,
+          "vector": 0.54170966,
+          "graph": 0.9504413,
+          "cross_encoder": 0.68923014,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D5:11",
+          "gold": true,
+          "score": 0.3407403,
+          "bm25": 85.50952,
+          "vector": 0.5132467,
+          "graph": 0.98175305,
+          "cross_encoder": 0.5627189,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D12:8",
+          "gold": false,
+          "score": 0.23005246,
+          "bm25": 0.0,
+          "vector": 0.5389175,
+          "graph": 0.056609884,
+          "cross_encoder": 0.4910555,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q110",
       "category": "single_hop",
       "query": "Why did Nate choose the hair color he did?",
-      "ndcg_at_k": 0.5,
+      "ndcg_at_k": 1.0,
       "recall_at_k": 1.0,
-      "mrr": 0.3333333333333333,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D7:5",
+          "gold": true,
+          "score": 0.22431424,
+          "bm25": 323.56085,
+          "vector": 0.46270642,
+          "graph": 0.43697244,
+          "cross_encoder": 0.25227544,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D7:4",
+          "gold": false,
+          "score": 0.21865895,
+          "bm25": 441.68234,
+          "vector": 0.47237918,
+          "graph": 1.0,
+          "cross_encoder": 0.19522855,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D7:1",
+          "gold": false,
+          "score": 0.19078037,
+          "bm25": 174.85565,
+          "vector": 0.6305441,
+          "graph": 0.6120056,
+          "cross_encoder": 0.31706244,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q111",
@@ -245,21 +856,116 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D8:19",
+          "gold": true,
+          "score": 0.28904906,
+          "bm25": 139.87129,
+          "vector": 0.51982397,
+          "graph": 0.056542274,
+          "cross_encoder": 0.5607265,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:6",
+          "gold": false,
+          "score": 0.26992297,
+          "bm25": 137.59113,
+          "vector": 0.44089657,
+          "graph": 0.28717312,
+          "cross_encoder": 0.5352268,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D16:8",
+          "gold": false,
+          "score": 0.22503015,
+          "bm25": 164.93454,
+          "vector": 0.55964947,
+          "graph": 0.26760373,
+          "cross_encoder": 0.30695796,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q112",
       "category": "single_hop",
       "query": "What is Joanna's project called in the writers group?",
-      "ndcg_at_k": 0.38685280723454163,
+      "ndcg_at_k": 0.4306765580733931,
       "recall_at_k": 1.0,
-      "mrr": 0.2,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D9:1",
+          "gold": false,
+          "score": 0.23812005,
+          "bm25": 203.0147,
+          "vector": 0.55028516,
+          "graph": 0.07958879,
+          "cross_encoder": 0.339073,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D19:6",
+          "gold": false,
+          "score": 0.23147285,
+          "bm25": 197.7913,
+          "vector": 0.51871485,
+          "graph": 0.07127506,
+          "cross_encoder": 0.33826798,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D9:2",
+          "gold": false,
+          "score": 0.16536087,
+          "bm25": 148.08357,
+          "vector": 0.5649844,
+          "graph": 0.07957787,
+          "cross_encoder": 0.19120497,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 4,
+          "id": "conv-42:D9:3",
+          "gold": true,
+          "score": 0.16001363,
+          "bm25": 115.13863,
+          "vector": 0.0,
+          "graph": 0.044929247,
+          "cross_encoder": 0.22472927,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q113",
@@ -273,23 +979,103 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:13",
+          "gold": false,
+          "score": 0.5175751,
+          "bm25": 264.9739,
+          "vector": 0.6992641,
+          "graph": 0.16502418,
+          "cross_encoder": 0.80524915,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D9:10",
+          "gold": true,
+          "score": 0.22774386,
+          "bm25": 75.13885,
+          "vector": 0.67543864,
+          "graph": 0.16740991,
+          "cross_encoder": 0.4543724,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D1:12",
+          "gold": false,
+          "score": 0.20678379,
+          "bm25": 91.87012,
+          "vector": 0.6523086,
+          "graph": 0.15719739,
+          "cross_encoder": 0.39705598,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q114",
       "category": "single_hop",
       "query": "What kind of books does Nate enjoy?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
-      "p_at_1": 0.0,
+      "ndcg_at_k": 1.0,
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D9:14"
-      ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "relevant_found": 1,
+      "missed": [],
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D9:14",
+          "gold": true,
+          "score": 0.3190572,
+          "bm25": 151.13507,
+          "vector": 0.6516734,
+          "graph": 0.08944773,
+          "cross_encoder": 0.6625631,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D8:3",
+          "gold": false,
+          "score": 0.25148442,
+          "bm25": 79.81163,
+          "vector": 0.6985612,
+          "graph": 0.6733227,
+          "cross_encoder": 0.47317618,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D19:13",
+          "gold": false,
+          "score": 0.2431028,
+          "bm25": 110.14176,
+          "vector": 0.0,
+          "graph": 0.089870706,
+          "cross_encoder": 0.47707006,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q115",
@@ -303,7 +1089,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D9:9",
+          "gold": true,
+          "score": 0.37969965,
+          "bm25": 191.54807,
+          "vector": 0.5427531,
+          "graph": 0.05113024,
+          "cross_encoder": 0.6172138,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D1:10",
+          "gold": false,
+          "score": 0.17591314,
+          "bm25": 92.062035,
+          "vector": 0.4892094,
+          "graph": 0.14063504,
+          "cross_encoder": 0.31280836,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D3:1",
+          "gold": false,
+          "score": 0.17174979,
+          "bm25": 73.01548,
+          "vector": 0.490331,
+          "graph": 0.043308407,
+          "cross_encoder": 0.30504364,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q116",
@@ -317,7 +1144,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D9:10",
+          "gold": true,
+          "score": 0.262727,
+          "bm25": 177.9617,
+          "vector": 0.04166667,
+          "graph": 0.06748935,
+          "cross_encoder": 0.52287483,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D23:15",
+          "gold": false,
+          "score": 0.16691467,
+          "bm25": 44.129204,
+          "vector": 0.047619052,
+          "graph": 0.051284853,
+          "cross_encoder": 0.35668212,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D27:19",
+          "gold": false,
+          "score": 0.10589445,
+          "bm25": 101.88623,
+          "vector": 0.03571429,
+          "graph": 0.03485329,
+          "cross_encoder": 0.19508311,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q117",
@@ -331,7 +1199,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D10:9",
+          "gold": false,
+          "score": 0.10560957,
+          "bm25": 185.07281,
+          "vector": 0.045454543,
+          "graph": 0.036472693,
+          "cross_encoder": 0.25430202,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D10:11",
+          "gold": true,
+          "score": 0.10360038,
+          "bm25": 120.69005,
+          "vector": 0.01010101,
+          "graph": 0.044532202,
+          "cross_encoder": 0.38275298,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D21:14",
+          "gold": false,
+          "score": 0.070182726,
+          "bm25": 113.33971,
+          "vector": 0.047619045,
+          "graph": 0.5103569,
+          "cross_encoder": 0.24118888,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q118",
@@ -345,38 +1254,160 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D10:9",
+          "gold": false,
+          "score": 0.14897175,
+          "bm25": 138.31946,
+          "vector": 0.62134016,
+          "graph": 0.045173492,
+          "cross_encoder": 0.25256935,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D10:11",
+          "gold": true,
+          "score": 0.13099377,
+          "bm25": 132.46779,
+          "vector": 0.40611893,
+          "graph": 0.061134648,
+          "cross_encoder": 0.40023637,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D10:10",
+          "gold": false,
+          "score": 0.12019526,
+          "bm25": 129.43945,
+          "vector": 0.45588183,
+          "graph": 1.0,
+          "cross_encoder": 0.1821362,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q119",
       "category": "single_hop",
       "query": "What does Nate feel he could do when out in cool places like Whispering Falls?",
-      "ndcg_at_k": 1.0,
+      "ndcg_at_k": 0.6309297535714574,
       "recall_at_k": 1.0,
-      "mrr": 1.0,
-      "p_at_1": 1.0,
+      "mrr": 0.5,
+      "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D11:8",
+          "gold": false,
+          "score": 0.1496621,
+          "bm25": 315.9451,
+          "vector": 0.55331236,
+          "graph": 0.016882522,
+          "cross_encoder": 0.19423372,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D11:13",
+          "gold": true,
+          "score": 0.124019384,
+          "bm25": 151.63939,
+          "vector": 0.0,
+          "graph": 0.087418474,
+          "cross_encoder": 0.10276251,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:21",
+          "gold": false,
+          "score": 0.12202888,
+          "bm25": 69.97945,
+          "vector": 0.5816334,
+          "graph": 0.006141448,
+          "cross_encoder": 0.2124201,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q12",
       "category": "open_domain",
       "query": "What underlying condition might Joanna have based on her allergies?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.3868528072345416,
+      "recall_at_k": 0.5,
+      "mrr": 0.5,
       "p_at_1": 0.0,
       "relevant_total": 2,
-      "relevant_found": 0,
+      "relevant_found": 1,
       "missed": [
-        "conv-42:D5:11",
-        "conv-42:D2:23"
+        "conv-42:D5:11"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "recall_at_50": 0.5,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D12:8",
+          "gold": false,
+          "score": 0.19183166,
+          "bm25": 142.10645,
+          "vector": 0.560844,
+          "graph": 1.0,
+          "cross_encoder": 0.34593317,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D2:23",
+          "gold": true,
+          "score": 0.15824017,
+          "bm25": 79.98874,
+          "vector": 0.46089023,
+          "graph": 0.028067315,
+          "cross_encoder": 0.2973336,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D2:22",
+          "gold": false,
+          "score": 0.12734215,
+          "bm25": 118.74065,
+          "vector": 0.55794835,
+          "graph": 0.58484095,
+          "cross_encoder": 0.21198358,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q120",
@@ -392,7 +1423,48 @@
         "conv-42:D11:16"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D18:2",
+          "gold": false,
+          "score": 0.18996696,
+          "bm25": 108.49044,
+          "vector": 0.5036095,
+          "graph": 0.13877301,
+          "cross_encoder": 0.17085934,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D11:12",
+          "gold": false,
+          "score": 0.13417903,
+          "bm25": 143.53601,
+          "vector": 0.6264672,
+          "graph": 0.031193752,
+          "cross_encoder": 0.20084828,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D18:3",
+          "gold": false,
+          "score": 0.11868026,
+          "bm25": 62.204247,
+          "vector": 0.0,
+          "graph": 0.0,
+          "cross_encoder": 0.06667757,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q121",
@@ -406,37 +1478,184 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D11:17",
+          "gold": true,
+          "score": 0.17370845,
+          "bm25": 315.75333,
+          "vector": 0.025,
+          "graph": 0.044697143,
+          "cross_encoder": 0.2675485,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D8:5",
+          "gold": false,
+          "score": 0.14313048,
+          "bm25": 102.95809,
+          "vector": 0.02857143,
+          "graph": 0.33616823,
+          "cross_encoder": 0.25314656,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D11:18",
+          "gold": false,
+          "score": 0.13044743,
+          "bm25": 270.59045,
+          "vector": 0.02857143,
+          "graph": 0.5470163,
+          "cross_encoder": 0.19504154,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q122",
       "category": "single_hop",
       "query": "What did Nate do for Joanna on 25 May, 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
-      "p_at_1": 0.0,
-      "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D13:9"
-      ],
-      "recall_at_50": 1.0,
-      "recall_at_100": 1.0
-    },
-    {
-      "case_id": "conv-42_q123",
-      "category": "single_hop",
-      "query": "How does Nate describe the stuffed animal he got for Joanna?",
-      "ndcg_at_k": 0.4306765580733931,
+      "ndcg_at_k": 0.2890648263178878,
       "recall_at_k": 1.0,
-      "mrr": 0.25,
+      "mrr": 0.1,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D13:22",
+          "gold": false,
+          "score": 0.20803721,
+          "bm25": 23.584148,
+          "vector": 0.0,
+          "graph": 0.9853469,
+          "cross_encoder": 0.3864122,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D13:21",
+          "gold": false,
+          "score": 0.1903494,
+          "bm25": 23.58009,
+          "vector": 0.6457169,
+          "graph": 0.9646345,
+          "cross_encoder": 0.3415714,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D13:17",
+          "gold": false,
+          "score": 0.17977585,
+          "bm25": 22.524513,
+          "vector": 0.63030034,
+          "graph": 0.9854154,
+          "cross_encoder": 0.3395586,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 10,
+          "id": "conv-42:D13:9",
+          "gold": true,
+          "score": 0.1363654,
+          "bm25": 26.704144,
+          "vector": 0.0,
+          "graph": 0.0,
+          "cross_encoder": 0.2354328,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
+    },
+    {
+      "case_id": "conv-42_q123",
+      "category": "single_hop",
+      "query": "How does Nate describe the stuffed animal he got for Joanna?",
+      "ndcg_at_k": 0.38685280723454163,
+      "recall_at_k": 1.0,
+      "mrr": 0.2,
+      "p_at_1": 0.0,
+      "relevant_total": 1,
+      "relevant_found": 1,
+      "missed": [],
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D13:14",
+          "gold": false,
+          "score": 0.29370058,
+          "bm25": 151.95361,
+          "vector": 0.60353124,
+          "graph": 0.074639946,
+          "cross_encoder": 0.4744139,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D24:4",
+          "gold": false,
+          "score": 0.19713713,
+          "bm25": 147.49046,
+          "vector": 0.48967594,
+          "graph": 0.9467089,
+          "cross_encoder": 0.2806954,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D24:7",
+          "gold": false,
+          "score": 0.18736218,
+          "bm25": 170.39984,
+          "vector": 0.5911908,
+          "graph": 0.99988705,
+          "cross_encoder": 0.24181506,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 5,
+          "id": "conv-42:D13:11",
+          "gold": true,
+          "score": 0.18359052,
+          "bm25": 166.24664,
+          "vector": 0.5636211,
+          "graph": 1.0,
+          "cross_encoder": 0.24559706,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q124",
@@ -450,21 +1669,103 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:20",
+          "gold": true,
+          "score": 0.18353894,
+          "bm25": 160.04958,
+          "vector": 0.0,
+          "graph": 1.0,
+          "cross_encoder": 0.25021943,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D16:6",
+          "gold": false,
+          "score": 0.12999937,
+          "bm25": 36.106003,
+          "vector": 0.57676715,
+          "graph": 0.009974403,
+          "cross_encoder": 0.2616709,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D14:22",
+          "gold": false,
+          "score": 0.121753216,
+          "bm25": 42.529633,
+          "vector": 0.5594998,
+          "graph": 0.010596592,
+          "cross_encoder": 0.22761782,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q125",
       "category": "single_hop",
       "query": "Who did Nate plan to invite to his gaming party in June 2022?",
-      "ndcg_at_k": 0.3333333333333333,
+      "ndcg_at_k": 0.5,
       "recall_at_k": 1.0,
-      "mrr": 0.14285714285714285,
+      "mrr": 0.3333333333333333,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:20",
+          "gold": false,
+          "score": 0.21464026,
+          "bm25": 164.63284,
+          "vector": 0.032258064,
+          "graph": 1.0,
+          "cross_encoder": 0.33462667,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D16:2",
+          "gold": false,
+          "score": 0.1458875,
+          "bm25": 145.42418,
+          "vector": 0.009375,
+          "graph": 0.024062177,
+          "cross_encoder": 0.2528671,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D14:22",
+          "gold": true,
+          "score": 0.123445325,
+          "bm25": 83.87379,
+          "vector": 0.045454547,
+          "graph": 0.016208105,
+          "cross_encoder": 0.20791607,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q126",
@@ -478,7 +1779,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:24",
+          "gold": true,
+          "score": 0.1774813,
+          "bm25": 129.79535,
+          "vector": 0.0,
+          "graph": 0.04724712,
+          "cross_encoder": 0.35250977,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D14:20",
+          "gold": false,
+          "score": 0.1587328,
+          "bm25": 195.84077,
+          "vector": 0.41991785,
+          "graph": 1.0,
+          "cross_encoder": 0.2115696,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D16:2",
+          "gold": false,
+          "score": 0.15327227,
+          "bm25": 174.515,
+          "vector": 0.0,
+          "graph": 0.048095614,
+          "cross_encoder": 0.24006373,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q127",
@@ -492,7 +1834,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D15:1",
+          "gold": true,
+          "score": 0.58802474,
+          "bm25": 252.22804,
+          "vector": 0.67896795,
+          "graph": 0.5993067,
+          "cross_encoder": 0.8473858,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:2",
+          "gold": false,
+          "score": 0.2850102,
+          "bm25": 116.09842,
+          "vector": 0.0,
+          "graph": 0.04611329,
+          "cross_encoder": 0.53729767,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D27:6",
+          "gold": false,
+          "score": 0.24373639,
+          "bm25": 124.19752,
+          "vector": 0.0,
+          "graph": 0.13668095,
+          "cross_encoder": 0.41992217,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q128",
@@ -506,21 +1889,103 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D15:3",
+          "gold": true,
+          "score": 0.38855797,
+          "bm25": 118.47918,
+          "vector": 0.5153345,
+          "graph": 0.04225483,
+          "cross_encoder": 0.7181763,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D15:2",
+          "gold": false,
+          "score": 0.25539145,
+          "bm25": 88.49573,
+          "vector": 0.50409037,
+          "graph": 0.04188644,
+          "cross_encoder": 0.4394089,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D15:4",
+          "gold": false,
+          "score": 0.22054107,
+          "bm25": 0.0,
+          "vector": 0.52857727,
+          "graph": 0.05136203,
+          "cross_encoder": 0.41284359,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q129",
       "category": "single_hop",
       "query": "Which superhero toy figure does Nate share a photo of?",
-      "ndcg_at_k": 0.4306765580733931,
+      "ndcg_at_k": 1.0,
       "recall_at_k": 1.0,
-      "mrr": 0.25,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D15:4",
+          "gold": true,
+          "score": 0.15158285,
+          "bm25": 9.763071,
+          "vector": 0.41039935,
+          "graph": 0.07640637,
+          "cross_encoder": 0.21726312,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:3",
+          "gold": false,
+          "score": 0.12442492,
+          "bm25": 48.052303,
+          "vector": 0.4257133,
+          "graph": 0.2738162,
+          "cross_encoder": 0.14027841,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D15:3",
+          "gold": false,
+          "score": 0.117642395,
+          "bm25": 117.893906,
+          "vector": 0.0,
+          "graph": 0.070621066,
+          "cross_encoder": 0.1269641,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q13",
@@ -534,7 +1999,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D6:2",
+          "gold": true,
+          "score": 0.49040416,
+          "bm25": 331.01587,
+          "vector": 0.04761905,
+          "graph": 0.055295665,
+          "cross_encoder": 0.8332934,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D2:25",
+          "gold": false,
+          "score": 0.10695258,
+          "bm25": 63.71442,
+          "vector": 0.035714287,
+          "graph": 0.97792315,
+          "cross_encoder": 0.20420581,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D18:1",
+          "gold": false,
+          "score": 0.10014726,
+          "bm25": 64.50902,
+          "vector": 0.022222223,
+          "graph": 0.06162756,
+          "cross_encoder": 0.19091533,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q130",
@@ -548,7 +2054,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D15:7",
+          "gold": true,
+          "score": 0.48843068,
+          "bm25": 341.4594,
+          "vector": 0.04761905,
+          "graph": 0.7181272,
+          "cross_encoder": 0.8511358,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D15:9",
+          "gold": false,
+          "score": 0.18822858,
+          "bm25": 168.78679,
+          "vector": 0.045454547,
+          "graph": 0.7243609,
+          "cross_encoder": 0.3347804,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D15:11",
+          "gold": false,
+          "score": 0.18306363,
+          "bm25": 169.75346,
+          "vector": 0.043478265,
+          "graph": 0.07724921,
+          "cross_encoder": 0.32240808,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q131",
@@ -562,7 +2109,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D15:11",
+          "gold": true,
+          "score": 0.44820789,
+          "bm25": 193.13187,
+          "vector": 0.7046175,
+          "graph": 0.030560449,
+          "cross_encoder": 0.69533145,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D15:9",
+          "gold": false,
+          "score": 0.41698566,
+          "bm25": 188.8984,
+          "vector": 0.80791926,
+          "graph": 1.0,
+          "cross_encoder": 0.5913385,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D15:7",
+          "gold": false,
+          "score": 0.3175959,
+          "bm25": 171.7746,
+          "vector": 0.6996983,
+          "graph": 0.4690755,
+          "cross_encoder": 0.55366546,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q132",
@@ -576,7 +2164,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D16:8",
+          "gold": true,
+          "score": 0.47207054,
+          "bm25": 332.94876,
+          "vector": 0.045454543,
+          "graph": 1.0,
+          "cross_encoder": 0.7842631,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:19",
+          "gold": false,
+          "score": 0.13231431,
+          "bm25": 63.27424,
+          "vector": 0.047619045,
+          "graph": 0.9947423,
+          "cross_encoder": 0.24576183,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D21:4",
+          "gold": false,
+          "score": 0.122774936,
+          "bm25": 37.35753,
+          "vector": 0.032258064,
+          "graph": 0.009111241,
+          "cross_encoder": 0.23348896,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q133",
@@ -590,7 +2219,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D16:6",
+          "gold": true,
+          "score": 0.25433382,
+          "bm25": 142.44458,
+          "vector": 0.6053999,
+          "graph": 1.0,
+          "cross_encoder": 0.22057307,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D16:2",
+          "gold": false,
+          "score": 0.23180233,
+          "bm25": 146.95161,
+          "vector": 0.46367794,
+          "graph": 0.012352968,
+          "cross_encoder": 0.34081492,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D14:20",
+          "gold": false,
+          "score": 0.23174655,
+          "bm25": 164.07736,
+          "vector": 0.47122473,
+          "graph": 0.8177608,
+          "cross_encoder": 0.28731722,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q134",
@@ -605,8 +2275,49 @@
       "missed": [
         "conv-42:D16:10"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D18:12",
+          "gold": false,
+          "score": 0.3828004,
+          "bm25": 111.07977,
+          "vector": 0.03333334,
+          "graph": 0.52563596,
+          "cross_encoder": 0.7514051,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:7",
+          "gold": false,
+          "score": 0.29529262,
+          "bm25": 88.11598,
+          "vector": 0.025641026,
+          "graph": 0.068770185,
+          "cross_encoder": 0.57960576,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D8:22",
+          "gold": false,
+          "score": 0.29053032,
+          "bm25": 81.92448,
+          "vector": 0.035714287,
+          "graph": 0.07029951,
+          "cross_encoder": 0.5633879,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q14",
@@ -622,7 +2333,48 @@
         "conv-42:D7:1"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D24:1",
+          "gold": false,
+          "score": 0.16808967,
+          "bm25": 18.360523,
+          "vector": 0.6559185,
+          "graph": 0.9741131,
+          "cross_encoder": 0.31344762,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D2:2",
+          "gold": false,
+          "score": 0.16774257,
+          "bm25": 15.938609,
+          "vector": 0.6192196,
+          "graph": 0.98568094,
+          "cross_encoder": 0.31873763,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D24:3",
+          "gold": false,
+          "score": 0.16362731,
+          "bm25": 11.545389,
+          "vector": 0.0,
+          "graph": 0.98489815,
+          "cross_encoder": 0.31874168,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q15",
@@ -636,23 +2388,116 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D7:1",
+          "gold": true,
+          "score": 0.15540555,
+          "bm25": 146.53824,
+          "vector": 0.04761905,
+          "graph": 1.0,
+          "cross_encoder": 0.2287592,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D7:2",
+          "gold": false,
+          "score": 0.08725609,
+          "bm25": 87.39173,
+          "vector": 0.0,
+          "graph": 0.11018657,
+          "cross_encoder": 0.10739873,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D7:5",
+          "gold": false,
+          "score": 0.07669174,
+          "bm25": 109.43543,
+          "vector": 0.0,
+          "graph": 0.05648509,
+          "cross_encoder": 0.11550697,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q16",
       "category": "temporal",
       "query": "What physical transformation did Nate undergo in April 2022?",
-      "ndcg_at_k": 0.21840743681816419,
-      "recall_at_k": 0.5,
-      "mrr": 0.16666666666666666,
+      "ndcg_at_k": 0.39780880120575696,
+      "recall_at_k": 1.0,
+      "mrr": 0.14285714285714285,
       "p_at_1": 0.0,
       "relevant_total": 2,
-      "relevant_found": 1,
-      "missed": [
-        "conv-42:D7:3"
-      ],
+      "relevant_found": 2,
+      "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D7:13",
+          "gold": false,
+          "score": 0.10771795,
+          "bm25": 48.43132,
+          "vector": 0.5352036,
+          "graph": 0.9468332,
+          "cross_encoder": 0.17583844,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D8:13",
+          "gold": false,
+          "score": 0.10499434,
+          "bm25": 42.679085,
+          "vector": 0.5757126,
+          "graph": 0.9433279,
+          "cross_encoder": 0.18487248,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D7:12",
+          "gold": false,
+          "score": 0.08977785,
+          "bm25": 48.494846,
+          "vector": 0.46953434,
+          "graph": 0.95561504,
+          "cross_encoder": 0.15039684,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 7,
+          "id": "conv-42:D7:3",
+          "gold": true,
+          "score": 0.08392624,
+          "bm25": 42.187756,
+          "vector": 0.42748472,
+          "graph": 0.0,
+          "cross_encoder": 0.15095897,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q17",
@@ -666,7 +2511,61 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D23:18",
+          "gold": false,
+          "score": 0.23028716,
+          "bm25": 79.70833,
+          "vector": 0.62684613,
+          "graph": 1.0,
+          "cross_encoder": 0.38160384,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D1:18",
+          "gold": false,
+          "score": 0.17790315,
+          "bm25": 77.22658,
+          "vector": 0.6746814,
+          "graph": 0.9830058,
+          "cross_encoder": 0.29823133,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D25:12",
+          "gold": false,
+          "score": 0.17742257,
+          "bm25": 135.45982,
+          "vector": 0.65851396,
+          "graph": 0.9766744,
+          "cross_encoder": 0.25873744,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 4,
+          "id": "conv-42:D10:1",
+          "gold": true,
+          "score": 0.17089942,
+          "bm25": 22.488316,
+          "vector": 0.5425574,
+          "graph": 0.02915783,
+          "cross_encoder": 0.2899726,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q18",
@@ -681,8 +2580,49 @@
       "missed": [
         "conv-42:D11:7"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D11:5",
+          "gold": false,
+          "score": 0.17786634,
+          "bm25": 139.13654,
+          "vector": 0.5873649,
+          "graph": 1.0,
+          "cross_encoder": 0.2831213,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D11:11",
+          "gold": false,
+          "score": 0.11730968,
+          "bm25": 83.39066,
+          "vector": 0.47972065,
+          "graph": 0.054352604,
+          "cross_encoder": 0.21108377,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D8:4",
+          "gold": false,
+          "score": 0.101236336,
+          "bm25": 29.830618,
+          "vector": 0.0,
+          "graph": 0.063581504,
+          "cross_encoder": 0.16866237,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q19",
@@ -696,7 +2636,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D11:3",
+          "gold": true,
+          "score": 0.31843215,
+          "bm25": 196.7777,
+          "vector": 0.75979614,
+          "graph": 0.99694973,
+          "cross_encoder": 0.4532587,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D8:4",
+          "gold": true,
+          "score": 0.27348936,
+          "bm25": 180.6459,
+          "vector": 0.611142,
+          "graph": 1.0,
+          "cross_encoder": 0.4014231,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D14:19",
+          "gold": false,
+          "score": 0.22271033,
+          "bm25": 145.59404,
+          "vector": 0.5836189,
+          "graph": 0.16079016,
+          "cross_encoder": 0.34573287,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q2",
@@ -710,7 +2691,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:18",
+          "gold": true,
+          "score": 0.23929836,
+          "bm25": 36.408363,
+          "vector": 0.047619052,
+          "graph": 0.26896036,
+          "cross_encoder": 0.48901674,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D23:18",
+          "gold": false,
+          "score": 0.13530762,
+          "bm25": 86.45059,
+          "vector": 0.04166667,
+          "graph": 0.2717963,
+          "cross_encoder": 0.26461893,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D25:12",
+          "gold": false,
+          "score": 0.12904996,
+          "bm25": 40.99612,
+          "vector": 0.045454547,
+          "graph": 0.26552778,
+          "cross_encoder": 0.24141249,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q20",
@@ -724,7 +2746,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D12:3",
+          "gold": true,
+          "score": 0.30375937,
+          "bm25": 120.513,
+          "vector": 0.6374358,
+          "graph": 0.98695713,
+          "cross_encoder": 0.5341995,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D13:1",
+          "gold": false,
+          "score": 0.15372775,
+          "bm25": 88.2156,
+          "vector": 0.0,
+          "graph": 0.04270437,
+          "cross_encoder": 0.24866092,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D12:5",
+          "gold": false,
+          "score": 0.14749195,
+          "bm25": 29.087889,
+          "vector": 0.42435408,
+          "graph": 1.0,
+          "cross_encoder": 0.19713615,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q21",
@@ -738,7 +2801,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D12:3",
+          "gold": true,
+          "score": 0.36573964,
+          "bm25": 216.72168,
+          "vector": 0.04,
+          "graph": 1.0,
+          "cross_encoder": 0.49482042,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D12:4",
+          "gold": false,
+          "score": 0.10991302,
+          "bm25": 149.47235,
+          "vector": 0.0,
+          "graph": 0.0,
+          "cross_encoder": 0.033165295,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": false
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D15:12",
+          "gold": false,
+          "score": 0.108042195,
+          "bm25": 96.94146,
+          "vector": 0.02727273,
+          "graph": 0.15218213,
+          "cross_encoder": 0.18808769,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q22",
@@ -755,13 +2859,54 @@
         "conv-42:D12:14"
       ],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D2:3",
+          "gold": false,
+          "score": 0.24055007,
+          "bm25": 85.908875,
+          "vector": 0.04761905,
+          "graph": 0.02659695,
+          "cross_encoder": 0.45818558,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D4:10",
+          "gold": false,
+          "score": 0.22610699,
+          "bm25": 102.09096,
+          "vector": 0.04,
+          "graph": 0.0357949,
+          "cross_encoder": 0.3961326,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D16:1",
+          "gold": false,
+          "score": 0.146045,
+          "bm25": 94.55567,
+          "vector": 0.029411767,
+          "graph": 0.04041297,
+          "cross_encoder": 0.24499491,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q23",
       "category": "multi_hop",
       "query": "Which of Joanna's screenplay were rejected from production companies?",
-      "ndcg_at_k": 0.8304198973631919,
+      "ndcg_at_k": 0.8435378753444458,
       "recall_at_k": 0.8,
       "mrr": 1.0,
       "p_at_1": 1.0,
@@ -771,7 +2916,48 @@
         "conv-42:D2:7"
       ],
       "recall_at_50": 0.8,
-      "recall_at_100": 0.8
+      "recall_at_100": 0.8,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:1",
+          "gold": true,
+          "score": 0.38198218,
+          "bm25": 126.356804,
+          "vector": 0.045454547,
+          "graph": 0.35197222,
+          "cross_encoder": 0.7118109,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D24:12",
+          "gold": true,
+          "score": 0.34331948,
+          "bm25": 137.03557,
+          "vector": 0.047619056,
+          "graph": 1.0,
+          "cross_encoder": 0.59874284,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D24:13",
+          "gold": true,
+          "score": 0.16620459,
+          "bm25": 111.379364,
+          "vector": 0.03571429,
+          "graph": 0.14023647,
+          "cross_encoder": 0.25461102,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q24",
@@ -785,7 +2971,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:20",
+          "gold": true,
+          "score": 0.3998062,
+          "bm25": 198.02113,
+          "vector": 0.6089621,
+          "graph": 1.0,
+          "cross_encoder": 0.7727996,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D16:2",
+          "gold": false,
+          "score": 0.24465027,
+          "bm25": 173.65125,
+          "vector": 0.4910659,
+          "graph": 0.008369369,
+          "cross_encoder": 0.44722557,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:1",
+          "gold": false,
+          "score": 0.12954855,
+          "bm25": 50.857956,
+          "vector": 0.48566163,
+          "graph": 0.008392016,
+          "cross_encoder": 0.25990576,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q25",
@@ -799,7 +3026,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:19",
+          "gold": true,
+          "score": 0.40303424,
+          "bm25": 114.00407,
+          "vector": 0.0,
+          "graph": 1.0,
+          "cross_encoder": 0.6448726,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D11:3",
+          "gold": false,
+          "score": 0.17347534,
+          "bm25": 19.693567,
+          "vector": 0.61433953,
+          "graph": 0.240498,
+          "cross_encoder": 0.2976369,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D11:5",
+          "gold": false,
+          "score": 0.16499506,
+          "bm25": 103.56921,
+          "vector": 0.5728944,
+          "graph": 0.23807667,
+          "cross_encoder": 0.247246,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q26",
@@ -815,7 +3083,48 @@
         "conv-42:D14:8"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D10:4",
+          "gold": false,
+          "score": 0.23344108,
+          "bm25": 19.480526,
+          "vector": 0.57490057,
+          "graph": 0.23290049,
+          "cross_encoder": 0.45361155,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D22:3",
+          "gold": false,
+          "score": 0.15588002,
+          "bm25": 29.986252,
+          "vector": 0.47882265,
+          "graph": 0.2515887,
+          "cross_encoder": 0.28307748,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D19:2",
+          "gold": false,
+          "score": 0.14218879,
+          "bm25": 18.84949,
+          "vector": 0.51150954,
+          "graph": 0.2464408,
+          "cross_encoder": 0.26012287,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q27",
@@ -829,7 +3138,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D2:7",
+          "gold": true,
+          "score": 0.24720298,
+          "bm25": 80.56603,
+          "vector": 0.48567435,
+          "graph": 0.10034439,
+          "cross_encoder": 0.41402406,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D27:12",
+          "gold": false,
+          "score": 0.18236288,
+          "bm25": 116.849464,
+          "vector": 0.62716687,
+          "graph": 0.9696522,
+          "cross_encoder": 0.2999615,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D16:1",
+          "gold": true,
+          "score": 0.16565777,
+          "bm25": 24.253227,
+          "vector": 0.47068536,
+          "graph": 1.0,
+          "cross_encoder": 0.31976295,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q28",
@@ -843,21 +3193,116 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D16:8",
+          "gold": true,
+          "score": 0.47808146,
+          "bm25": 270.63834,
+          "vector": 0.047619056,
+          "graph": 1.0,
+          "cross_encoder": 0.8437629,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:4",
+          "gold": false,
+          "score": 0.17035888,
+          "bm25": 39.733948,
+          "vector": 0.03571429,
+          "graph": 0.03362533,
+          "cross_encoder": 0.3593036,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D18:9",
+          "gold": false,
+          "score": 0.14506367,
+          "bm25": 78.5689,
+          "vector": 0.041666664,
+          "graph": 0.13366319,
+          "cross_encoder": 0.25893956,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q29",
       "category": "temporal",
       "query": "When is Joanna going to make Nate's ice cream for her family?",
-      "ndcg_at_k": 0.2890648263178878,
+      "ndcg_at_k": 0.3010299956639812,
       "recall_at_k": 1.0,
-      "mrr": 0.1,
+      "mrr": 0.1111111111111111,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D4:1",
+          "gold": false,
+          "score": 0.24449393,
+          "bm25": 144.4116,
+          "vector": 0.047619052,
+          "graph": 0.029769009,
+          "cross_encoder": 0.418693,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D29:13",
+          "gold": false,
+          "score": 0.23397829,
+          "bm25": 144.8016,
+          "vector": 0.02702703,
+          "graph": 0.31421414,
+          "cross_encoder": 0.4002754,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D28:1",
+          "gold": false,
+          "score": 0.22640266,
+          "bm25": 73.921036,
+          "vector": 0.034482755,
+          "graph": 0.08033852,
+          "cross_encoder": 0.42181045,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 9,
+          "id": "conv-42:D16:11",
+          "gold": true,
+          "score": 0.14530712,
+          "bm25": 70.515434,
+          "vector": 0.016666666,
+          "graph": 0.29204124,
+          "cross_encoder": 0.27385837,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q3",
@@ -871,24 +3316,120 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:3",
+          "gold": true,
+          "score": 0.44352564,
+          "bm25": 229.8866,
+          "vector": 0.6029677,
+          "graph": 0.48006445,
+          "cross_encoder": 0.74229074,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D14:8",
+          "gold": false,
+          "score": 0.32286787,
+          "bm25": 237.29158,
+          "vector": 0.5850402,
+          "graph": 0.8995695,
+          "cross_encoder": 0.58513916,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D10:4",
+          "gold": false,
+          "score": 0.3082782,
+          "bm25": 55.69066,
+          "vector": 0.64274675,
+          "graph": 1.0,
+          "cross_encoder": 0.6041483,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q30",
       "category": "multi_hop",
       "query": "What kind of writings does Joanna do?",
-      "ndcg_at_k": 0.2429718246796358,
-      "recall_at_k": 0.5,
-      "mrr": 0.14285714285714285,
+      "ndcg_at_k": 0.15101961822780524,
+      "recall_at_k": 0.25,
+      "mrr": 0.2,
       "p_at_1": 0.0,
       "relevant_total": 4,
-      "relevant_found": 2,
+      "relevant_found": 1,
       "missed": [
         "conv-42:D2:3",
-        "conv-42:D17:14"
+        "conv-42:D17:14",
+        "conv-42:D18:1"
       ],
       "recall_at_50": 0.5,
-      "recall_at_100": 0.75
+      "recall_at_100": 0.5,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D18:3",
+          "gold": false,
+          "score": 0.27112016,
+          "bm25": 13.1290045,
+          "vector": 0.6134743,
+          "graph": 0.4143128,
+          "cross_encoder": 0.49100837,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D27:10",
+          "gold": false,
+          "score": 0.25997695,
+          "bm25": 18.157984,
+          "vector": 0.66161263,
+          "graph": 0.06596603,
+          "cross_encoder": 0.47570664,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D4:12",
+          "gold": false,
+          "score": 0.23967347,
+          "bm25": 120.12993,
+          "vector": 0.57774,
+          "graph": 0.07247746,
+          "cross_encoder": 0.36042145,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 5,
+          "id": "conv-42:D18:5",
+          "gold": true,
+          "score": 0.22918949,
+          "bm25": 62.32655,
+          "vector": 0.5091376,
+          "graph": 0.06667141,
+          "cross_encoder": 0.36287424,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q31",
@@ -902,23 +3443,116 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D17:1",
+          "gold": true,
+          "score": 0.48236942,
+          "bm25": 318.91895,
+          "vector": 0.5998387,
+          "graph": 0.036120385,
+          "cross_encoder": 0.81898403,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D14:8",
+          "gold": false,
+          "score": 0.32937706,
+          "bm25": 203.72035,
+          "vector": 0.5790824,
+          "graph": 0.8995695,
+          "cross_encoder": 0.6102904,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D10:4",
+          "gold": false,
+          "score": 0.29080227,
+          "bm25": 38.37651,
+          "vector": 0.6389974,
+          "graph": 1.0,
+          "cross_encoder": 0.571376,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q32",
       "category": "temporal",
       "query": "Where did Joanna travel to in July 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.4306765580733931,
+      "recall_at_k": 1.0,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D17:4"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D17:3",
+          "gold": false,
+          "score": 0.11986296,
+          "bm25": 57.400322,
+          "vector": 0.041666664,
+          "graph": 0.97879046,
+          "cross_encoder": 0.20689122,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D17:14",
+          "gold": false,
+          "score": 0.089956015,
+          "bm25": 53.597523,
+          "vector": 0.015789473,
+          "graph": 0.0,
+          "cross_encoder": 0.14154713,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D17:17",
+          "gold": false,
+          "score": 0.08986166,
+          "bm25": 46.63259,
+          "vector": 0.010752688,
+          "graph": 0.0,
+          "cross_encoder": 0.15222202,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 4,
+          "id": "conv-42:D17:4",
+          "gold": true,
+          "score": 0.089210205,
+          "bm25": 42.103813,
+          "vector": 0.0,
+          "graph": 0.0,
+          "cross_encoder": 0.13605607,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q33",
@@ -932,7 +3566,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D18:5",
+          "gold": true,
+          "score": 0.4956643,
+          "bm25": 136.55707,
+          "vector": 0.5961613,
+          "graph": 0.4390626,
+          "cross_encoder": 0.77725977,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D18:6",
+          "gold": false,
+          "score": 0.16068958,
+          "bm25": 116.69705,
+          "vector": 0.0,
+          "graph": 0.07814626,
+          "cross_encoder": 0.13813949,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D14:5",
+          "gold": false,
+          "score": 0.15028019,
+          "bm25": 140.24057,
+          "vector": 0.496952,
+          "graph": 0.5695958,
+          "cross_encoder": 0.24872059,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q34",
@@ -948,8 +3623,62 @@
         "conv-42:D3:17",
         "conv-42:D19:16"
       ],
-      "recall_at_50": 0.3333333333333333,
-      "recall_at_100": 0.3333333333333333
+      "recall_at_50": 0.6666666666666666,
+      "recall_at_100": 0.6666666666666666,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D8:2",
+          "gold": false,
+          "score": 0.2874641,
+          "bm25": 22.947037,
+          "vector": 0.047619052,
+          "graph": 0.105866954,
+          "cross_encoder": 0.5765749,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D9:15",
+          "gold": false,
+          "score": 0.2692791,
+          "bm25": 20.60329,
+          "vector": 0.045454547,
+          "graph": 0.04025501,
+          "cross_encoder": 0.5248233,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D17:18",
+          "gold": false,
+          "score": 0.22279863,
+          "bm25": 77.55393,
+          "vector": 0.038461536,
+          "graph": 0.10942111,
+          "cross_encoder": 0.41450477,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 8,
+          "id": "conv-42:D19:14",
+          "gold": true,
+          "score": 0.1355262,
+          "bm25": 94.58995,
+          "vector": 0.023076924,
+          "graph": 0.34337124,
+          "cross_encoder": 0.24433544,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q35",
@@ -963,7 +3692,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D19:9",
+          "gold": true,
+          "score": 0.46242735,
+          "bm25": 265.73776,
+          "vector": 0.047619045,
+          "graph": 0.7470394,
+          "cross_encoder": 0.77355593,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D5:10",
+          "gold": false,
+          "score": 0.2693942,
+          "bm25": 164.01889,
+          "vector": 0.045454547,
+          "graph": 0.1589268,
+          "cross_encoder": 0.4857235,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D8:11",
+          "gold": false,
+          "score": 0.15502352,
+          "bm25": 111.48352,
+          "vector": 0.013636364,
+          "graph": 0.04592665,
+          "cross_encoder": 0.29225653,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q36",
@@ -977,7 +3747,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D19:6",
+          "gold": true,
+          "score": 0.5034896,
+          "bm25": 271.9602,
+          "vector": 0.5586628,
+          "graph": 0.04662697,
+          "cross_encoder": 0.74773467,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D9:1",
+          "gold": false,
+          "score": 0.27353665,
+          "bm25": 211.08615,
+          "vector": 0.44954443,
+          "graph": 0.05000283,
+          "cross_encoder": 0.4072384,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D9:2",
+          "gold": false,
+          "score": 0.14711396,
+          "bm25": 149.46046,
+          "vector": 0.40561393,
+          "graph": 0.05227179,
+          "cross_encoder": 0.15654705,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q37",
@@ -991,7 +3802,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D19:1",
+          "gold": true,
+          "score": 0.36600927,
+          "bm25": 127.592384,
+          "vector": 0.04166667,
+          "graph": 1.0,
+          "cross_encoder": 0.6777449,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D10:4",
+          "gold": false,
+          "score": 0.23973994,
+          "bm25": 52.253735,
+          "vector": 0.038461536,
+          "graph": 0.42512962,
+          "cross_encoder": 0.46149778,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D26:12",
+          "gold": false,
+          "score": 0.22547838,
+          "bm25": 119.20988,
+          "vector": 0.047619052,
+          "graph": 0.9224726,
+          "cross_encoder": 0.3754165,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q38",
@@ -1005,7 +3857,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D21:9",
+          "gold": true,
+          "score": 0.22950959,
+          "bm25": 175.78152,
+          "vector": 0.52573,
+          "graph": 0.007529716,
+          "cross_encoder": 0.32628825,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D20:10",
+          "gold": false,
+          "score": 0.14921023,
+          "bm25": 204.63965,
+          "vector": 0.4088512,
+          "graph": 0.005737296,
+          "cross_encoder": 0.16178018,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D21:15",
+          "gold": false,
+          "score": 0.1479258,
+          "bm25": 100.17444,
+          "vector": 0.6065968,
+          "graph": 1.0,
+          "cross_encoder": 0.21390283,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q39",
@@ -1019,7 +3912,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D21:5",
+          "gold": false,
+          "score": 0.20989117,
+          "bm25": 250.64252,
+          "vector": 0.5134383,
+          "graph": 0.05191879,
+          "cross_encoder": 0.3190931,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:4",
+          "gold": true,
+          "score": 0.19575235,
+          "bm25": 194.87056,
+          "vector": 0.52773833,
+          "graph": 0.053581037,
+          "cross_encoder": 0.2936929,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D20:13",
+          "gold": false,
+          "score": 0.12579016,
+          "bm25": 48.199642,
+          "vector": 0.51588076,
+          "graph": 0.024620486,
+          "cross_encoder": 0.19633904,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q4",
@@ -1035,7 +3969,48 @@
         "conv-42:D2:23"
       ],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D24:4",
+          "gold": false,
+          "score": 0.16687673,
+          "bm25": 69.07846,
+          "vector": 0.038461544,
+          "graph": 0.9827521,
+          "cross_encoder": 0.25373244,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D5:9",
+          "gold": false,
+          "score": 0.15430748,
+          "bm25": 66.48999,
+          "vector": 0.045454547,
+          "graph": 0.97746694,
+          "cross_encoder": 0.26114017,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D12:8",
+          "gold": false,
+          "score": 0.1541166,
+          "bm25": 91.81549,
+          "vector": 0.032258064,
+          "graph": 0.05284641,
+          "cross_encoder": 0.25109956,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q40",
@@ -1049,7 +4024,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D21:1",
+          "gold": true,
+          "score": 0.52665347,
+          "bm25": 187.1484,
+          "vector": 0.7386925,
+          "graph": 0.9811934,
+          "cross_encoder": 0.82916313,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:2",
+          "gold": false,
+          "score": 0.18125592,
+          "bm25": 122.01171,
+          "vector": 0.0,
+          "graph": 0.9697608,
+          "cross_encoder": 0.22108005,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D21:3",
+          "gold": false,
+          "score": 0.107350215,
+          "bm25": 0.0,
+          "vector": 0.5070365,
+          "graph": 0.96484673,
+          "cross_encoder": 0.22516716,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q41",
@@ -1065,25 +4081,119 @@
         "conv-42:D22:1"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D21:11",
+          "gold": false,
+          "score": 0.4010823,
+          "bm25": 191.05429,
+          "vector": 0.59348446,
+          "graph": 0.056903467,
+          "cross_encoder": 0.5951204,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:15",
+          "gold": false,
+          "score": 0.27614734,
+          "bm25": 181.10463,
+          "vector": 0.5792108,
+          "graph": 0.16182739,
+          "cross_encoder": 0.3827089,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D21:13",
+          "gold": false,
+          "score": 0.2660496,
+          "bm25": 151.98442,
+          "vector": 0.53702164,
+          "graph": 0.304144,
+          "cross_encoder": 0.39847577,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q42",
       "category": "multi_hop",
       "query": "What movies have both Joanna and Nate seen?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.141266972859829,
+      "recall_at_k": 0.3333333333333333,
+      "mrr": 0.1111111111111111,
       "p_at_1": 0.0,
       "relevant_total": 3,
-      "relevant_found": 0,
+      "relevant_found": 1,
       "missed": [
         "conv-42:D3:17",
-        "conv-42:D10:1",
-        "conv-42:D22:8"
+        "conv-42:D10:1"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.3333333333333333
+      "recall_at_50": 0.3333333333333333,
+      "recall_at_100": 0.6666666666666666,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:12",
+          "gold": false,
+          "score": 0.36479998,
+          "bm25": 100.25293,
+          "vector": 0.047619052,
+          "graph": 0.098417714,
+          "cross_encoder": 0.66111207,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D25:2",
+          "gold": false,
+          "score": 0.27809748,
+          "bm25": 17.036009,
+          "vector": 0.025641026,
+          "graph": 1.0,
+          "cross_encoder": 0.52785265,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D29:1",
+          "gold": false,
+          "score": 0.24083027,
+          "bm25": 18.866962,
+          "vector": 0.045454547,
+          "graph": 0.9960302,
+          "cross_encoder": 0.43156892,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 9,
+          "id": "conv-42:D22:8",
+          "gold": true,
+          "score": 0.15814084,
+          "bm25": 46.679115,
+          "vector": 0.021276595,
+          "graph": 0.052206416,
+          "cross_encoder": 0.3566357,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q43",
@@ -1097,7 +4207,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D22:9",
+          "gold": true,
+          "score": 0.26528963,
+          "bm25": 79.36488,
+          "vector": 0.037037037,
+          "graph": 0.11038229,
+          "cross_encoder": 0.46444225,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D2:3",
+          "gold": false,
+          "score": 0.18253057,
+          "bm25": 88.93007,
+          "vector": 0.043478258,
+          "graph": 0.904824,
+          "cross_encoder": 0.33665773,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D19:6",
+          "gold": false,
+          "score": 0.17619741,
+          "bm25": 106.48116,
+          "vector": 0.045454547,
+          "graph": 0.10624851,
+          "cross_encoder": 0.31241024,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q44",
@@ -1111,7 +4262,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D17:1",
+          "gold": false,
+          "score": 0.34278223,
+          "bm25": 282.60764,
+          "vector": 0.5976871,
+          "graph": 0.0493777,
+          "cross_encoder": 0.5446959,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D22:2",
+          "gold": true,
+          "score": 0.33843502,
+          "bm25": 265.56958,
+          "vector": 0.52867526,
+          "graph": 0.049326092,
+          "cross_encoder": 0.54708326,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D10:4",
+          "gold": false,
+          "score": 0.26332414,
+          "bm25": 92.96373,
+          "vector": 0.596188,
+          "graph": 1.0,
+          "cross_encoder": 0.45223677,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q45",
@@ -1125,7 +4317,48 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D22:9",
+          "gold": true,
+          "score": 0.39610508,
+          "bm25": 114.66149,
+          "vector": 0.021276595,
+          "graph": 0.093336545,
+          "cross_encoder": 0.7064072,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D17:14",
+          "gold": false,
+          "score": 0.18338266,
+          "bm25": 110.72233,
+          "vector": 0.033333335,
+          "graph": 0.8821543,
+          "cross_encoder": 0.34979174,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D19:6",
+          "gold": false,
+          "score": 0.1664483,
+          "bm25": 70.90896,
+          "vector": 0.04166667,
+          "graph": 0.089677945,
+          "cross_encoder": 0.3272152,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q46",
@@ -1139,7 +4372,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D23:7",
+          "gold": true,
+          "score": 0.30237156,
+          "bm25": 105.57886,
+          "vector": 0.5057999,
+          "graph": 0.44625047,
+          "cross_encoder": 0.5427548,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D23:5",
+          "gold": false,
+          "score": 0.26136005,
+          "bm25": 75.5154,
+          "vector": 0.5570304,
+          "graph": 0.22117703,
+          "cross_encoder": 0.47112793,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D16:2",
+          "gold": true,
+          "score": 0.22082315,
+          "bm25": 75.90008,
+          "vector": 0.43565986,
+          "graph": 0.066496275,
+          "cross_encoder": 0.4061514,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q47",
@@ -1153,7 +4427,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D23:1",
+          "gold": true,
+          "score": 0.27102157,
+          "bm25": 94.386215,
+          "vector": 0.04761905,
+          "graph": 0.091672175,
+          "cross_encoder": 0.5052683,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D14:8",
+          "gold": true,
+          "score": 0.2485715,
+          "bm25": 97.917755,
+          "vector": 0.022727273,
+          "graph": 0.05413463,
+          "cross_encoder": 0.4799553,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:2",
+          "gold": false,
+          "score": 0.18522212,
+          "bm25": 60.207718,
+          "vector": 0.045454547,
+          "graph": 0.10060209,
+          "cross_encoder": 0.34920332,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q48",
@@ -1167,26 +4482,53 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D23:1",
+          "gold": true,
+          "score": 0.38013506,
+          "bm25": 133.4901,
+          "vector": 0.045454547,
+          "graph": 0.021498939,
+          "cross_encoder": 0.71951294,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D23:3",
+          "gold": false,
+          "score": 0.1950625,
+          "bm25": 265.0272,
+          "vector": 0.041666668,
+          "graph": 0.023539374,
+          "cross_encoder": 0.3027987,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:13",
+          "gold": false,
+          "score": 0.1418299,
+          "bm25": 134.5338,
+          "vector": 0.027777778,
+          "graph": 1.0,
+          "cross_encoder": 0.2710235,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q49",
       "category": "multi_hop",
       "query": "How many times has Joanna's scripts been rejected?",
-      "ndcg_at_k": 1.0,
-      "recall_at_k": 1.0,
-      "mrr": 1.0,
-      "p_at_1": 1.0,
-      "relevant_total": 2,
-      "relevant_found": 2,
-      "missed": [],
-      "recall_at_50": 1.0,
-      "recall_at_100": 1.0
-    },
-    {
-      "case_id": "conv-42_q5",
-      "category": "multi_hop",
-      "query": "What are Joanna's hobbies?",
       "ndcg_at_k": 0.0,
       "recall_at_k": 0.0,
       "mrr": 0.0,
@@ -1194,11 +4536,109 @@
       "relevant_total": 2,
       "relevant_found": 0,
       "missed": [
-        "conv-42:D1:10",
+        "conv-42:D14:1",
+        "conv-42:D24:12"
+      ],
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D5:1",
+          "gold": false,
+          "score": 0.19916728,
+          "bm25": 70.53721,
+          "vector": 0.4554773,
+          "graph": 0.1033178,
+          "cross_encoder": 0.35057145,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D29:5",
+          "gold": false,
+          "score": 0.17954098,
+          "bm25": 57.394512,
+          "vector": 0.5888331,
+          "graph": 0.6932757,
+          "cross_encoder": 0.32096988,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D28:8",
+          "gold": false,
+          "score": 0.17608412,
+          "bm25": 41.62541,
+          "vector": 0.48091045,
+          "graph": 0.6981988,
+          "cross_encoder": 0.3420968,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
+    },
+    {
+      "case_id": "conv-42_q5",
+      "category": "multi_hop",
+      "query": "What are Joanna's hobbies?",
+      "ndcg_at_k": 0.3065735963827292,
+      "recall_at_k": 0.5,
+      "mrr": 0.3333333333333333,
+      "p_at_1": 0.0,
+      "relevant_total": 2,
+      "relevant_found": 1,
+      "missed": [
         "conv-42:D2:25"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.5
+      "recall_at_50": 0.5,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D12:10",
+          "gold": false,
+          "score": 0.28215772,
+          "bm25": 9.952244,
+          "vector": 0.57307154,
+          "graph": 0.059377667,
+          "cross_encoder": 0.61497235,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D1:2",
+          "gold": false,
+          "score": 0.27570775,
+          "bm25": 88.126976,
+          "vector": 0.58230853,
+          "graph": 0.115821175,
+          "cross_encoder": 0.44061628,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D1:10",
+          "gold": true,
+          "score": 0.26303223,
+          "bm25": 67.87566,
+          "vector": 0.5280002,
+          "graph": 0.06127764,
+          "cross_encoder": 0.5085223,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q50",
@@ -1215,7 +4655,48 @@
         "conv-42:D24:2"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D27:9",
+          "gold": false,
+          "score": 0.2496747,
+          "bm25": 152.70512,
+          "vector": 0.030303031,
+          "graph": 0.063175365,
+          "cross_encoder": 0.473337,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D22:5",
+          "gold": false,
+          "score": 0.20309757,
+          "bm25": 50.46873,
+          "vector": 0.029411765,
+          "graph": 0.06590464,
+          "cross_encoder": 0.42858785,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D24:16",
+          "gold": false,
+          "score": 0.19330165,
+          "bm25": 58.900528,
+          "vector": 0.011363637,
+          "graph": 0.06306948,
+          "cross_encoder": 0.4210003,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q51",
@@ -1231,8 +4712,49 @@
         "conv-42:D13:9",
         "conv-42:D24:2"
       ],
-      "recall_at_50": 0.5,
-      "recall_at_100": 1.0
+      "recall_at_50": 0.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D24:5",
+          "gold": false,
+          "score": 0.16247144,
+          "bm25": 125.10834,
+          "vector": 0.61968803,
+          "graph": 1.0,
+          "cross_encoder": 0.218624,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D24:8",
+          "gold": false,
+          "score": 0.15331148,
+          "bm25": 124.692,
+          "vector": 0.0,
+          "graph": 0.99475145,
+          "cross_encoder": 0.22119334,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D24:4",
+          "gold": false,
+          "score": 0.13733749,
+          "bm25": 98.527565,
+          "vector": 0.0,
+          "graph": 0.88948625,
+          "cross_encoder": 0.19198655,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q52",
@@ -1246,7 +4768,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D27:6",
+          "gold": false,
+          "score": 0.36055225,
+          "bm25": 163.37762,
+          "vector": 0.023255814,
+          "graph": 0.11404754,
+          "cross_encoder": 0.6362226,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D15:1",
+          "gold": true,
+          "score": 0.29834837,
+          "bm25": 131.33696,
+          "vector": 0.037037037,
+          "graph": 0.019243268,
+          "cross_encoder": 0.5157012,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D25:2",
+          "gold": true,
+          "score": 0.29272264,
+          "bm25": 116.03666,
+          "vector": 0.00952381,
+          "graph": 0.020093597,
+          "cross_encoder": 0.5235956,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q53",
@@ -1262,7 +4825,48 @@
         "conv-42:D5:4"
       ],
       "recall_at_50": 0.5,
-      "recall_at_100": 1.0
+      "recall_at_100": 0.5,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D25:15",
+          "gold": true,
+          "score": 0.38616034,
+          "bm25": 206.11728,
+          "vector": 0.6666325,
+          "graph": 1.0,
+          "cross_encoder": 0.6080612,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D24:9",
+          "gold": false,
+          "score": 0.1865463,
+          "bm25": 166.78674,
+          "vector": 0.4697856,
+          "graph": 0.23805709,
+          "cross_encoder": 0.24297026,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D29:6",
+          "gold": false,
+          "score": 0.16051899,
+          "bm25": 52.22606,
+          "vector": 0.54785085,
+          "graph": 0.037032314,
+          "cross_encoder": 0.30386847,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q54",
@@ -1278,13 +4882,54 @@
         "conv-42:D25:1"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D25:2",
+          "gold": false,
+          "score": 0.5040733,
+          "bm25": 220.7906,
+          "vector": 0.5108321,
+          "graph": 0.539505,
+          "cross_encoder": 0.76591694,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D27:6",
+          "gold": false,
+          "score": 0.39851475,
+          "bm25": 195.61035,
+          "vector": 0.6820803,
+          "graph": 0.49019945,
+          "cross_encoder": 0.61359173,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D5:1",
+          "gold": false,
+          "score": 0.34203964,
+          "bm25": 166.1468,
+          "vector": 0.52729553,
+          "graph": 1.0,
+          "cross_encoder": 0.5221575,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q55",
       "category": "multi_hop",
       "query": "What is Joanna inspired by?",
-      "ndcg_at_k": 0.5337936505754552,
+      "ndcg_at_k": 0.5407153339336951,
       "recall_at_k": 0.5,
       "mrr": 1.0,
       "p_at_1": 1.0,
@@ -1296,7 +4941,48 @@
         "conv-42:D25:10"
       ],
       "recall_at_50": 0.6666666666666666,
-      "recall_at_100": 0.8333333333333334
+      "recall_at_100": 0.8333333333333334,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D11:11",
+          "gold": true,
+          "score": 0.37809572,
+          "bm25": 20.04613,
+          "vector": 0.5619252,
+          "graph": 0.9291204,
+          "cross_encoder": 0.69629335,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D4:16",
+          "gold": false,
+          "score": 0.35731867,
+          "bm25": 78.02781,
+          "vector": 0.5369036,
+          "graph": 0.9571844,
+          "cross_encoder": 0.63929677,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D15:7",
+          "gold": false,
+          "score": 0.32315674,
+          "bm25": 21.397726,
+          "vector": 0.5429747,
+          "graph": 0.9193922,
+          "cross_encoder": 0.58769226,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q56",
@@ -1313,7 +4999,48 @@
         "conv-42:D26:9"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D13:14",
+          "gold": false,
+          "score": 0.23916431,
+          "bm25": 107.65352,
+          "vector": 0.0,
+          "graph": 0.17139846,
+          "cross_encoder": 0.4149207,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D27:35",
+          "gold": false,
+          "score": 0.18244569,
+          "bm25": 32.716385,
+          "vector": 0.013157895,
+          "graph": 0.1399032,
+          "cross_encoder": 0.30921885,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D25:24",
+          "gold": false,
+          "score": 0.14213853,
+          "bm25": 41.130413,
+          "vector": 0.035714287,
+          "graph": 0.16351297,
+          "cross_encoder": 0.26111206,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q58",
@@ -1333,8 +5060,49 @@
         "conv-42:D19:17",
         "conv-42:D27:23"
       ],
-      "recall_at_50": 0.5,
-      "recall_at_100": 0.6666666666666666
+      "recall_at_50": 0.3333333333333333,
+      "recall_at_100": 0.6666666666666666,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D8:12",
+          "gold": false,
+          "score": 0.2775648,
+          "bm25": 64.04271,
+          "vector": 0.026086958,
+          "graph": 0.5540896,
+          "cross_encoder": 0.55560297,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D13:17",
+          "gold": false,
+          "score": 0.2593681,
+          "bm25": 62.826008,
+          "vector": 0.027777776,
+          "graph": 0.64634275,
+          "cross_encoder": 0.5066838,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D10:15",
+          "gold": false,
+          "score": 0.19866556,
+          "bm25": 61.9796,
+          "vector": 0.015789473,
+          "graph": 0.15873222,
+          "cross_encoder": 0.39071852,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q59",
@@ -1350,7 +5118,61 @@
         "conv-42:D15:9"
       ],
       "recall_at_50": 0.5,
-      "recall_at_100": 0.5
+      "recall_at_100": 0.5,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D13:16",
+          "gold": false,
+          "score": 0.35291535,
+          "bm25": 105.39469,
+          "vector": 0.04761905,
+          "graph": 1.0,
+          "cross_encoder": 0.7019646,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D13:20",
+          "gold": false,
+          "score": 0.23100285,
+          "bm25": 45.65089,
+          "vector": 0.045454547,
+          "graph": 0.30768862,
+          "cross_encoder": 0.5057973,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D27:36",
+          "gold": false,
+          "score": 0.21410197,
+          "bm25": 112.648415,
+          "vector": 0.041666664,
+          "graph": 0.5324468,
+          "cross_encoder": 0.4486999,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 9,
+          "id": "conv-42:D27:34",
+          "gold": true,
+          "score": 0.13767411,
+          "bm25": 134.24712,
+          "vector": 0.032258064,
+          "graph": 0.044815246,
+          "cross_encoder": 0.2621746,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q60",
@@ -1365,8 +5187,49 @@
       "missed": [
         "conv-42:D27:23"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D27:19",
+          "gold": false,
+          "score": 0.13744225,
+          "bm25": 10.38798,
+          "vector": 0.5071975,
+          "graph": 0.980742,
+          "cross_encoder": 0.2797095,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D2:4",
+          "gold": false,
+          "score": 0.11397656,
+          "bm25": 12.972131,
+          "vector": 0.46250752,
+          "graph": 0.99719906,
+          "cross_encoder": 0.15801966,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D26:12",
+          "gold": false,
+          "score": 0.09548017,
+          "bm25": 8.786245,
+          "vector": 0.48097125,
+          "graph": 0.94403064,
+          "cross_encoder": 0.18697838,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q61",
@@ -1384,7 +5247,48 @@
         "conv-42:D27:15"
       ],
       "recall_at_50": 0.3333333333333333,
-      "recall_at_100": 0.3333333333333333
+      "recall_at_100": 0.6666666666666666,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:11",
+          "gold": false,
+          "score": 0.23044075,
+          "bm25": 106.6242,
+          "vector": 0.043478265,
+          "graph": 1.0,
+          "cross_encoder": 0.4105528,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D9:10",
+          "gold": false,
+          "score": 0.21414366,
+          "bm25": 73.666695,
+          "vector": 0.038461544,
+          "graph": 0.4193032,
+          "cross_encoder": 0.41052496,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:15",
+          "gold": false,
+          "score": 0.15697084,
+          "bm25": 86.895134,
+          "vector": 0.02631579,
+          "graph": 0.40938225,
+          "cross_encoder": 0.27597874,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q62",
@@ -1398,7 +5302,48 @@
       "relevant_found": 2,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D14:5",
+          "gold": false,
+          "score": 0.22294663,
+          "bm25": 85.65814,
+          "vector": 0.48914126,
+          "graph": 0.98139584,
+          "cross_encoder": 0.37323108,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D14:1",
+          "gold": true,
+          "score": 0.21792139,
+          "bm25": 97.7071,
+          "vector": 0.47452757,
+          "graph": 1.0,
+          "cross_encoder": 0.3678131,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D18:5",
+          "gold": true,
+          "score": 0.21504131,
+          "bm25": 54.90237,
+          "vector": 0.47878087,
+          "graph": 0.044299558,
+          "cross_encoder": 0.36584473,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q63",
@@ -1412,11 +5357,65 @@
       "relevant_found": 2,
       "missed": [
         "conv-42:D27:1",
-        "conv-42:D1:7",
-        "conv-42:D23:17"
+        "conv-42:D27:23",
+        "conv-42:D1:7"
       ],
       "recall_at_50": 0.8,
-      "recall_at_100": 0.8
+      "recall_at_100": 0.8,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D1:11",
+          "gold": false,
+          "score": 0.47928724,
+          "bm25": 190.6661,
+          "vector": 0.69832855,
+          "graph": 1.0,
+          "cross_encoder": 0.78905547,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D9:10",
+          "gold": false,
+          "score": 0.47116068,
+          "bm25": 138.11905,
+          "vector": 0.71993756,
+          "graph": 0.17544001,
+          "cross_encoder": 0.81412435,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D23:15",
+          "gold": false,
+          "score": 0.42139482,
+          "bm25": 164.28659,
+          "vector": 0.5360996,
+          "graph": 0.6078601,
+          "cross_encoder": 0.6822312,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 4,
+          "id": "conv-42:D10:6",
+          "gold": true,
+          "score": 0.34035698,
+          "bm25": 106.325386,
+          "vector": 0.4328117,
+          "graph": 0.16255109,
+          "cross_encoder": 0.65445113,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q66",
@@ -1434,8 +5433,49 @@
         "conv-42:D25:19",
         "conv-42:D28:25"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_50": 0.25,
+      "recall_at_100": 0.25,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D22:18",
+          "gold": false,
+          "score": 0.14115436,
+          "bm25": 129.82416,
+          "vector": 0.4501895,
+          "graph": 0.8016912,
+          "cross_encoder": 0.17062446,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D10:4",
+          "gold": false,
+          "score": 0.13427117,
+          "bm25": 75.52747,
+          "vector": 0.6388378,
+          "graph": 0.12357525,
+          "cross_encoder": 0.26399767,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D27:21",
+          "gold": false,
+          "score": 0.11785761,
+          "bm25": 151.96243,
+          "vector": 0.5080324,
+          "graph": 0.49552786,
+          "cross_encoder": 0.17073256,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q67",
@@ -1453,7 +5493,48 @@
         "conv-42:D28:23"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D5:10",
+          "gold": false,
+          "score": 0.38734916,
+          "bm25": 73.80483,
+          "vector": 0.6535536,
+          "graph": 0.9747797,
+          "cross_encoder": 0.6907333,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D12:5",
+          "gold": false,
+          "score": 0.324491,
+          "bm25": 69.806015,
+          "vector": 0.5804833,
+          "graph": 0.06033876,
+          "cross_encoder": 0.5742305,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D28:25",
+          "gold": false,
+          "score": 0.29936072,
+          "bm25": 94.877884,
+          "vector": 0.502844,
+          "graph": 0.049958535,
+          "cross_encoder": 0.5229304,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q68",
@@ -1469,7 +5550,61 @@
         "conv-42:D14:21"
       ],
       "recall_at_50": 0.75,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D11:3",
+          "gold": false,
+          "score": 0.3401806,
+          "bm25": 16.334776,
+          "vector": 0.65786844,
+          "graph": 0.9856898,
+          "cross_encoder": 0.59705603,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D11:11",
+          "gold": false,
+          "score": 0.26759747,
+          "bm25": 21.188179,
+          "vector": 0.53572273,
+          "graph": 0.9644849,
+          "cross_encoder": 0.44635516,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D14:19",
+          "gold": false,
+          "score": 0.2589794,
+          "bm25": 16.169502,
+          "vector": 0.46924734,
+          "graph": 0.97411865,
+          "cross_encoder": 0.4669332,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 4,
+          "id": "conv-42:D11:5",
+          "gold": true,
+          "score": 0.2191229,
+          "bm25": 82.13049,
+          "vector": 0.5649981,
+          "graph": 0.9694743,
+          "cross_encoder": 0.32542944,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q73",
@@ -1483,15 +5618,56 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D28:22",
+          "gold": true,
+          "score": 0.10882241,
+          "bm25": 134.32681,
+          "vector": 0.0,
+          "graph": 0.9648465,
+          "cross_encoder": 0.15004662,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D17:3",
+          "gold": false,
+          "score": 0.09235489,
+          "bm25": 11.1407795,
+          "vector": 0.5688542,
+          "graph": 0.9787904,
+          "cross_encoder": 0.1990438,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D25:16",
+          "gold": false,
+          "score": 0.08440519,
+          "bm25": 10.9604,
+          "vector": 0.5631169,
+          "graph": 0.96633136,
+          "cross_encoder": 0.18108127,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q84",
       "category": "open_domain",
       "query": "Was the first half of September 2022 a good month career-wise for Nate and Joanna? Answer yes or no.",
-      "ndcg_at_k": 0.17723928678404774,
+      "ndcg_at_k": 0.21840743681816419,
       "recall_at_k": 0.5,
-      "mrr": 0.1,
+      "mrr": 0.16666666666666666,
       "p_at_1": 0.0,
       "relevant_total": 2,
       "relevant_found": 1,
@@ -1499,7 +5675,61 @@
         "conv-42:D20:1"
       ],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D6:2",
+          "gold": false,
+          "score": 0.1069461,
+          "bm25": 27.014538,
+          "vector": 0.038461544,
+          "graph": 0.21138796,
+          "cross_encoder": 0.2092538,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D21:2",
+          "gold": false,
+          "score": 0.10693541,
+          "bm25": 79.313255,
+          "vector": 0.0,
+          "graph": 0.090301715,
+          "cross_encoder": 0.16090663,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D20:3",
+          "gold": false,
+          "score": 0.10441378,
+          "bm25": 61.04173,
+          "vector": 0.0,
+          "graph": 0.092691004,
+          "cross_encoder": 0.16847645,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        },
+        {
+          "rank": 6,
+          "id": "conv-42:D21:1",
+          "gold": true,
+          "score": 0.097525015,
+          "bm25": 107.16333,
+          "vector": 0.0,
+          "graph": 0.11751973,
+          "cross_encoder": 0.12582317,
+          "recency": 0.0,
+          "temporal_match": true,
+          "entity_overlap": true
+        }
+      ]
     },
     {
       "case_id": "conv-42_q85",
@@ -1513,7 +5743,61 @@
       "relevant_found": 1,
       "missed": [],
       "recall_at_50": 1.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 1.0,
+      "top": [
+        {
+          "rank": 1,
+          "id": "conv-42:D27:28",
+          "gold": false,
+          "score": 0.14010869,
+          "bm25": 130.28923,
+          "vector": 0.037037037,
+          "graph": 0.09761366,
+          "cross_encoder": 0.19551255,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 2,
+          "id": "conv-42:D27:6",
+          "gold": false,
+          "score": 0.13038936,
+          "bm25": 128.84055,
+          "vector": 0.04347826,
+          "graph": 0.45893216,
+          "cross_encoder": 0.23289806,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 3,
+          "id": "conv-42:D29:2",
+          "gold": false,
+          "score": 0.10436774,
+          "bm25": 94.34527,
+          "vector": 0.032258064,
+          "graph": 0.08876687,
+          "cross_encoder": 0.17694612,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        },
+        {
+          "rank": 4,
+          "id": "conv-42:D29:1",
+          "gold": true,
+          "score": 0.103176415,
+          "bm25": 116.424355,
+          "vector": 0.02,
+          "graph": 0.20321478,
+          "cross_encoder": 0.17047441,
+          "recency": 0.0,
+          "temporal_match": false,
+          "entity_overlap": true
+        }
+      ]
     }
   ]
 }
