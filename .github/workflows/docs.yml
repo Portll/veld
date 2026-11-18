@@ -132,10 +132,11 @@ jobs:
         # RenderContext). Runs against the *built* HTML so it sees what a
         # reader sees. --offline skips external HTTPS so CI never fails on
         # transient network errors; external links are checked weekly in a
-        # separate scheduled workflow.
+        # separate scheduled workflow. lychee 0.24 refuses a relative --base, so root-relative
+        # links resolve against the book's absolute path.
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --offline --base ./docs/book './docs/book/**/*.html'
+          args: --offline --root-dir ${{ github.workspace }}/docs/book './docs/book/**/*.html'
           fail: true
 
       - name: Build rustdoc
