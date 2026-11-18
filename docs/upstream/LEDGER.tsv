@@ -302,7 +302,7 @@ in	d629d659	568	2026-09-24	eval	W0	adapted	fab07f23	reports record the rerank se
 in	18df072a	567	2026-09-25	eval	W0	pending		waiting: the per-leg stage capture with scores and the ce stage it exports are calls in memory/recall.rs, which the cobolwork-de session (fix/hebbian-learned) is rewriting; scripts/stage_diff.py compares nothing without them
 in	2c3eb049	569	2026-09-25	retrieval	W2	pending		
 in	8ccaf6ab	570	2026-09-26	eval	W0	adapted	e31e5111,34c44668	model_tape.rs and its MiniLM, cross-encoder and neural-NER hooks, the harness's record-mode checks and the workflow inputs are in. veld's shipped NER is rule-based code, so NER is taped only when the neural model loads, and only the models that loaded are required; the HTTP and Nomic embedders are not taped; the recording skips the pre-warm pair as it skips the load probe (976e9f86)
-in	d6dd1ce7	571	2026-09-27	retrieval	W2	pending		
+in	d6dd1ce7	571	2026-09-27	retrieval	W2	ported	ed0e64f1	the directional suite, fixtures and generator, with recall-eval --suite directional and the workflow option; upstream stage_export input not ported. First veld run (44252355115, ed0e64f1): p@1 0.500, chance
 in	93a29ba7	572	2026-09-27	eval	W0	adapted	06415c9a	the held-out suite gets the job maximum of 360 minutes; veld's suite input came with #524's port
 in	f22faa2e	574	2026-09-27	eval	W0	adapted	7d964609	reports record the tape they replayed and compare_to_baseline refuses a live run against a replay, or two tapes; the workflow replays the tape pinned in tests/recall/model-tape.json and runs live while no pin exists. veld has no kernel-class check (#566, W2), so there is none to skip
 in	902daf83	573	2026-09-27	ner-entities	W6	pending		
