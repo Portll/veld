@@ -39,7 +39,14 @@ See [decision 0001](docs/src/decisions/0001-redb-migration.md) (amended) and [de
 
 ### Record-schema migration
 
-When you add a field on `Memory`, make it backwards-compatible: `Option<T>` with `#[serde(default)]`. The legacy `bincode1` format support in [Cargo.toml](Cargo.toml) handles pre-2.0 memories. Forward-incompatible changes need an explicit migration in [src/storage/](src/storage/); these are rare and should land paired with a `## Schema Version & CHANGELOG` entry once that section exists (LLM-Wiki Phase 1).
+`Memory` is bincode-encoded by position, and so is every type reachable from it, `Experience` included. `#[serde(default)]` does nothing there: a field added, removed or reordered on any of those types makes every record written before it undecodable (4a54053 appended two fields to `AgentSession` and 24 live records stopped decoding). `tests/persisted_layout.rs` snapshots the traced layout and fails at the commit that changes it.
+
+In order of preference:
+
+1. **Keep the data off the record.** Write-time-only data travels as a parameter, as the graph build's `Option<&TagSources>` does. Data that must persist can live beside the record in the user's key-value keyspace, keyed by memory id, as `memory::tag_sources` does.
+2. **If it must be on the record**, add a legacy decode arm for the old shape (the `Legacy*` structs in [src/memory/storage.rs](src/memory/storage.rs)), then accept the new layout as the header of `tests/persisted_layout.rs` describes.
+
+The legacy `bincode1` format support in [Cargo.toml](Cargo.toml) handles pre-2.0 memories. These changes are rare and should land paired with a `## Schema Version & CHANGELOG` entry once that section exists (LLM-Wiki Phase 1).
 
 ### Distribution-binary scaling
 

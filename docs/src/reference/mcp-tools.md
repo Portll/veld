@@ -6,7 +6,7 @@
 
 # MCP Tools
 
-The TypeScript MCP server (`@veld/memory-mcp`) exposes **54** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
+The TypeScript MCP server (`@veld/memory-mcp`) exposes **55** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
 
 Tools are listed alphabetically. For full parameter schemas, see [mcp-server/index.ts](https://github.com/Portll/veld/blob/main/mcp-server/index.ts).
 
@@ -46,11 +46,12 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `memory_health` | Check memory system status and statistics |
 | `memory_stats` | Get statistics about stored memories |
 | `pending_work` | Show todos and incomplete tasks |
-| `proactive_context` | REQUIRED: Call this tool with EVERY user message to surface relevant memories and build conversation history. Pass the user's message as context. This enables: (1) retrieving memories relevant to what the user is asking, (2) building persistent memory of the conversation for future sessions. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories. Auto-ingest stores the context automatically. USAGE: Always call this FIRST when you receive a user message, passing their message as the context parameter. |
+| `proactive_context` | Surface memories relevant to the current task or question, ranked by entities, semantic similarity and recency. Call it when the task turns to something past sessions may have covered (a decision, a prior bug, a preference); it takes one to several seconds, so do not call it on every message. Pass the task or question as context. Set auto_ingest to true only when the context itself is worth remembering; hooks already record conversation turns. |
 | `query` | What to search for in memories |
 | `quick_recall` | Search your memories for relevant context |
 | `read_memory` | Read the FULL content of a specific memory by ID. Use this when you need to see the complete text of a memory that was truncated in search results. |
 | `recall` | Search memories AND todos using semantic similarity. Returns both relevant memories and matching todos. Use this to find past experiences, decisions, context, or pending work. Modes: 'semantic' (vector similarity), 'associative' (graph traversal), 'hybrid' (combined). |
+| `recall_by_tags` | Find memories by tags, newest first. Returns memories whose writer gave them ANY of the provided tags, e.g. 'decision', 'learning', 'error', 'project:veld'. |
 | `recent_memories` | Show recently created memories |
 | `reorder_todo` | Move a todo up or down within its status group. Use to prioritize tasks manually. |
 | `repair_index` | Repair vector index by re-indexing orphaned memories. Use this when verify_index shows unhealthy status. Returns count of repaired memories. |

@@ -12,7 +12,7 @@ How to use the memory tools well — what to `remember`, what to leave to the au
 
 ### When to call `remember` explicitly
 
-The hook layer encodes most context automatically (Edit/Write/Bash/Read tool patterns, prompt submissions, session-start surfaces). Reach for explicit `remember(content, importance)` only when:
+The hook layer records command failures and subagent completions automatically, and surfaces context at session start, on each prompt and before tools. Reach for explicit `remember(content, importance)` only when:
 
 - A **decision** was made that future sessions need to honour (e.g., "we chose Redb over RocksDB because …" — see [decision 0001](docs/src/decisions/0001-redb-migration.md)).
 - A **user preference** was stated (e.g., "always run cargo check, never cargo build").
@@ -39,6 +39,8 @@ Tags are the cheap "what kind of thing" signal (scoring signal 15). Keep them sh
 - **Status**: `wip`, `blocked`, `done` (mostly for todos)
 
 A memory typically carries one domain + one kind tag (`["storage", "decision"]`); add more only if you'll search by them.
+
+Veld adds derived tags of its own (NER, YAKE, ingest hints, cold-start extraction). After redaction it drops any derived tag without a letter, under two characters, or carrying code punctuation, then keeps the rarest by graph mention count up to `DERIVED_TAG_BUDGET` ([src/entity_cap.rs](src/entity_cap.rs)). The default budget is 50, the record-wide limit, so it cuts nothing: on the recall gate a budget of 12 lost eleven gold documents and 24 lost three (PR #88). `VELD_DERIVED_TAG_BUDGET` lowers it for a store that wants to measure. Authored tags are never counted against it.
 
 ### Citation format
 
