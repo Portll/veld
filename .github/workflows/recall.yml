@@ -31,11 +31,13 @@ on:
           gate is too coarse to settle: whole-case metrics move in steps of 1/n, 0.01 overall and
           0.04 on multi_hop at n=100, both above a 2% allowance. locomo contains the gate's
           conversation; locomo-holdout leaves it out, and every case someone has examined, and
-          is the number to report. Neither is gated.
+          is the number to report. Neither is gated. directional asks who did what to whom over
+          role-swapped twin memories made of the same words (chance is 50% p@1); diagnostic, not
+          gated.
         required: false
         default: 'locomo-gate'
         type: choice
-        options: ['locomo-gate', 'locomo', 'locomo-holdout']
+        options: ['locomo-gate', 'locomo', 'locomo-holdout', 'directional']
       record:
         description: 'Record a new baseline: run ungated and upload the reports'
         required: false

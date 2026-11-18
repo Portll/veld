@@ -17,6 +17,18 @@ This directory holds the fixtures, ground truth, and frozen baselines for the re
 The gate compares veld with veld: upstream's published numbers are hypotheses to test, never a
 reason to accept or decline a port (`docs/upstream/PLAN.md`, 1.5).
 
+## Who did what to whom (`directional`)
+
+`directional` (ported from upstream #571) asks 240 questions over 60 pairs of twin memories made
+of exactly the same words with the roles swapped ("Priya invited Caroline …" and "Caroline invited
+Priya …"), in three categories: `dir_object` ("Who did Priya invite?"), `dir_subject` ("Who invited
+Caroline?") and `dir_passive` (the same questions over passive memories). Each question's twin is
+its decisive distractor, so a retriever that ignores direction scores exactly 0.5 p@1. Upstream
+measured the embedder at cosine 0.979 between twins and 51% correct. Diagnostic, not gated:
+`gh workflow run recall.yml -f suite=directional -f record=true`. The fixtures test
+`directional_fixtures_give_every_gold_a_same_words_twin` pins the twin property; the generator is
+`benchmarks/build_directional_suite.py`.
+
 ## The gate baseline (`locomo-gate`)
 
 `.github/workflows/recall.yml` runs the 100-case `locomo-gate` suite and compares each engine's
