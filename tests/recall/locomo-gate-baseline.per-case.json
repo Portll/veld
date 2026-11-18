@@ -41,17 +41,15 @@
       "case_id": "conv-42_q10",
       "category": "multi_hop",
       "query": "What emotions is Joanna feeling about  the screenplay she submitted?",
-      "ndcg_at_k": 0.3065735963827292,
-      "recall_at_k": 0.5,
-      "mrr": 0.3333333333333333,
-      "p_at_1": 0.0,
+      "ndcg_at_k": 1.0,
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 2,
-      "relevant_found": 1,
-      "missed": [
-        "conv-42:D2:7"
-      ],
+      "relevant_found": 2,
+      "missed": [],
       "recall_at_50": 0.5,
-      "recall_at_100": 0.5
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q100",
@@ -66,8 +64,8 @@
       "missed": [
         "conv-42:D2:12"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q101",
@@ -89,9 +87,9 @@
       "case_id": "conv-42_q102",
       "category": "single_hop",
       "query": "Which dairy-free dessert flavors does Nate enjoy?",
-      "ndcg_at_k": 0.5,
+      "ndcg_at_k": 0.4306765580733931,
       "recall_at_k": 1.0,
-      "mrr": 0.3333333333333333,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
@@ -103,13 +101,15 @@
       "case_id": "conv-42_q103",
       "category": "single_hop",
       "query": "What did Joanna recently watch and recommend to Nate on February 7, 2022?",
-      "ndcg_at_k": 0.2890648263178878,
-      "recall_at_k": 1.0,
-      "mrr": 0.1,
+      "ndcg_at_k": 0.0,
+      "recall_at_k": 0.0,
+      "mrr": 0.0,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 1,
-      "missed": [],
+      "relevant_found": 0,
+      "missed": [
+        "conv-42:D3:17"
+      ],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -140,27 +140,13 @@
       "missed": [
         "conv-42:D4:3"
       ],
-      "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q106",
       "category": "single_hop",
       "query": "What inspired Joanna's new screenplay on 25 February, 2022?",
-      "ndcg_at_k": 0.3562071871080222,
-      "recall_at_k": 1.0,
-      "mrr": 0.16666666666666666,
-      "p_at_1": 0.0,
-      "relevant_total": 1,
-      "relevant_found": 1,
-      "missed": [],
-      "recall_at_50": 1.0,
-      "recall_at_100": 1.0
-    },
-    {
-      "case_id": "conv-42_q107",
-      "category": "single_hop",
-      "query": "Why does Nate like turtles as pets?",
       "ndcg_at_k": 0.0,
       "recall_at_k": 0.0,
       "mrr": 0.0,
@@ -168,8 +154,22 @@
       "relevant_total": 1,
       "relevant_found": 0,
       "missed": [
-        "conv-42:D5:6"
+        "conv-42:D4:16"
       ],
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0
+    },
+    {
+      "case_id": "conv-42_q107",
+      "category": "single_hop",
+      "query": "Why does Nate like turtles as pets?",
+      "ndcg_at_k": 0.5,
+      "recall_at_k": 1.0,
+      "mrr": 0.3333333333333333,
+      "p_at_1": 0.0,
+      "relevant_total": 1,
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -187,7 +187,7 @@
         "conv-42:D5:8"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q109",
@@ -223,9 +223,9 @@
       "case_id": "conv-42_q110",
       "category": "single_hop",
       "query": "Why did Nate choose the hair color he did?",
-      "ndcg_at_k": 0.6309297535714574,
+      "ndcg_at_k": 0.5,
       "recall_at_k": 1.0,
-      "mrr": 0.5,
+      "mrr": 0.3333333333333333,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
@@ -237,15 +237,13 @@
       "case_id": "conv-42_q111",
       "category": "single_hop",
       "query": "What are the main ingredients of the ice cream recipe shared by Nate?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
-      "p_at_1": 0.0,
+      "ndcg_at_k": 1.0,
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D8:19"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -253,15 +251,13 @@
       "case_id": "conv-42_q112",
       "category": "single_hop",
       "query": "What is Joanna's project called in the writers group?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.38685280723454163,
+      "recall_at_k": 1.0,
+      "mrr": 0.2,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D9:3"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -293,7 +289,7 @@
         "conv-42:D9:14"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q115",
@@ -341,9 +337,9 @@
       "case_id": "conv-42_q118",
       "category": "single_hop",
       "query": "What kind of frosting did Joanna use on the cake she made recently in May 2022?",
-      "ndcg_at_k": 0.3562071871080222,
+      "ndcg_at_k": 0.6309297535714574,
       "recall_at_k": 1.0,
-      "mrr": 0.16666666666666666,
+      "mrr": 0.5,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
@@ -380,7 +376,7 @@
         "conv-42:D2:23"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q120",
@@ -396,16 +392,16 @@
         "conv-42:D11:16"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q121",
       "category": "single_hop",
       "query": "Who invited Nate to join her on the trails sometime?",
-      "ndcg_at_k": 0.6309297535714574,
+      "ndcg_at_k": 1.0,
       "recall_at_k": 1.0,
-      "mrr": 0.5,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
@@ -425,7 +421,7 @@
       "missed": [
         "conv-42:D13:9"
       ],
-      "recall_at_50": 0.0,
+      "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
     {
@@ -460,31 +456,27 @@
       "case_id": "conv-42_q125",
       "category": "single_hop",
       "query": "Who did Nate plan to invite to his gaming party in June 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.3333333333333333,
+      "recall_at_k": 1.0,
+      "mrr": 0.14285714285714285,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D14:22"
-      ],
-      "recall_at_50": 0.0,
+      "relevant_found": 1,
+      "missed": [],
+      "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q126",
       "category": "single_hop",
       "query": "What special items did Nate get for everyone at his gaming party?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
-      "p_at_1": 0.0,
+      "ndcg_at_k": 1.0,
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D14:24"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -520,15 +512,13 @@
       "case_id": "conv-42_q129",
       "category": "single_hop",
       "query": "Which superhero toy figure does Nate share a photo of?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.4306765580733931,
+      "recall_at_k": 1.0,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D15:4"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -564,10 +554,10 @@
       "case_id": "conv-42_q131",
       "category": "single_hop",
       "query": "What does the photo on Joanna's cork board remind her of?",
-      "ndcg_at_k": 0.6309297535714574,
+      "ndcg_at_k": 1.0,
       "recall_at_k": 1.0,
-      "mrr": 0.5,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
@@ -652,32 +642,29 @@
       "case_id": "conv-42_q16",
       "category": "temporal",
       "query": "What physical transformation did Nate undergo in April 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.21840743681816419,
+      "recall_at_k": 0.5,
+      "mrr": 0.16666666666666666,
       "p_at_1": 0.0,
       "relevant_total": 2,
-      "relevant_found": 0,
+      "relevant_found": 1,
       "missed": [
-        "conv-42:D7:1",
         "conv-42:D7:3"
       ],
-      "recall_at_50": 0.0,
+      "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q17",
       "category": "temporal",
       "query": "What movie did Joanna watch on 1 May, 2022?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.4306765580733931,
+      "recall_at_k": 1.0,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 1,
-      "relevant_found": 0,
-      "missed": [
-        "conv-42:D10:1"
-      ],
+      "relevant_found": 1,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -695,7 +682,7 @@
         "conv-42:D11:7"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q19",
@@ -784,7 +771,7 @@
         "conv-42:D2:7"
       ],
       "recall_at_50": 0.8,
-      "recall_at_100": 1.0
+      "recall_at_100": 0.8
     },
     {
       "case_id": "conv-42_q24",
@@ -834,10 +821,10 @@
       "case_id": "conv-42_q27",
       "category": "multi_hop",
       "query": "What places has Joanna submitted her work to?",
-      "ndcg_at_k": 0.430624116386567,
+      "ndcg_at_k": 0.9197207891481876,
       "recall_at_k": 1.0,
-      "mrr": 0.2,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 2,
       "relevant_found": 2,
       "missed": [],
@@ -862,9 +849,9 @@
       "case_id": "conv-42_q29",
       "category": "temporal",
       "query": "When is Joanna going to make Nate's ice cream for her family?",
-      "ndcg_at_k": 0.4306765580733931,
+      "ndcg_at_k": 0.2890648263178878,
       "recall_at_k": 1.0,
-      "mrr": 0.25,
+      "mrr": 0.1,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
@@ -890,17 +877,15 @@
       "case_id": "conv-42_q30",
       "category": "multi_hop",
       "query": "What kind of writings does Joanna do?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.2429718246796358,
+      "recall_at_k": 0.5,
+      "mrr": 0.14285714285714285,
       "p_at_1": 0.0,
       "relevant_total": 4,
-      "relevant_found": 0,
+      "relevant_found": 2,
       "missed": [
         "conv-42:D2:3",
-        "conv-42:D17:14",
-        "conv-42:D18:1",
-        "conv-42:D18:5"
+        "conv-42:D17:14"
       ],
       "recall_at_50": 0.5,
       "recall_at_100": 0.75
@@ -909,10 +894,10 @@
       "case_id": "conv-42_q31",
       "category": "temporal",
       "query": "When did Nate win his fourth video game tournament?",
-      "ndcg_at_k": 0.4306765580733931,
+      "ndcg_at_k": 1.0,
       "recall_at_k": 1.0,
-      "mrr": 0.25,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 1,
       "relevant_found": 1,
       "missed": [],
@@ -932,7 +917,7 @@
       "missed": [
         "conv-42:D17:4"
       ],
-      "recall_at_50": 0.0,
+      "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
     {
@@ -953,15 +938,14 @@
       "case_id": "conv-42_q34",
       "category": "multi_hop",
       "query": "What book recommendations has Joanna given to Nate?",
-      "ndcg_at_k": 0.0,
-      "recall_at_k": 0.0,
-      "mrr": 0.0,
+      "ndcg_at_k": 0.14804095548293264,
+      "recall_at_k": 0.3333333333333333,
+      "mrr": 0.125,
       "p_at_1": 0.0,
       "relevant_total": 3,
-      "relevant_found": 0,
+      "relevant_found": 1,
       "missed": [
         "conv-42:D3:17",
-        "conv-42:D19:14",
         "conv-42:D19:16"
       ],
       "recall_at_50": 0.3333333333333333,
@@ -1027,9 +1011,9 @@
       "case_id": "conv-42_q39",
       "category": "temporal",
       "query": "When did Nate attend a cooking show?",
-      "ndcg_at_k": 0.38685280723454163,
+      "ndcg_at_k": 0.6309297535714574,
       "recall_at_k": 1.0,
-      "mrr": 0.2,
+      "mrr": 0.5,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
@@ -1050,7 +1034,7 @@
       "missed": [
         "conv-42:D2:23"
       ],
-      "recall_at_50": 0.0,
+      "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
     {
@@ -1099,21 +1083,19 @@
         "conv-42:D22:8"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.3333333333333333
     },
     {
       "case_id": "conv-42_q43",
       "category": "temporal",
       "query": "How long did it take for Joanna to finish writing her book?",
-      "ndcg_at_k": 0.3868528072345416,
-      "recall_at_k": 0.5,
-      "mrr": 0.5,
-      "p_at_1": 0.0,
+      "ndcg_at_k": 0.8772153153380493,
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 2,
-      "relevant_found": 1,
-      "missed": [
-        "conv-42:D22:9"
-      ],
+      "relevant_found": 2,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -1121,9 +1103,9 @@
       "case_id": "conv-42_q44",
       "category": "temporal",
       "query": "When did Nate win a lot of money in a video game tournament?",
-      "ndcg_at_k": 0.38685280723454163,
+      "ndcg_at_k": 0.6309297535714574,
       "recall_at_k": 1.0,
-      "mrr": 0.2,
+      "mrr": 0.5,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
@@ -1149,10 +1131,10 @@
       "case_id": "conv-42_q46",
       "category": "multi_hop",
       "query": "What board games has Nate played?",
-      "ndcg_at_k": 0.5640920940185893,
+      "ndcg_at_k": 0.9197207891481876,
       "recall_at_k": 1.0,
-      "mrr": 0.5,
-      "p_at_1": 0.0,
+      "mrr": 1.0,
+      "p_at_1": 1.0,
       "relevant_total": 2,
       "relevant_found": 2,
       "missed": [],
@@ -1163,15 +1145,13 @@
       "case_id": "conv-42_q47",
       "category": "multi_hop",
       "query": "What places has Nate met new people?",
-      "ndcg_at_k": 0.6131471927654584,
-      "recall_at_k": 0.5,
+      "ndcg_at_k": 1.0,
+      "recall_at_k": 1.0,
       "mrr": 1.0,
       "p_at_1": 1.0,
       "relevant_total": 2,
-      "relevant_found": 1,
-      "missed": [
-        "conv-42:D14:8"
-      ],
+      "relevant_found": 2,
+      "missed": [],
       "recall_at_50": 1.0,
       "recall_at_100": 1.0
     },
@@ -1218,7 +1198,7 @@
         "conv-42:D2:25"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 0.0
+      "recall_at_100": 0.5
     },
     {
       "case_id": "conv-42_q50",
@@ -1235,7 +1215,7 @@
         "conv-42:D24:2"
       ],
       "recall_at_50": 0.0,
-      "recall_at_100": 1.0
+      "recall_at_100": 0.0
     },
     {
       "case_id": "conv-42_q51",
@@ -1304,20 +1284,19 @@
       "case_id": "conv-42_q55",
       "category": "multi_hop",
       "query": "What is Joanna inspired by?",
-      "ndcg_at_k": 0.4103915680233244,
-      "recall_at_k": 0.3333333333333333,
+      "ndcg_at_k": 0.5337936505754552,
+      "recall_at_k": 0.5,
       "mrr": 1.0,
       "p_at_1": 1.0,
       "relevant_total": 6,
-      "relevant_found": 2,
+      "relevant_found": 3,
       "missed": [
         "conv-42:D4:6",
         "conv-42:D26:3",
-        "conv-42:D26:7",
         "conv-42:D25:10"
       ],
-      "recall_at_50": 0.5,
-      "recall_at_100": 0.6666666666666666
+      "recall_at_50": 0.6666666666666666,
+      "recall_at_100": 0.8333333333333334
     },
     {
       "case_id": "conv-42_q56",
@@ -1354,16 +1333,16 @@
         "conv-42:D19:17",
         "conv-42:D27:23"
       ],
-      "recall_at_50": 0.3333333333333333,
-      "recall_at_100": 0.3333333333333333
+      "recall_at_50": 0.5,
+      "recall_at_100": 0.6666666666666666
     },
     {
       "case_id": "conv-42_q59",
       "category": "multi_hop",
       "query": "What does Joanna do to remember happy memories?",
-      "ndcg_at_k": 0.20438239758848614,
+      "ndcg_at_k": 0.1845756967795682,
       "recall_at_k": 0.5,
-      "mrr": 0.14285714285714285,
+      "mrr": 0.1111111111111111,
       "p_at_1": 0.0,
       "relevant_total": 2,
       "relevant_found": 1,
@@ -1404,14 +1383,14 @@
         "conv-42:D27:21",
         "conv-42:D27:15"
       ],
-      "recall_at_50": 0.0,
+      "recall_at_50": 0.3333333333333333,
       "recall_at_100": 0.3333333333333333
     },
     {
       "case_id": "conv-42_q62",
       "category": "multi_hop",
       "query": "How many letters has Joanna recieved?",
-      "ndcg_at_k": 0.6240505200038378,
+      "ndcg_at_k": 0.6934264036172708,
       "recall_at_k": 1.0,
       "mrr": 0.5,
       "p_at_1": 0.0,
@@ -1425,15 +1404,14 @@
       "case_id": "conv-42_q63",
       "category": "multi_hop",
       "query": "What video games does Nate play?",
-      "ndcg_at_k": 0.13120507751234178,
-      "recall_at_k": 0.2,
-      "mrr": 0.2,
+      "ndcg_at_k": 0.2441076356740635,
+      "recall_at_k": 0.4,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 5,
-      "relevant_found": 1,
+      "relevant_found": 2,
       "missed": [
         "conv-42:D27:1",
-        "conv-42:D27:23",
         "conv-42:D1:7",
         "conv-42:D23:17"
       ],
@@ -1481,16 +1459,16 @@
       "case_id": "conv-42_q68",
       "category": "open_domain",
       "query": "How many hikes has Joanna been on?",
-      "ndcg_at_k": 0.6804558477306826,
+      "ndcg_at_k": 0.43731039911259373,
       "recall_at_k": 0.75,
-      "mrr": 1.0,
-      "p_at_1": 1.0,
+      "mrr": 0.25,
+      "p_at_1": 0.0,
       "relevant_total": 4,
       "relevant_found": 3,
       "missed": [
         "conv-42:D14:21"
       ],
-      "recall_at_50": 1.0,
+      "recall_at_50": 0.75,
       "recall_at_100": 1.0
     },
     {
@@ -1511,25 +1489,25 @@
       "case_id": "conv-42_q84",
       "category": "open_domain",
       "query": "Was the first half of September 2022 a good month career-wise for Nate and Joanna? Answer yes or no.",
-      "ndcg_at_k": 0.26406812257259094,
+      "ndcg_at_k": 0.17723928678404774,
       "recall_at_k": 0.5,
-      "mrr": 0.25,
+      "mrr": 0.1,
       "p_at_1": 0.0,
       "relevant_total": 2,
       "relevant_found": 1,
       "missed": [
         "conv-42:D20:1"
       ],
-      "recall_at_50": 0.5,
-      "recall_at_100": 0.5
+      "recall_at_50": 1.0,
+      "recall_at_100": 1.0
     },
     {
       "case_id": "conv-42_q85",
       "category": "open_domain",
       "query": "What kind of job is Joanna beginning to preform the duties of because of her movie scripts?",
-      "ndcg_at_k": 0.5,
+      "ndcg_at_k": 0.4306765580733931,
       "recall_at_k": 1.0,
-      "mrr": 0.3333333333333333,
+      "mrr": 0.25,
       "p_at_1": 0.0,
       "relevant_total": 1,
       "relevant_found": 1,
