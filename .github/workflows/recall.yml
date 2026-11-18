@@ -105,6 +105,14 @@ on:
           Recorded as an override like fusion: pair it with record=true.
         required: false
         default: ''
+      index_context:
+        description: >-
+          previous_turn embeds each LoCoMo turn with the turn before it in its session, as a
+          caller would by sending it as the memory's index_context metadata
+          (VELD_EVAL_INDEX_CONTEXT, src/recall_harness/runner.rs). Empty embeds content alone, as
+          the baseline does. Recorded as an override like fusion: pair it with record=true.
+        required: false
+        default: ''
       embedder:
         description: >-
           Primary embedder. minilm-l6-v2 is what the baseline measures. arctic-embed-xs
@@ -277,6 +285,7 @@ jobs:
           VELD_DIALS_FUSION: ${{ github.event.inputs.fusion || '' }}
           VELD_DIALS_GRAPH_CANDIDATES_ONLY: ${{ github.event.inputs.graph_candidates_only || '' }}
           VELD_DIALS_DISABLE_SIGNALS: ${{ github.event.inputs.disable_signals || '' }}
+          VELD_EVAL_INDEX_CONTEXT: ${{ github.event.inputs.index_context || '' }}
           VELD_MODEL_TAPE_RECORD: ${{ env.MODEL_TAPE == 'record' && format('model-tape-{0}.jsonl.gz', matrix.engine) || '' }}
           VELD_MODEL_TAPE_REPLAY: ${{ env.TAPE_PATH }}
           # minilm-l6-v2 is VELD_EMBEDDER=minilm, nomic-embed-text-v1.5 is VELD_EMBEDDER=nomic;

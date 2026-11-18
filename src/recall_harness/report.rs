@@ -160,6 +160,12 @@ pub struct RetrievalDials {
     /// The `disabled_signals` dial, sorted: empty is every signal on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_signals: Vec<String>,
+    /// The harness's index-context mode (`VELD_EVAL_INDEX_CONTEXT`, see
+    /// [`crate::recall_harness::runner::IndexContextMode`]): `None` embeds each item's content
+    /// alone. Not a dial, but it changes every vector the run ingests, so it is refused across
+    /// like one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_context: Option<String>,
 }
 
 impl RetrievalDials {
@@ -174,7 +180,17 @@ impl RetrievalDials {
                 ids.sort();
                 ids
             },
+            index_context: None,
         }
+    }
+
+    /// These overrides, with the harness's index-context mode recorded.
+    pub fn with_index_context(
+        mut self,
+        mode: Option<crate::recall_harness::runner::IndexContextMode>,
+    ) -> Self {
+        self.index_context = mode.map(|m| m.as_str().to_string());
+        self
     }
 
     fn describe(&self) -> String {
@@ -193,6 +209,9 @@ impl RetrievalDials {
                 "disabled_signals={}",
                 self.disabled_signals.join(",")
             ));
+        }
+        if let Some(mode) = &self.index_context {
+            set.push(format!("index_context={mode}"));
         }
         if set.is_empty() {
             "engine defaults".to_string()
@@ -1496,6 +1515,9 @@ mod tests {
             disabled_signals: vec!["temporal_fact_untimed_fallback".to_string()],
             ..Default::default()
         };
+        let previous_turn = RetrievalDials::default().with_index_context(Some(
+            crate::recall_harness::runner::IndexContextMode::PreviousTurn,
+        ));
         for (set, named) in [
             (off, "date_window_leg=false"),
             (flat, "fusion=flat"),
@@ -1504,6 +1526,7 @@ mod tests {
                 untimed_off,
                 "disabled_signals=temporal_fact_untimed_fallback",
             ),
+            (previous_turn, "index_context=previous_turn"),
         ] {
             let set = Some(set);
             let defaults = Some(RetrievalDials::default());

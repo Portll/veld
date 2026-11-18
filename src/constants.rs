@@ -2881,6 +2881,12 @@ pub const CE_BLEND_ABSTRACT: f32 = 0.45;
 /// latency cost and a share this small cannot move a rank.
 pub const CE_BLEND_SKIP_BELOW: f32 = 0.05;
 
+/// Characters of a memory's index context (`Experience::embedding_text`) embedded after its
+/// content. A conversation turn's context is the turn before it, a sentence or two; the cap keeps
+/// a long one from filling an embedder's window, and the content goes first so truncation takes
+/// context, not content.
+pub const MAX_INDEX_CONTEXT_CHARS: usize = 400;
+
 /// Layer 5.36 query-term coverage: a candidate's score is multiplied by
 /// `1 - weight * (1 - coverage)`, where coverage is the information-content-weighted
 /// fraction of the query's focal and modifier stems that appear in the memory's content or

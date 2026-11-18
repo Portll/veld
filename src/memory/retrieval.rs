@@ -1839,6 +1839,10 @@ impl RetrievalEngine {
     /// This is the single source of truth for embedding input. Both the synchronous
     /// `index_memory()` path and the deferred `embed_and_index()` path must use this.
     pub fn extract_searchable_text(memory: &Memory) -> String {
+        // The content and its index context (`Experience::embedding_text`), so the deferred and
+        // re-embedding paths embed what the synchronous remember paths embed.
+        let body = memory.experience.embedding_text();
+
         // Build context prefix: "[project | topic | type] "
         let mut prefix_parts: Vec<&str> = Vec::new();
 
@@ -1874,16 +1878,16 @@ impl RetrievalEngine {
             let mut t = String::with_capacity(
                 prefix_parts.iter().map(|p| p.len()).sum::<usize>()
                     + 6 // brackets + separators
-                    + memory.experience.content.len()
+                    + body.len()
                     + 128, // headroom
             );
             t.push('[');
             t.push_str(&prefix_parts.join(" | "));
             t.push_str("] ");
-            t.push_str(&memory.experience.content);
+            t.push_str(&body);
             t
         } else {
-            memory.experience.content.clone()
+            body.into_owned()
         };
 
         // Add entities

@@ -964,7 +964,8 @@ fn run_one_pass(
     }
 
     let rerank = RerankSetting::of(&system.read(), cross_encoder);
-    let retrieval_dials = RetrievalDials::of(&system.read().cognitive_dials());
+    let retrieval_dials = RetrievalDials::of(&system.read().cognitive_dials())
+        .with_index_context(IndexContextMode::from_env()?);
     Ok(OnePassResult {
         per_mode,
         failures,
@@ -1236,11 +1237,85 @@ pub(crate) fn guard_ner_backend(manager: &MultiUserMemoryManager) -> Result<()> 
     Ok(())
 }
 
+/// How the harness gives each corpus item an index context, the text embedded after its content
+/// ([`crate::memory::types::INDEX_CONTEXT_METADATA_KEY`]). Read from `VELD_EVAL_INDEX_CONTEXT`;
+/// unset (or `none`) gives none, which is what the gate baseline measures.
+///
+/// A production caller supplies the context in the memory's metadata; the harness derives it
+/// from the corpus, so an arm measures what a caller that sends it would get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexContextMode {
+    /// A conversation turn's context is the turn before it in the same session
+    /// (`conv-42:D1:7` takes `conv-42:D1:6`). The first turn of a session, and any corpus item
+    /// whose id is not shaped `<conversation>:<session>:<turn>`, gets none.
+    PreviousTurn,
+}
+
+impl IndexContextMode {
+    pub const ENV: &'static str = "VELD_EVAL_INDEX_CONTEXT";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreviousTurn => "previous_turn",
+        }
+    }
+
+    /// The mode `VELD_EVAL_INDEX_CONTEXT` names. An unknown value refuses the run: an arm that
+    /// silently measured the default would read as a verdict on a mode that never ran.
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var(Self::ENV) {
+            Err(_) => Ok(None),
+            Ok(value) => Self::parse(&value),
+        }
+    }
+
+    fn parse(value: &str) -> Result<Option<Self>> {
+        match value.trim() {
+            "" | "none" => Ok(None),
+            "previous_turn" => Ok(Some(Self::PreviousTurn)),
+            other => anyhow::bail!(
+                "{}={other:?} is not an index-context mode; use previous_turn or none",
+                Self::ENV
+            ),
+        }
+    }
+}
+
+/// `conv-42:D1:7` → (`conv-42:D1`, 7). `None` for an id that is not
+/// `<conversation>:<session>:<turn>` with a numeric turn.
+fn split_turn_id(id: &str) -> Option<(&str, u32)> {
+    let (session, turn) = id.rsplit_once(':')?;
+    if !session.contains(':') {
+        return None;
+    }
+    Some((session, turn.parse().ok()?))
+}
+
+/// Each corpus item's index context under `mode`, by item id. Items without one are absent.
+fn index_contexts(corpus: &[CorpusItem], mode: Option<IndexContextMode>) -> HashMap<&str, &str> {
+    let Some(IndexContextMode::PreviousTurn) = mode else {
+        return HashMap::new();
+    };
+    let by_turn: HashMap<(&str, u32), &str> = corpus
+        .iter()
+        .filter_map(|item| Some((split_turn_id(&item.id)?, item.content.as_str())))
+        .collect();
+    corpus
+        .iter()
+        .filter_map(|item| {
+            let (session, turn) = split_turn_id(&item.id)?;
+            let previous = by_turn.get(&(session, turn.checked_sub(1)?))?;
+            Some((item.id.as_str(), *previous))
+        })
+        .collect()
+}
+
 pub fn ingest_corpus(
     manager: &MultiUserMemoryManager,
     corpus: &[CorpusItem],
 ) -> Result<HashMap<String, Uuid>> {
     guard_ner_backend(manager)?;
+    let contexts = index_contexts(corpus, IndexContextMode::from_env()?);
     let mut map = HashMap::with_capacity(corpus.len());
     let ner = manager.get_neural_ner();
     let keyword_extractor = manager.get_keyword_extractor();
@@ -1308,6 +1383,15 @@ pub fn ingest_corpus(
             entities: merged.clone(),
             tags: merged,
             ner_entities,
+            metadata: contexts
+                .get(item.id.as_str())
+                .map(|context| {
+                    HashMap::from([(
+                        crate::memory::types::INDEX_CONTEXT_METADATA_KEY.to_string(),
+                        (*context).to_string(),
+                    )])
+                })
+                .unwrap_or_default(),
             ..Default::default()
         };
 
@@ -5443,5 +5527,75 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod index_context_tests {
+    use super::*;
+
+    fn item(id: &str, content: &str) -> CorpusItem {
+        CorpusItem {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: "conversation".to_string(),
+            tags: Vec::new(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2022-01-21T19:31:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn mode_parses_and_refuses_unknown_values() {
+        assert_eq!(IndexContextMode::parse("").unwrap(), None);
+        assert_eq!(IndexContextMode::parse(" none ").unwrap(), None);
+        assert_eq!(
+            IndexContextMode::parse("previous_turn").unwrap(),
+            Some(IndexContextMode::PreviousTurn)
+        );
+        let err = IndexContextMode::parse("prev").unwrap_err().to_string();
+        assert!(err.contains("VELD_EVAL_INDEX_CONTEXT"), "{err}");
+    }
+
+    #[test]
+    fn turn_ids_split_into_session_and_turn() {
+        assert_eq!(split_turn_id("conv-42:D1:7"), Some(("conv-42:D1", 7)));
+        assert_eq!(split_turn_id("conv-42:D12:0"), Some(("conv-42:D12", 0)));
+        assert_eq!(split_turn_id("ssm-001"), None);
+        assert_eq!(split_turn_id("D1:7"), None, "no conversation part");
+        assert_eq!(split_turn_id("conv-42:D1:x"), None);
+    }
+
+    #[test]
+    fn previous_turn_is_the_turn_before_in_the_same_session_whatever_the_order() {
+        // Out of order on purpose: the predecessor is found by turn number, not by position.
+        let corpus = vec![
+            item("conv-1:D1:2", "Thanks! it's a team shooter game."),
+            item("conv-1:D2:1", "Morning! Back from the tournament."),
+            item("conv-1:D1:1", "Congrats on winning! What game was it?"),
+            item("conv-2:D1:2", "Another conversation's second turn."),
+            item("smoke-001", "Not a conversation turn."),
+        ];
+        let contexts = index_contexts(&corpus, Some(IndexContextMode::PreviousTurn));
+        assert_eq!(
+            contexts.get("conv-1:D1:2"),
+            Some(&"Congrats on winning! What game was it?")
+        );
+        assert_eq!(contexts.get("conv-1:D1:1"), None, "first turn has none");
+        assert_eq!(contexts.get("conv-1:D2:1"), None, "sessions do not chain");
+        assert_eq!(
+            contexts.get("conv-2:D1:2"),
+            None,
+            "conv-2 has no first turn here, and conv-1's is not its"
+        );
+        assert_eq!(contexts.get("smoke-001"), None);
+        assert_eq!(contexts.len(), 1);
+    }
+
+    #[test]
+    fn no_mode_gives_no_contexts() {
+        let corpus = vec![item("conv-1:D1:1", "a"), item("conv-1:D1:2", "b")];
+        assert!(index_contexts(&corpus, None).is_empty());
     }
 }

@@ -174,6 +174,22 @@ Cross-embedder alignment ([Procrustes + Ridge](alignment.md)) maps the two
 spaces into a comparable frame before max-merging; without alignment the
 scores would be incomparable.
 
+## Index context
+
+A memory's vectors are computed from `Experience::embedding_text()`: its content, then the
+`index_context` entry of its metadata when one is set (cut to `MAX_INDEX_CONTEXT_CHARS`). The
+context situates text that cannot be found on its own words: a conversation turn such as
+"Thanks! it's a team shooter game." embedded with the turn it answers. This is the
+contextual-embedding half of Anthropic's Contextual Retrieval, which reported a 35% cut in
+top-20 retrieval failures. Content goes first, so an embedder that truncates drops context, never
+content. BM25, the write gate's content hash and the cross-encoder still see the content alone.
+
+No memory has one unless its caller sets it, so the shipped pipeline is unchanged. The HTTP
+`remember` route does not take metadata yet; the recall harness measures the effect with
+`VELD_EVAL_INDEX_CONTEXT=previous_turn` (the workflow's `index_context` input), which gives each
+LoCoMo turn the turn before it in its session, and records the mode with the run's overrides so
+the gate never compares it with a run that embedded content alone.
+
 ## Cross-encoder reranking
 
 The cross-encoder ([src/embeddings/cross_encoder.rs](https://github.com/Portll/veld/blob/main/src/embeddings/cross_encoder.rs))

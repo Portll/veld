@@ -2049,7 +2049,7 @@ impl MemorySystem {
 
         // Generate embedding if not provided
         if experience.embeddings.is_none() {
-            match self.embed_primary_cached(&experience.content) {
+            match self.embed_primary_cached(&experience.embedding_text()) {
                 Ok((embedding, space)) => experience.set_primary_vector(embedding, space),
                 Err(e) => {
                     tracing::warn!("Failed to embed imported memory {}: {e}", memory_id.0);
@@ -2069,7 +2069,9 @@ impl MemorySystem {
 
         // Generate secondary embedding if dual-embedder is active
         if experience.embeddings_secondary.is_none() && self.embedder.has_secondary() {
-            if let Ok(Some(secondary)) = self.embedder.encode_secondary(&experience.content) {
+            if let Ok(Some(secondary)) =
+                self.embedder.encode_secondary(&experience.embedding_text())
+            {
                 if let Some(space) = self.embedder.secondary_space_for(&secondary) {
                     experience.set_secondary_vector(secondary, space);
                 }
@@ -2236,7 +2238,7 @@ impl MemorySystem {
         // If experience doesn't have embeddings, check cache or generate.
         // Skipped when defer_embedding=true — handled by embed_and_index() later.
         if !defer_embedding && experience.embeddings.is_none() {
-            match self.embed_primary_cached(&experience.content) {
+            match self.embed_primary_cached(&experience.embedding_text()) {
                 Ok((embedding, space)) => experience.set_primary_vector(embedding, space),
                 Err(e) => {
                     tracing::warn!("Failed to generate embedding: {}", e);
@@ -3477,7 +3479,8 @@ impl MemorySystem {
         // PERFORMANCE: Content embedding cache
         // Skipped when defer_embedding=true — handled by embed_and_index() later.
         if !defer_embedding && experience.embeddings.is_none() {
-            if let Ok((embedding, space)) = self.embed_primary_cached(&experience.content) {
+            if let Ok((embedding, space)) = self.embed_primary_cached(&experience.embedding_text())
+            {
                 experience.set_primary_vector(embedding, space);
             }
         }

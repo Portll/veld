@@ -1177,6 +1177,50 @@ impl EnrichmentDelta {
     }
 }
 
+/// `Experience::metadata` key for the memory's index context: text that situates the content
+/// (for a conversation turn, the turn it answers) and is embedded with it, but is never part of
+/// the content itself.
+///
+/// A short turn such as "Thanks! it's a team shooter game." carries no topic of its own; embedded
+/// alone its vector sits near every other short thank-you. Embedding the content with a few
+/// words of situating context is Anthropic's contextual-embedding result (top-20 retrieval
+/// failures 5.7% → 3.7% on their corpora). Absent, which is every memory a caller did not give
+/// one, the embedding input is the content alone and nothing changes.
+///
+/// The content-hash write gate, BM25, the cross-encoder and every reader still see the content
+/// alone. A content-identical duplicate that brings a context the stored copy lacks adds the key
+/// (metadata merges add keys) but keeps the stored vectors, which were made without it.
+pub const INDEX_CONTEXT_METADATA_KEY: &str = "index_context";
+
+impl Experience {
+    /// The text a vector is computed from: the content, then the index context
+    /// ([`INDEX_CONTEXT_METADATA_KEY`]) when the caller supplied a non-blank one.
+    ///
+    /// The content comes first so an embedder that truncates its input drops context, never
+    /// content. The context is cut to [`crate::constants::MAX_INDEX_CONTEXT_CHARS`] characters
+    /// at a character boundary, so a caller cannot crowd the content out of a short window.
+    pub fn embedding_text(&self) -> std::borrow::Cow<'_, str> {
+        let Some(context) = self
+            .metadata
+            .get(INDEX_CONTEXT_METADATA_KEY)
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+        else {
+            return std::borrow::Cow::Borrowed(&self.content);
+        };
+        let cut = context
+            .char_indices()
+            .nth(crate::constants::MAX_INDEX_CONTEXT_CHARS)
+            .map_or(context.len(), |(i, _)| i);
+        let context = &context[..cut];
+        let mut text = String::with_capacity(self.content.len() + 1 + context.len());
+        text.push_str(&self.content);
+        text.push('\n');
+        text.push_str(context);
+        std::borrow::Cow::Owned(text)
+    }
+}
+
 impl Experience {
     /// Folds the enrichment a content-identical duplicate carries into this stored experience
     /// and reports what changed.
@@ -6622,5 +6666,86 @@ mod query_filter_tests {
         assert_eq!(ctx.repo_slug(), Some("acme/two"));
         assert_eq!(ctx.place.places.len(), 2);
         assert!(matches!(ctx.place.places[0], Place::Repo { .. }));
+    }
+}
+
+#[cfg(test)]
+mod embedding_text_tests {
+    use super::*;
+    use crate::constants::MAX_INDEX_CONTEXT_CHARS;
+
+    fn experience(content: &str, context: Option<&str>) -> Experience {
+        Experience {
+            content: content.to_string(),
+            metadata: context
+                .map(|c| HashMap::from([(INDEX_CONTEXT_METADATA_KEY.to_string(), c.to_string())]))
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_a_context_the_text_is_the_content_borrowed() {
+        let e = experience("it's a team shooter game", None);
+        assert!(matches!(e.embedding_text(), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(e.embedding_text(), "it's a team shooter game");
+        // A blank context is no context: the vector must not move for whitespace.
+        let blank = experience("it's a team shooter game", Some("  \n "));
+        assert!(matches!(
+            blank.embedding_text(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn the_context_follows_the_content() {
+        let e = experience(
+            "Thanks! it's a team shooter game.",
+            Some(" Congrats on winning! What game was it? "),
+        );
+        assert_eq!(
+            e.embedding_text(),
+            "Thanks! it's a team shooter game.\nCongrats on winning! What game was it?"
+        );
+    }
+
+    #[test]
+    fn a_long_context_is_cut_at_a_character_boundary() {
+        // Multi-byte characters straddle every byte cut; the cap counts characters.
+        let long: String = "é".repeat(MAX_INDEX_CONTEXT_CHARS + 50);
+        let e = experience("content", Some(&long));
+        let text = e.embedding_text();
+        let context = text.strip_prefix("content\n").expect("content first");
+        assert_eq!(context.chars().count(), MAX_INDEX_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn the_searchable_text_carries_the_context_and_the_content() {
+        let e = experience("it's a team shooter game", Some("what game was it?"));
+        let memory = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            e,
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let text = crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+        assert!(
+            text.contains("it's a team shooter game\nwhat game was it?"),
+            "{text}"
+        );
+        let plain = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience("it's a team shooter game", None),
+            0.5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let plain_text = crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&plain);
+        assert!(!plain_text.contains("what game"), "{plain_text}");
     }
 }
