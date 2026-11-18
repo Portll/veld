@@ -2842,40 +2842,42 @@ pub const RECENTLY_FLOOR_MULTIPLIER: f32 = 0.5;
 /// Cross-encoder share of the Layer 5.3 blend, by query shape
 /// ([`crate::memory::query_parser::RerankShape`]). The fused score keeps `1 - share`.
 ///
-/// The share is lowered where the reranker has nothing to add and can only re-sort what a
-/// better-informed layer ordered, and raised where the lexical and vector legs disagree and
-/// the question needs query-to-passage reasoning.
+/// Every shape but Identifier takes half. Measured on the LoCoMo hold-out (1,161 questions over
+/// nine conversations, paired against the shipped settings, 2026-11-18, `scripts/recall_compare.py`):
+/// a 0.5 share with the cross-encoder scoring 30 of a 50-candidate pool raised p@1 0.470 → 0.496,
+/// MRR 0.548 → 0.570, recall@10 0.630 → 0.648 and nDCG@10 0.545 → 0.565. Every conversation's MRR,
+/// recall@10 and nDCG@10 rose (exact per-conversation randomisation p = 2/512, the floor); p@1's
+/// per-conversation p was 0.012. The earlier per-shape shares (0.05 to 0.45, each set on one or two
+/// gate cases) left the reranker too small a say to move gold up from rank 11–30, where a quarter of
+/// the gate's gold sat. A share of 1.0 at the same depth gained less p@1 and lost more cases; 1.0
+/// at depth 50 over a pool of 100 matched it at a quarter more latency.
 ///
-/// - Identifier: the reranker tokenises `admin/serve.mjs` into fragments; BM25 exact match
-///   is the truth.
-/// - Ordinal ("first", "latest", "last"): Layer 5.9 pins the answer by time and the blend
-///   can only re-sort it back down. On the recall gate (2026-10-19) this gained a gold
-///   document.
-/// - Keyword (under three content words): a cross-encoder needs a question to read.
-/// - Temporal and People stay at the exploratory share. Both were lowered to 0.10 and
-///   measured: a date in a content question filters rather than answers, so the reranker
-///   still matches the content (the gate lost a gold document on "what filling did she use
-///   in the cake she made recently"), and a small reranker is what a who-question has until
-///   a person-density signal exists (LOCOMO-20 Q20 lost a top-5 answer). They remain
-///   separate dials so they can be tuned without touching everything else.
-/// - Attribute: entity-to-value matching is what the reranker is trained on; the gate
-///   gained rank on "what is Nate's favorite genre".
-/// - Relational ("how did X fix Y", "why"): under nomic-embed on LOCOMO-20 the
-///   EU-migration answer sat at rank 10 because the vector leg saw topic overlap and the
-///   lexical leg saw stems; only the reranker reads that one passage answers the other.
-/// - Abstract (decomposed): the 0.45 these queries already had.
+/// - Identifier stays 0: the reranker tokenises `admin/serve.mjs` into fragments, so BM25 exact
+///   match is the truth, and a declared file path keeps its fused rank. No LoCoMo question is one.
 ///
-/// The `ce_blend` dial overrides every shape except Abstract, which takes the larger of it and
-/// its own share; the per-shape dials override one shape each.
+/// Each shape keeps its own dial (`ce_blend_<shape>`) and the `ce_blend` dial sets every shape but
+/// Abstract, which takes the larger of the dial and its own share.
 pub const CE_BLEND_IDENTIFIER: f32 = 0.0;
-pub const CE_BLEND_ORDINAL: f32 = 0.05;
-pub const CE_BLEND_KEYWORD: f32 = 0.10;
-pub const CE_BLEND_TEMPORAL: f32 = 0.18;
-pub const CE_BLEND_PEOPLE: f32 = 0.18;
-pub const CE_BLEND_EXPLORATORY: f32 = 0.18;
-pub const CE_BLEND_ATTRIBUTE: f32 = 0.30;
-pub const CE_BLEND_RELATIONAL: f32 = 0.35;
-pub const CE_BLEND_ABSTRACT: f32 = 0.45;
+pub const CE_BLEND_ORDINAL: f32 = 0.5;
+pub const CE_BLEND_KEYWORD: f32 = 0.5;
+pub const CE_BLEND_TEMPORAL: f32 = 0.5;
+pub const CE_BLEND_PEOPLE: f32 = 0.5;
+pub const CE_BLEND_EXPLORATORY: f32 = 0.5;
+pub const CE_BLEND_ATTRIBUTE: f32 = 0.5;
+pub const CE_BLEND_RELATIONAL: f32 = 0.5;
+pub const CE_BLEND_ABSTRACT: f32 = 0.5;
+
+/// Fused candidates Layer 4 keeps for the cross-encoder when the `rerank_pool` dial is unset,
+/// for every query (it was 30, and 50 for a decomposed query). Measured with
+/// [`RERANK_COUNT_DEFAULT`] and the 0.5 shares above; see [`CE_BLEND_IDENTIFIER`].
+pub const RERANK_POOL_DEFAULT: usize = 50;
+
+/// Candidates the cross-encoder scores when neither the `rerank_count` dial nor the query sets a
+/// budget. It was the smaller of twice `max_results` and 20 (30 for a decomposed query), which
+/// for a ten-result recall stopped at rank 20 while a quarter of the gate's gold sat between rank
+/// 11 and 100. Each candidate is one forward pass: on the hold-out, scoring 30 of 50 cost about
+/// 4% median latency over scoring 20 of 30.
+pub const RERANK_COUNT_DEFAULT: usize = 30;
 
 /// Below this share the reranker is not called at all: at scale it is the dominant
 /// latency cost and a share this small cannot move a rank.

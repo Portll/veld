@@ -67,9 +67,8 @@ fn default_repeats() -> usize {
     1
 }
 
-/// Layer 5.3's cross-encoder budget for an undecomposed query when the `rerank_count` dial is
-/// unset (`memory/recall.rs`).
-pub const DEFAULT_RERANK_CAP: usize = 20;
+/// Layer 5.3's cross-encoder budget when the `rerank_count` dial is unset (`memory/recall.rs`).
+pub const DEFAULT_RERANK_CAP: usize = crate::constants::RERANK_COUNT_DEFAULT;
 
 /// The cross-encoder setting a run measured under.
 ///

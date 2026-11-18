@@ -8,7 +8,7 @@ default values are sensible, but specific workloads benefit from tuning.
 | Parameter | Default | When to change |
 |---|---|---|
 | Cross-encoder budget (top-K reranked) | 20 | Increase for accuracy-critical workloads; decrease for latency |
-| Cross-encoder blend weight | 18% | Increase if cross-encoder consistently helps; decrease if it adds noise |
+| Cross-encoder blend weight | 50% (0 for identifier queries) | Increase if cross-encoder consistently helps; decrease if it adds noise |
 | Embedder secondary | Nomic 768d | Disable if memory-constrained — primary embedder alone works |
 | Calibrated confidence gate | 0.85 | Lower if too few memories surface; raise to suppress low-confidence noise |
 | Decay factor | from `decay_scales.rs` | Per-memory-type; Fourier-learned during consolidation |

@@ -70,14 +70,14 @@ on:
         default: ''
       rerank_count:
         description: >-
-          Cross-encoder budget for the rerank_count dial; empty keeps the shipped default (20).
+          Cross-encoder budget for the rerank_count dial; empty keeps the shipped default (30).
           As with rerank_model, a different cap is not gated: pair it with record=true.
         required: false
         default: ''
       rerank_pool:
         description: >-
           Fused candidates kept for the cross-encoder (rerank_pool dial); empty keeps the shipped
-          30, or 50 for a decomposed query. Not gated: pair it with record=true.
+          50. Not gated: pair it with record=true.
         required: false
         default: ''
       ce_blend:

@@ -28,6 +28,32 @@ LLM-judged answer accuracy ("J"), so the two are on different scales and do not 
 tuned against, so the run is not a fully held-out measurement; a held-out set without conv-42,
 with confidence intervals, is task 7 of plan `veld-review-remediation-20261020`.
 
+## Held-out: the reranker sweep, 2026-11-18
+
+The hold-out (`locomo-holdout`: 1,161 questions over the nine conversations that are not the
+gate's, less every case someone has examined) was run once per arm on main `fcf28bc`/`880c674`,
+and each arm compared with the shipped settings case by case with `scripts/recall_compare.py`.
+The per-conversation columns are the ones to read: an exact sign-flip test over the nine
+conversations, whose floor is p = 0.0039.
+
+| Arm | p@1 | MRR | recall@10 | nDCG@10 | per-conversation p (p@1 / MRR) |
+|---|---|---|---|---|---|
+| Shipped until now: 18% share (more for some shapes), top 20 of 30 | 0.470 | 0.548 | 0.630 | 0.545 | — |
+| Share 1.0, top 20 of 30 | 0.487 | 0.560 | 0.630 | 0.553 | 0.094 / 0.027 |
+| Share 1.0, top 30 of 50 | 0.490 | 0.566 | 0.645 | 0.560 | 0.086 / 0.012 |
+| **Share 0.5, top 30 of 50 (now the default)** | **0.496** | **0.570** | **0.648** | **0.565** | **0.012 / 0.0039** |
+| Share 1.0, top 50 of 100 | 0.491 | 0.570 | 0.653 | 0.566 | 0.063 / 0.0039 |
+| Upstream's setup: ms-marco-MiniLM-L-6-v2, share 1.0, top 30 of 30 | 0.479 | 0.554 | 0.637 | 0.552 | 0.34 / 0.30 |
+
+The new default raised MRR, recall@10 and nDCG@10 in every one of the nine conversations; 39
+questions gained the top rank and 9 lost it. The branch that ships it reproduced the 0.5 arm
+case for case. Upstream reports +16.5pp p@1 for its reranker against no reranker; veld already
+blended one in, and upstream's exact setup gains nothing measurable over veld's old one here.
+
+Embedding each turn with the turn before it (the harness's `index_context=previous_turn`, branch
+`feat/index-context-20261118`) lost p@1 0.470 → 0.453 and nDCG@10 0.545 → 0.527, per-conversation
+p 0.031 and 0.020, and was not merged. The `directional` suite scores p@1 0.500: chance.
+
 ## Withdrawn figures
 
 Earlier pages quoted MRR 0.925 for v0.7.2, and a changelog entry quotes MRR 0.917 (`6dae51f6`).

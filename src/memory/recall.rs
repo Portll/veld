@@ -2910,9 +2910,8 @@ impl super::MemorySystem {
                 }
             }
 
-            // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
-            // Decomposed queries produce a wider candidate set — widen the budget
-            // so more candidates survive into the cross-encoder.
+            // Phase 2.1: Keep a wider candidate pool for cross-encoder reranking,
+            // `constants::RERANK_POOL_DEFAULT` wide for every query.
             // The `rerank_pool` dial overrides the width; the pool never drops below an explicit
             // `rerank_count`, or Layer 5.3 would be asked to score candidates already cut.
             let (pool_dial, rerank_count_dial) = {
@@ -2920,7 +2919,7 @@ impl super::MemorySystem {
                 (d.rerank_pool, d.rerank_count)
             };
             let rerank_budget = pool_dial
-                .unwrap_or(if decomposed { 50_usize } else { 30_usize })
+                .unwrap_or(crate::constants::RERANK_POOL_DEFAULT)
                 .max(rerank_count_dial.or(query.rerank_count).unwrap_or(0))
                 .max(query.max_results);
             // Query filters are applied in the Layer 5 scan below, which stops once
@@ -2961,16 +2960,18 @@ impl super::MemorySystem {
         // before truncating to max_results. Without this, the early break at max_results
         // would prevent the cross-encoder from ever firing (max_results == max_results).
         // Decomposed queries benefit from a larger pool — more candidates to rerank.
-        // An explicit rerank_count is Layer 5.3's budget, so the scan must find that many;
-        // stopping at 20 would cap the dial at 20 whenever max_results is small.
-        let explicit_rerank_count = self
+        // The rerank count (explicit, else RERANK_COUNT_DEFAULT) is Layer 5.3's budget, so the
+        // scan must find that many; stopping at 20 would cap it at 20 whenever max_results is
+        // small.
+        let rerank_count = self
             .cognitive_dials
             .read()
             .rerank_count
-            .or(query.rerank_count);
+            .or(query.rerank_count)
+            .unwrap_or(crate::constants::RERANK_COUNT_DEFAULT);
         let scan_limit = if decomposed { 30_usize } else { 20_usize }
             .max(query.max_results)
-            .max(explicit_rerank_count.unwrap_or(0));
+            .max(rerank_count);
 
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // Recency decay: recent memories get boost, old memories decay
@@ -3553,14 +3554,14 @@ impl super::MemorySystem {
         // into the main retrieval path. This uses joint query-document attention
         // (70% cross-encoder + 30% bi-encoder blend) to re-score the top
         // candidates. The cross-encoder score is blended with the existing
-        // unified score at 12% weight — enough to promote/demote by 1-3 positions
-        // without overriding the multi-signal pipeline.
+        // unified score at the query shape's share (`constants::CE_BLEND_*`, 0.5 for
+        // every shape but Identifier).
         //
         // Only runs on the top `rerank_budget` candidates to keep latency bounded.
         //
         // Dial gate: VELD_DIALS_USE_RERANKING=false (or cognitive_dials.use_reranking =
         // Some(false)) fully skips this layer. The `rerank_count` dial caps the
-        // candidate budget; absent that, the hardcoded ce_cap applies.
+        // candidate budget; absent that, `constants::RERANK_COUNT_DEFAULT` applies.
         let rerank_shape = query_parser::classify_rerank_shape(query_text, decomposed, &query_type);
         let (layer53_use_reranking, layer53_rerank_count_dial, ce_w) = {
             let d = self.cognitive_dials.read();
@@ -3581,16 +3582,14 @@ impl super::MemorySystem {
                 .allows(crate::memory::types::LayerMode::PlusRerank)
         {
             if let Some(reranker) = self.hybrid_search.reranker() {
-                // Decomposed queries: widen CE budget from 20→30 to exploit the
-                // broader candidate pool from multi-query vector search.
-                let ce_cap = if decomposed { 30 } else { 20 };
-                // An explicit rerank_count (dial or query) is the budget, so it can reach past
-                // twice max_results to gold the fused order left below rank 20; absent one, the
-                // budget stays bounded by max_results for latency.
-                let rerank_budget = match layer53_rerank_count_dial.or(query.rerank_count) {
-                    Some(explicit) => memories.len().min(explicit),
-                    None => memories.len().min(query.max_results * 2).min(ce_cap),
-                };
+                // An explicit rerank_count (dial or query) is the budget; absent one, the
+                // reranker scores RERANK_COUNT_DEFAULT candidates whatever max_results is, so it
+                // can reach gold the fused order left between rank 11 and 30.
+                let rerank_budget = memories.len().min(
+                    layer53_rerank_count_dial
+                        .or(query.rerank_count)
+                        .unwrap_or(crate::constants::RERANK_COUNT_DEFAULT),
+                );
                 // Pass each candidate's stored embedding so the reranker's
                 // bi-encoder pass can reuse it instead of re-embedding via the
                 // HTTP embedder (5–6s/call for CPU Nomic). The reranker

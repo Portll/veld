@@ -26,7 +26,7 @@ A Bayesian α/β pair per memory encoding how confident the system is in the mem
 A Letta-style mutable agent state entry (`key`, `content`, `max_tokens`, `version`). Unlike memories, context blocks are persistently editable — the agent can overwrite them. Distinct from the memory store; useful for working notes, current task, and agent identity.
 
 **Cross-encoder reranker**
-A more expensive bi-directional text comparison model that scores query-memory pairs jointly (rather than independently as bi-encoders do). Veld runs the cross-encoder over the top-20 candidates from the initial retrieval pass and blends the score at 18%.
+A more expensive bi-directional text comparison model that scores query-memory pairs jointly (rather than independently as bi-encoders do). Veld runs the cross-encoder over the top 30 of the 50 candidates the initial retrieval pass keeps and blends the score at 50% (0 for identifier queries).
 
 **Decay**
 The reduction in a memory's effective importance over time. Veld uses multi-time-scale decay (`src/decay.rs`) with Fourier-learned decay scales per memory type. Anchor and Hebbian strengthening counteract decay.

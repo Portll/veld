@@ -90,16 +90,19 @@ Five retrieval dials drive the Layer 5.3 cross-encoder
 | Dial | Type | `None` means | Env seed |
 |---|---|---|---|
 | `use_reranking` | `Option<bool>` | the layer runs | `VELD_DIALS_USE_RERANKING` |
-| `rerank_count` | `Option<usize>`, clamped to 1..=200 | at most 20 candidates (30 for a decomposed query), and never more than twice `max_results`; a set value is the budget itself | `VELD_DIALS_RERANK_COUNT` |
-| `rerank_pool` | `Option<usize>`, clamped to 10..=500 | Layer 4 keeps 30 fused candidates (50 for a decomposed query) for the layer; never fewer than `rerank_count` | `VELD_DIALS_RERANK_POOL` |
+| `rerank_count` | `Option<usize>`, clamped to 1..=200 | `RERANK_COUNT_DEFAULT` (30) candidates, whatever `max_results` is; a set value is the budget itself | `VELD_DIALS_RERANK_COUNT` |
+| `rerank_pool` | `Option<usize>`, clamped to 10..=500 | Layer 4 keeps `RERANK_POOL_DEFAULT` (50) fused candidates for the layer; never fewer than `rerank_count` | `VELD_DIALS_RERANK_POOL` |
 | `ce_blend` | `Option<f32>`, clamped to 0..=1 | each query shape takes its own cross-encoder share (`ce_blend_<shape>`, else `constants::CE_BLEND_*`); a set value is the share for every shape, and a decomposed query never takes less than its own | `VELD_TUNE_CE_BLEND` |
 | `rerank_model` | `Option<String>`, a registry id | the process-wide model: `VELD_CROSS_ENCODER`, else `mxbai-rerank-xsmall-v1` | `VELD_DIALS_RERANK_MODEL` |
 
 Depth takes all three of `rerank_pool`, `rerank_count` and `ce_blend`. On the LoCoMo
 gate a quarter of all gold sits between rank 11 and rank 100. A larger `rerank_count`
-cannot reach gold that Layer 4 already cut, and at a share near 18% the cross-encoder moves
-a candidate a few places, not from rank 40 into the top ten. Each candidate in the
-budget is one cross-encoder forward pass, so latency grows with `rerank_count`.
+cannot reach gold that Layer 4 already cut, and at a small share the cross-encoder moves a
+candidate a few places, not from rank 40 into the top ten. Each candidate in the budget is one
+cross-encoder forward pass, so latency grows with `rerank_count`. The shipped 0.5 share over the
+top 30 of 50 was chosen by a sweep on the hold-out (2026-11-18): against the earlier 18% over 20 of
+30 it gained p@1 +0.026 and MRR +0.023, and a share of 1.0, or a depth of 50 over a pool of 100,
+gained no more.
 
 `rerank_model` is applied when the dials are loaded at startup and on every
 `PUT /api/dials`: the user's `CrossEncoderReranker` switches to the named
