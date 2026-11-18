@@ -131,7 +131,13 @@ short-acronym changes.
   mean and 95% percentile-bootstrap interval, overall and per category. Two runs whose difference
   lies inside the intervals have not been shown to differ. For an A/B on the same cases pair them:
   `recall-eval --ablation` reports paired bootstrap intervals per arm, and `scripts/recall_diff.py`
-  lists the cases that moved.
+  lists the cases that moved. For two dispatched runs (a dial arm against the shipped default),
+  `python3 scripts/recall_compare.py <baseline.per-case.json> <candidate.per-case.json>` gives the
+  paired difference twice: per case, and per conversation, where every question about one
+  conversation moves as a unit. LoCoMo's questions share their conversation's memories, so the
+  per-case interval is too narrow; decide on the per-conversation columns. With the hold-out's
+  nine conversations the per-conversation randomisation test is exact and cannot go below
+  p = 2/512.
 - These are retrieval metrics (where the gold turn ranks). They are not the LLM-judged answer
   accuracy that Mem0, Zep and Letta publish for LoCoMo, and do not compare with it.
 

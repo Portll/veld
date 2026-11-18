@@ -304,6 +304,11 @@ jobs:
         working-directory: scripts
         run: python3 test_recall_diff.py
 
+      - name: Test the paired comparison
+        if: always()
+        working-directory: scripts
+        run: python3 test_recall_compare.py
+
       - name: Render the diff table
         if: always() && env.SUITE == 'locomo-gate' && hashFiles(format('current-{0}.json', matrix.engine)) != ''
         run: |
