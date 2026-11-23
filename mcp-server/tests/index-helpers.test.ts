@@ -7,6 +7,7 @@ import {
   formatTokenStatusText,
   normalizeLimit,
   shouldAppendProactiveContext,
+  shouldStreamToolCall,
 } from "../index-helpers";
 
 describe("buildProgressBar", () => {
@@ -86,6 +87,32 @@ describe("shouldAppendProactiveContext", () => {
   it("returns true for normal tools", () => {
     expect(shouldAppendProactiveContext("search_code")).toBe(true);
     expect(shouldAppendProactiveContext("read_file")).toBe(true);
+  });
+});
+
+describe("shouldStreamToolCall", () => {
+  it("does not echo reads of veld's own state", () => {
+    for (const tool of [
+      "recall",
+      "recall_by_tags",
+      "read_memory",
+      "list_todos",
+      "get_dials",
+      "dataset_query",
+    ]) {
+      expect(shouldStreamToolCall(tool)).toBe(false);
+    }
+  });
+
+  it("does not echo remember or forget", () => {
+    expect(shouldStreamToolCall("remember")).toBe(false);
+    expect(shouldStreamToolCall("forget")).toBe(false);
+  });
+
+  it("echoes tools that change state", () => {
+    expect(shouldStreamToolCall("add_todo")).toBe(true);
+    expect(shouldStreamToolCall("set_dials")).toBe(true);
+    expect(shouldStreamToolCall("backup_create")).toBe(true);
   });
 });
 

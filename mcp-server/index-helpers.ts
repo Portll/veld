@@ -15,6 +15,41 @@ const PROACTIVE_EXCLUDED_TOOLS = new Set([
   "memory_stats",
 ]);
 
+// An echo of a read returns what veld already holds as a new memory, so every
+// recall would surface the recall that found it. Writes that store their own
+// record (remember) or remove one (forget) would echo noise too.
+const UNSTREAMED_TOOLS = new Set([
+  "remember",
+  "forget",
+  "recall",
+  "recall_by_tags",
+  "read_memory",
+  "list_memories",
+  "context_summary",
+  "proactive_context",
+  "memory_stats",
+  "verify_index",
+  "consolidation_report",
+  "fact_narratives",
+  "facts_preview_purge",
+  "token_status",
+  "get_dials",
+  "backup_list",
+  "backup_verify",
+  "list_reminders",
+  "list_todos",
+  "list_subtasks",
+  "list_todo_comments",
+  "list_projects",
+  "todo_stats",
+  "dataset_list",
+  "dataset_query",
+]);
+
+export function shouldStreamToolCall(toolName: string): boolean {
+  return !UNSTREAMED_TOOLS.has(toolName);
+}
+
 export function buildProgressBar(percentUsed: number, barLength = 20): string {
   const clamped = Math.max(0, Math.min(100, Math.round(percentUsed)));
   const filledLength = Math.round((clamped / 100) * barLength);

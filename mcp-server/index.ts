@@ -47,6 +47,7 @@ import {
   formatResetTokenSessionText,
   formatTokenStatusText,
   shouldAppendProactiveContext,
+  shouldStreamToolCall,
 } from "./index-helpers";
 
 const __filename =
@@ -485,9 +486,7 @@ function streamToolCall(
   args: Record<string, unknown>,
   resultText: string,
 ): void {
-  // Skip ingesting memory management tools to avoid noise
-  if (["remember", "recall", "forget", "list_memories"].includes(toolName))
-    return;
+  if (!shouldStreamToolCall(toolName)) return;
 
   const argsStr = JSON.stringify(args, null, 2);
   const content = `Tool: ${toolName}\nInput: ${argsStr}\nResult: ${resultText.slice(0, 1000)}${resultText.length > 1000 ? "..." : ""}`;
