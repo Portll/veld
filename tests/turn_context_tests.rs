@@ -8,7 +8,7 @@
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 use veld::memory::index_text;
-use veld::memory::types::{Experience, ExperienceType, Query};
+use veld::memory::types::{EpisodeContext, Experience, ExperienceType, MemoryId, Query};
 use veld::memory::{CognitiveDials, MemoryConfig, MemorySystem};
 
 fn create_test_system() -> (MemorySystem, TempDir) {
@@ -186,17 +186,9 @@ fn a_turn_after_the_session_gap_has_no_prior() {
     assert_eq!(preceding, None);
 }
 
-/// With the dial off the record is written exactly as before: no threading.
-#[test]
-fn the_dial_turns_contextualisation_off() {
-    let (system, _dir) = create_test_system();
-    system.set_cognitive_dials(CognitiveDials {
-        turn_context: Some(false),
-        ..Default::default()
-    });
+fn weekend_plans(system: &MemorySystem) -> (MemoryId, MemoryId) {
     let at = Utc.with_ymd_and_hms(2022, 5, 1, 19, 31, 0).unwrap();
-
-    system
+    let first = system
         .remember(
             turn("Joanna: Any plans for the weekend?", "Joanna"),
             Some(at),
@@ -208,14 +200,66 @@ fn the_dial_turns_contextualisation_off() {
             Some(at),
         )
         .expect("second stored");
+    (first, second)
+}
 
-    let stored = system.get_memory(&second).expect("readable");
-    assert!(stored
-        .experience
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.episode.preceding_memory_id.clone())
-        .is_none());
+fn episode_of(system: &MemorySystem, id: &MemoryId) -> Option<EpisodeContext> {
+    let stored = system.get_memory(id).expect("readable");
+    stored.experience.context.map(|ctx| ctx.episode)
+}
+
+/// `turn_context` governs the index text only: the record is still threaded, so the
+/// successor index is built either way.
+#[test]
+fn the_record_is_threaded_with_contextualisation_off() {
+    let (system, _dir) = create_test_system();
+    system.set_cognitive_dials(CognitiveDials {
+        turn_context: Some(false),
+        ..Default::default()
+    });
+    let (first, second) = weekend_plans(&system);
+
+    let episode = episode_of(&system, &second).expect("threaded");
+    assert_eq!(episode.preceding_memory_id, Some(first.0.to_string()));
+    assert_eq!(system.turn_successors(&first), vec![second]);
+}
+
+/// The writer sent no episode, sequence or prior turn, and `remember` derived all three.
+#[test]
+fn remember_derives_the_episode_links_a_writer_left_out() {
+    let (system, _dir) = create_test_system();
+    let (first, second) = weekend_plans(&system);
+
+    let opening = episode_of(&system, &first).expect("threaded");
+    assert_eq!(opening.episode_id.as_deref(), Some("conv-42"));
+    assert_eq!(opening.sequence_number, Some(1));
+    assert!(opening.is_episode_start);
+    assert_eq!(opening.preceding_memory_id, None);
+
+    let reply = episode_of(&system, &second).expect("threaded");
+    assert_eq!(reply.episode_id.as_deref(), Some("conv-42"));
+    assert_eq!(reply.sequence_number, Some(2));
+    assert!(!reply.is_episode_start);
+    assert_eq!(reply.preceding_memory_id, Some(first.0.to_string()));
+}
+
+/// With `turn_derivation` off the record is stored as its writer sent it.
+#[test]
+fn the_dial_turns_derivation_off() {
+    let (system, _dir) = create_test_system();
+    system.set_cognitive_dials(CognitiveDials {
+        turn_derivation: Some(false),
+        ..Default::default()
+    });
+    let (first, second) = weekend_plans(&system);
+
+    for id in [&first, &second] {
+        let episode = episode_of(&system, id).unwrap_or_default();
+        assert_eq!(episode.episode_id, None);
+        assert_eq!(episode.sequence_number, None);
+        assert_eq!(episode.preceding_memory_id, None);
+    }
+    assert!(system.turn_successors(&first).is_empty());
 }
 
 /// The derivation itself, pinned so a re-index produces the same text.

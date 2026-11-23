@@ -5218,6 +5218,18 @@
           ]
         },
         {
+          "name": "turn_derivation",
+          "type": "Option<bool>",
+          "required": false,
+          "notes": [
+            "default when absent"
+          ],
+          "doc": "Whether `remember` writes into a linked memory the episode links its writer left out: the conversation key as `episode_id`, the prior turn resolved from that key as `preceding_memory_id`, and the next `sequence_number` (see `memory::index_text::thread_links`). The successor index and neighbour expansion read those links from the record. `None` keeps the engine default, which is on; `Some(false)` stores the record as the writer sent it.",
+          "refs": [
+            "Option"
+          ]
+        },
+        {
           "name": "neighbour_expansion",
           "type": "Option<bool>",
           "required": false,
@@ -5248,7 +5260,7 @@
           "notes": [
             "default when absent"
           ],
-          "doc": "Whether neighbour expansion also brings in the turn each ranked turn follows (its `preceding_memory_id`). `None` keeps the engine default, which is off.",
+          "doc": "Whether neighbour expansion also brings in the turn each ranked turn follows (its `preceding_memory_id`). `None` keeps the engine default, which is on: a question asked in the words of a reply reaches the turn that caused it.",
           "refs": [
             "Option"
           ]

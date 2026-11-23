@@ -174,6 +174,15 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub turn_context_embedding: Option<bool>,
 
+    /// Whether `remember` writes into a linked memory the episode links its writer left
+    /// out: the conversation key as `episode_id`, the prior turn resolved from that key as
+    /// `preceding_memory_id`, and the next `sequence_number` (see
+    /// `memory::index_text::thread_links`). The successor index and neighbour expansion
+    /// read those links from the record. `None` keeps the engine default, which is on;
+    /// `Some(false)` stores the record as the writer sent it.
+    #[serde(default)]
+    pub turn_derivation: Option<bool>,
+
     /// Whether recall runs neighbour expansion: for each of the top
     /// `neighbour_expansion_top` fused candidates that is a linked memory (a conversation
     /// turn or an episode-threaded memory), the memory recorded as following it (`memory::turn_successors`) joins the pre-rerank pool at
@@ -189,7 +198,8 @@ pub struct CognitiveDials {
     pub neighbour_expansion_top: Option<usize>,
 
     /// Whether neighbour expansion also brings in the turn each ranked turn follows (its
-    /// `preceding_memory_id`). `None` keeps the engine default, which is off.
+    /// `preceding_memory_id`). `None` keeps the engine default, which is on: a question
+    /// asked in the words of a reply reaches the turn that caused it.
     #[serde(default)]
     pub neighbour_expansion_predecessor: Option<bool>,
     /// Fused candidates kept for the cross-encoder layer (recall Layer 4's truncation).
@@ -747,6 +757,7 @@ impl Default for CognitiveDials {
             rerank_count: None,
             turn_context: None,
             turn_context_embedding: None,
+            turn_derivation: None,
             neighbour_expansion: None,
             neighbour_expansion_top: None,
             neighbour_expansion_predecessor: None,
@@ -920,6 +931,14 @@ impl CognitiveDials {
         self.turn_context_enabled() && self.turn_context_embedding.unwrap_or(false)
     }
 
+    /// Whether `remember` writes derived episode links into linked memories
+    /// (`turn_derivation`; the engine default is on). The `turn_derivation` signal
+    /// switches it off too.
+    #[inline]
+    pub fn turn_derivation_enabled(&self) -> bool {
+        self.turn_derivation.unwrap_or(true) && self.signal_enabled("turn_derivation")
+    }
+
     /// Whether recall runs neighbour expansion (`neighbour_expansion`; the engine
     /// default is on). The `neighbour_expansion` signal switches it off too.
     #[inline]
@@ -936,10 +955,10 @@ impl CognitiveDials {
     }
 
     /// Whether neighbour expansion also brings in each ranked turn's predecessor
-    /// (`neighbour_expansion_predecessor`; the engine default is off).
+    /// (`neighbour_expansion_predecessor`; the engine default is on).
     #[inline]
     pub fn neighbour_expansion_predecessor_enabled(&self) -> bool {
-        self.neighbour_expansion_enabled() && self.neighbour_expansion_predecessor.unwrap_or(false)
+        self.neighbour_expansion_enabled() && self.neighbour_expansion_predecessor.unwrap_or(true)
     }
 
     /// Cross-encoder share of the Layer 5.3 blend for a query shape: `ce_blend` when set,
@@ -1036,6 +1055,9 @@ impl CognitiveDials {
         }
         if let Some(v) = env_bool("VELD_DIALS_TURN_CONTEXT_EMBEDDING") {
             d.turn_context_embedding = Some(v);
+        }
+        if let Some(v) = env_bool("VELD_DIALS_TURN_DERIVATION") {
+            d.turn_derivation = Some(v);
         }
         if let Some(v) = env_bool("VELD_DIALS_NEIGHBOUR_EXPANSION") {
             d.neighbour_expansion = Some(v);
@@ -1200,7 +1222,9 @@ mod tests {
             crate::constants::NEIGHBOUR_EXPANSION_TOP_DEFAULT
         );
         assert!(d.neighbour_expansion_predecessor.is_none());
-        assert!(!d.neighbour_expansion_predecessor_enabled());
+        assert!(d.neighbour_expansion_predecessor_enabled());
+        assert!(d.turn_derivation.is_none());
+        assert!(d.turn_derivation_enabled());
         assert!(d.use_mmr.is_none());
         assert!(d.candidate_count.is_none());
         assert!(d.rerank_count.is_none());
@@ -1275,6 +1299,7 @@ mod tests {
             "temporal_fact_boost",
             "temporal_fact_untimed_fallback",
             "turn_context",
+            "turn_derivation",
             "neighbour_expansion",
             "ce_top_order",
         ];
