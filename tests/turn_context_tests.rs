@@ -262,6 +262,30 @@ fn the_dial_turns_derivation_off() {
     assert!(system.turn_successors(&first).is_empty());
 }
 
+/// A writer's `preceding_memory_id` naming no stored memory would thread the turn to
+/// nothing; the turn its conversation key resolves takes its place.
+#[test]
+fn a_prior_turn_naming_no_stored_memory_is_replaced() {
+    let (system, _dir) = create_test_system();
+    let at = Utc.with_ymd_and_hms(2022, 5, 1, 19, 31, 0).unwrap();
+    let first = system
+        .remember(
+            turn("Joanna: Any plans for the weekend?", "Joanna"),
+            Some(at),
+        )
+        .expect("first stored");
+    let mut reply = turn("Nate: Hiking, if the rain holds off.", "Nate");
+    let mut context = index_text::threaded_context(at);
+    context.episode.preceding_memory_id = Some(uuid::Uuid::new_v4().to_string());
+    reply.context = Some(context);
+    let second = system.remember(reply, Some(at)).expect("second stored");
+
+    let episode = episode_of(&system, &second).expect("threaded");
+    assert_eq!(episode.preceding_memory_id, Some(first.0.to_string()));
+    assert_eq!(episode.sequence_number, Some(2));
+    assert_eq!(system.turn_successors(&first), vec![second]);
+}
+
 /// The derivation itself, pinned so a re-index produces the same text.
 #[test]
 fn the_index_text_is_derived_from_content_and_the_prior_turn() {
