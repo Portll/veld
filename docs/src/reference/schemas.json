@@ -5152,7 +5152,7 @@
           "notes": [
             "default when absent"
           ],
-          "doc": "Override whether the cross-encoder rerank runs. `None` keeps the engine default ([`crate::constants::RERANK_ENABLED_DEFAULT`], off).",
+          "doc": "Override whether the cross-encoder rerank runs. `None` keeps the engine default.",
           "refs": [
             "Option"
           ]

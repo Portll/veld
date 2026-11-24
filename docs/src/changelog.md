@@ -161,7 +161,6 @@ Generated from git history. Sections are conventional-commit prefixes; hashes li
 
 ### docs
 
-- docs: regenerate the reference pages on train C3 (aac58b74)
 - docs(claude): serde(default) does not make a Memory field safe (0ae4aea7)
 - docs(generators): the config reference lists SHODH_* variables and switches read through named constants (d08fe051)
 - docs(upstream): ledger row for the directional suite port (#571) (ec10549a)

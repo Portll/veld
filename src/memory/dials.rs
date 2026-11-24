@@ -142,8 +142,7 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub refiner_mode: Option<RefinerMode>,
 
-    /// Override whether the cross-encoder rerank runs. `None` keeps the engine default
-    /// ([`crate::constants::RERANK_ENABLED_DEFAULT`], off).
+    /// Override whether the cross-encoder rerank runs. `None` keeps the engine default.
     #[serde(default)]
     pub use_reranking: Option<bool>,
 

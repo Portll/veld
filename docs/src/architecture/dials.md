@@ -151,7 +151,7 @@ Five retrieval dials drive the Layer 5.3 cross-encoder
 
 | Dial | Type | `None` means | Env seed |
 |---|---|---|---|
-| `use_reranking` | `Option<bool>` | `RERANK_ENABLED_DEFAULT`: the layer is skipped | `VELD_DIALS_USE_RERANKING` |
+| `use_reranking` | `Option<bool>` | the layer runs | `VELD_DIALS_USE_RERANKING` |
 | `rerank_count` | `Option<usize>`, clamped to 1..=200 | `RERANK_COUNT_DEFAULT` (30) candidates, whatever `max_results` is; a set value is the budget itself | `VELD_DIALS_RERANK_COUNT` |
 | `rerank_pool` | `Option<usize>`, clamped to 10..=500 | Layer 4 keeps `RERANK_POOL_DEFAULT` (50) fused candidates for the layer; never fewer than `rerank_count` | `VELD_DIALS_RERANK_POOL` |
 | `ce_blend` | `Option<f32>`, clamped to 0..=1 | each query shape takes its own cross-encoder share (`ce_blend_<shape>`, else `constants::CE_BLEND_*`); a set value is the share for every shape, and a decomposed query never takes less than its own | `VELD_TUNE_CE_BLEND` |

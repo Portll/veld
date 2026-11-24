@@ -16,7 +16,7 @@ flowchart TB
     BM --> RRF
     GR --> RRF
     RRF --> S20[20-signal<br/>composite score]
-    S20 --> CE[Cross-encoder rerank, opt-in<br/>top-30 of 50, 50% blend]
+    S20 --> CE[Cross-encoder rerank<br/>top-30 of 50, 50% blend]
     CE --> OUT[Ranked results +<br/>SignalAttribution]
 ```
 
@@ -36,7 +36,7 @@ development — the labels survive in the code as anchors for the
 | 4.527 | BM25 specificity discount | High-BM25 + zero-entity-overlap → 5% penalty |
 | 4.92 | Interference detection | Pairwise semantic opposition; demote older of two contradictory memories |
 | 5 | 20-signal composite score | Final ranking |
-| 5.3 | Cross-encoder reranker | Off by default; opted in, a 50% blend, top-30 budget from a 50-candidate pool |
+| 5.3 | Cross-encoder reranker | 50% blend, top-30 budget from a 50-candidate pool |
 | 5.85 | Linguistic boost (moved before ordinal pins) | Reorder for query-intent fit |
 | 5.87 | Calendar-aware temporal range demotion | "Last week" sweet spot — demote memories too far inside or outside the window |
 | 5.9 | Focal-entity recency scan (Strategy E) | Fallback when explicit entity queries are starved |
@@ -107,7 +107,7 @@ RRF fusion or scoring layer.
 
 ### Cross-encoder score (50% blend)
 
-**Function:** Bi-directional attention model that scores query-memory pairs *jointly* (not independently). Off by default (`RERANK_ENABLED_DEFAULT`); `VELD_DIALS_USE_RERANKING=true` opts in. Reranks the top 30 of the 50 candidates the cheap layers keep; blended at 50% (0 for identifier queries).
+**Function:** Bi-directional attention model that scores query-memory pairs *jointly* (not independently). Reranks the top 30 of the 50 candidates the cheap layers keep; blended at 50% (0 for identifier queries).
 **Benefit:** Cheap layers (vector + BM25) score independently and miss subtle relevance. Cross-encoder catches what bi-encoders can't — but is slow, so blends into the final score rather than dominating it. See [src/embeddings/cross_encoder.rs](https://github.com/Portll/veld/blob/main/src/embeddings/cross_encoder.rs).
 
 ### Importance (agent-set or inferred)
@@ -185,10 +185,6 @@ cross-encoder scores the top 30 (`RERANK_COUNT_DEFAULT`), and its score takes ha
 for every query shape but identifiers (`constants::CE_BLEND_*`). On the LoCoMo hold-out these
 settings beat the earlier 20-candidate, 18% blend on every metric in every conversation; the
 constants' doc comment has the numbers.
-
-The layer is off by default (`RERANK_ENABLED_DEFAULT`): its 30 forward passes per recall are
-the dominant cost on a loaded host. Set the `use_reranking` dial, or
-`VELD_DIALS_USE_RERANKING=true`, to opt in.
 
 ## Graph spreading activation
 

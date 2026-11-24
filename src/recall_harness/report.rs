@@ -127,8 +127,7 @@ pub const DEFAULT_RERANK_CAP: usize = crate::constants::RERANK_COUNT_DEFAULT;
 /// baseline would read as a regression no code caused.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RerankSetting {
-    /// Whether recall reranks: the `use_reranking` dial, or its default
-    /// ([`crate::constants::RERANK_ENABLED_DEFAULT`]), is on and a reranker is configured.
+    /// Whether recall reranks: the `use_reranking` dial is not off and a reranker is configured.
     pub enabled: bool,
     /// The cross-encoder that loaded, by registry id. `None` when reranking is off.
     pub model: Option<String>,
@@ -149,10 +148,7 @@ impl RerankSetting {
     /// The setting `system` recalls under, given the cross-encoder that loaded for it.
     pub fn of(system: &crate::memory::MemorySystem, model: Option<String>) -> Self {
         let dials = system.cognitive_dials();
-        let enabled = dials
-            .use_reranking
-            .unwrap_or(crate::constants::RERANK_ENABLED_DEFAULT)
-            && model.is_some();
+        let enabled = dials.use_reranking != Some(false) && model.is_some();
         Self {
             enabled,
             model: if enabled { model } else { None },
