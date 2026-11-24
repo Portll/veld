@@ -13,3 +13,11 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 [[profile.ci.overrides]]
 filter = 'binary(recall_engine_parity)'
 slow-timeout = { period = "120s", terminate-after = 15 }
+
+# The recall harness pins the cross-encoder to one ONNX thread, and since 60a0400 it reranks 30 of
+# 50 candidates on every recall. At load ~330 the planted-repetition and smoke-suite runner tests
+# both ran past fifteen minutes on main 6925ad42 (2026-11-24); with reranking off, the planted test
+# took 289 s.
+[[profile.ci.overrides]]
+filter = 'binary_id(veld) & test(/^recall_harness::/)'
+slow-timeout = { period = "120s", terminate-after = 15 }
