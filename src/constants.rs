@@ -2918,6 +2918,16 @@ pub const RERANK_POOL_DEFAULT: usize = 50;
 /// 4% median latency over scoring 20 of 30.
 pub const RERANK_COUNT_DEFAULT: usize = 30;
 
+/// Whether the Layer 5.3 cross-encoder rerank runs when no `use_reranking` dial is set.
+///
+/// Off. Since the depth went to 30 of a 50-candidate pool at a 0.5 share (2026-11-18), every recall
+/// makes 30 cross-encoder forward passes, and the recall harness pins the model to one ONNX thread:
+/// at load ~330 the planted-repetition and smoke-suite harness tests ran past thirty minutes each,
+/// against 289 s for the planted test with reranking off (2026-11-24). Off gives up the hold-out
+/// gains measured at that depth (p@1 0.470 → 0.496, MRR 0.548 → 0.570, recall@10 0.630 → 0.648;
+/// see [`CE_BLEND_IDENTIFIER`]). Set the dial, or `VELD_DIALS_USE_RERANKING=true`, to opt in.
+pub const RERANK_ENABLED_DEFAULT: bool = false;
+
 /// Below this share the reranker is not called at all: at scale it is the dominant
 /// latency cost and a share this small cannot move a rank.
 pub const CE_BLEND_SKIP_BELOW: f32 = 0.05;

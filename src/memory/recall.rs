@@ -3620,8 +3620,9 @@ impl super::MemorySystem {
         //
         // Only runs on the top `rerank_budget` candidates to keep latency bounded.
         //
-        // Dial gate: VELD_DIALS_USE_RERANKING=false (or cognitive_dials.use_reranking =
-        // Some(false)) fully skips this layer. The `rerank_count` dial caps the
+        // Dial gate: the layer runs only when cognitive_dials.use_reranking (or
+        // VELD_DIALS_USE_RERANKING) is true, or is unset and `constants::RERANK_ENABLED_DEFAULT`
+        // is. The `rerank_count` dial caps the
         // candidate budget; absent that, `constants::RERANK_COUNT_DEFAULT` applies.
         let rerank_shape = query_parser::classify_rerank_shape(query_text, decomposed, &query_type);
         let (layer53_use_reranking, layer53_rerank_count_dial, ce_w, rerank_context) = {
@@ -3647,7 +3648,7 @@ impl super::MemorySystem {
         }
         if memories.len() > 1
             && ce_w >= crate::constants::CE_BLEND_SKIP_BELOW
-            && layer53_use_reranking.unwrap_or(true)
+            && layer53_use_reranking.unwrap_or(crate::constants::RERANK_ENABLED_DEFAULT)
             && query
                 .layer_mode()
                 .allows(crate::memory::types::LayerMode::PlusRerank)

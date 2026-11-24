@@ -1465,7 +1465,7 @@ Defined in `src/memory/dials.rs`. Runtime-tunable cognitive parameters for a sin
 | `max_active_shadows` | `usize` | no | default when absent; Max simultaneous labile shadows before the oldest (expired-first) are evicted on the recall path. Caps memory + per-cycle re-encode work. |
 | `working_memory_threshold` | `u32` | no | default when absent; Consecutive-retrieval count at/above which a shadow is treated as *working memory* and kept labile (NOT drained at window close). Lower ⇒ drains sooner. |
 | `refiner_mode` | Option&lt;[`RefinerMode`](#refinermode)&gt; | no | default when absent; Override the post-fusion refiner stage. `None` keeps the engine default. |
-| `use_reranking` | `Option<bool>` | no | default when absent; Override whether the cross-encoder rerank runs. `None` keeps the engine default. |
+| `use_reranking` | `Option<bool>` | no | default when absent; Override whether the cross-encoder rerank runs. `None` keeps the engine default ([`crate::constants::RERANK_ENABLED_DEFAULT`], off). |
 | `use_mmr` | `Option<bool>` | no | default when absent; Override whether Layer 5.4 MMR diversification runs. `None` keeps the engine default ([`crate::constants::MMR_ENABLED_DEFAULT`], off). |
 | `candidate_count` | `Option<usize>` | no | default when absent; Override the initial candidate-pool size. `None` keeps the engine default. |
 | `rerank_count` | `Option<usize>` | no | default when absent; Override the rerank top-k. `None` keeps the engine default. |

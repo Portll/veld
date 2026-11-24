@@ -16,7 +16,7 @@ How veld behaves as data grows, and the migration paths between tiers / backends
 |---|---|
 | < 1 000 | Working/Session brute-force cosine (Layer 3.5) covers everything |
 | 1 000 – 50 000 | HNSW + BM25 (Tantivy) hybrid kicks in for the LongTerm tier |
-| 50 000 – 500 000 | Cross-encoder rerank budget (top 30 of a 50-candidate pool, 50% blend) is the dominant cost; consider tuning [`CognitiveDials`](docs/src/architecture/dials.md) to reduce rerank K |
+| 50 000 – 500 000 | With reranking on (it is off by default), the cross-encoder budget (top 30 of a 50-candidate pool, 50% blend) is the dominant cost; consider tuning [`CognitiveDials`](docs/src/architecture/dials.md) to reduce rerank K |
 | 500 000+ | Vamana / SPANN large-collection indexes available in [src/vector_db/](src/vector_db/); SQLite slow store for gap topology queries |
 
 ### Tier promotion (drives what's hot vs cold)

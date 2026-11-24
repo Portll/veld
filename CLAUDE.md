@@ -97,7 +97,7 @@ The retrieval pipeline is **multi-layer hybrid search**, not a single algorithm.
 - **Vector search**: HNSW (default), Vamana/DiskANN, SPANN, and PQ codecs all live in [src/vector_db/](src/vector_db/). HNSW is the active retrieval engine. Every embedding space but the primary is indexed as flat PQ codes reranked against the records' exact vectors ([src/vector_db/quantized.rs](src/vector_db/quantized.rs); `VELD_SPACE_CODEC=f32` keeps a Vamana graph instead).
 - **BM25 keyword search** via Tantivy (full-text index).
 - **Graph spreading activation** over Hebbian edges in [src/memory/graph_retrieval.rs](src/memory/graph_retrieval.rs).
-- **Cross-encoder reranking** ([src/embeddings/cross_encoder.rs](src/embeddings/cross_encoder.rs)) at a 50% blend (0 for identifier queries), scoring the top 30 of a 50-candidate pool.
+- **Cross-encoder reranking** ([src/embeddings/cross_encoder.rs](src/embeddings/cross_encoder.rs)), off by default; `VELD_DIALS_USE_RERANKING=true` opts in (`RERANK_ENABLED_DEFAULT`): a 50% blend (0 for identifier queries), scoring the top 30 of a 50-candidate pool.
 - **Dual-embedder competition**: MiniLM 384d + Nomic 768d via LM Studio / Ollama / vLLM HTTP API (auto-detect). `CompetitiveEmbedder` uses `Arc<dyn Embedder>`.
 - **20-signal scoring** ([src/memory/types.rs](src/memory/types.rs) `ScoringSignals`): base score, recency, arousal, source credibility, temporal match, session boost, access count, graph strength, calibrated confidence (Bayesian α/β), confidence observations, feedback momentum (EMA), cross-encoder, importance, entity match, tag match, episode coherence, source-type multiplier, emotional valence intensity, sequence proximity, activation level, temporal fact density, entity density.
 - **External-dimension modulation** from Spine's evaluation engine via `ExternalDimensionScores` (density, coherence, closure, confidence, isotropy) — modulates retrieval rank when fresh.
@@ -332,7 +332,7 @@ How veld behaves as data grows, and the migration paths between tiers / backends
 |---|---|
 | < 1 000 | Working/Session brute-force cosine (Layer 3.5) covers everything |
 | 1 000 – 50 000 | HNSW + BM25 (Tantivy) hybrid kicks in for the LongTerm tier |
-| 50 000 – 500 000 | Cross-encoder rerank budget (top 30 of a 50-candidate pool, 50% blend) is the dominant cost; consider tuning [`CognitiveDials`](docs/src/architecture/dials.md) to reduce rerank K |
+| 50 000 – 500 000 | With reranking on (it is off by default), the cross-encoder budget (top 30 of a 50-candidate pool, 50% blend) is the dominant cost; consider tuning [`CognitiveDials`](docs/src/architecture/dials.md) to reduce rerank K |
 | 500 000+ | Vamana / SPANN large-collection indexes available in [src/vector_db/](src/vector_db/); SQLite slow store for gap topology queries |
 
 ### Tier promotion (drives what's hot vs cold)

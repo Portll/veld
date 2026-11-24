@@ -1900,17 +1900,17 @@ const ABLATION_BOOTSTRAP_RESAMPLES: usize = 2000;
 /// Fixed so a report regenerated from the same per-case data carries the same
 /// intervals.
 const ABLATION_BOOTSTRAP_SEED: u64 = 0x5EED_AB1A;
-/// How a row names the dial the `-ce` arm turns.
-pub(crate) const RERANK_OFF_FLAG: &str = "dials.use_reranking=false";
+/// How a row names the dial the `+ce` arm turns.
+pub(crate) const RERANK_ON_FLAG: &str = "dials.use_reranking=true";
 
 /// One arm of the ablation matrix: the env overrides it applies, whether it turns
-/// the cross-encoder rerank off, and the arm it is measured against.
+/// the cross-encoder rerank on, and the arm it is measured against.
 pub(crate) struct AblationConfig {
     pub(crate) name: &'static str,
     pub(crate) env: Vec<(&'static str, &'static str)>,
-    /// Runs the arm with the `use_reranking` dial off. A dial, not an env flag:
+    /// Runs the arm with the `use_reranking` dial on. A dial, not an env flag:
     /// the dials read the environment once, when the memory system is built.
-    pub(crate) rerank_off: bool,
+    pub(crate) rerank_on: bool,
     /// `None` only for the baseline. Every other arm is its reference plus what it
     /// adds, so its delta is attributable to exactly that.
     pub(crate) reference: Option<&'static str>,
@@ -1924,8 +1924,8 @@ impl AblationConfig {
 
     fn flags(&self) -> Vec<String> {
         let mut flags: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        if self.rerank_off {
-            flags.push(RERANK_OFF_FLAG.to_string());
+        if self.rerank_on {
+            flags.push(RERANK_ON_FLAG.to_string());
         }
         flags
     }
@@ -1940,9 +1940,10 @@ impl AblationConfig {
 /// [`UNAVAILABLE_IN_VELD`]. The guard test
 /// `every_ablation_arm_flag_is_read_in_src_or_declared_unavailable` enforces this.
 ///
-/// The baseline is the pipeline as veld ships it, cross-encoder rerank included,
-/// so the leave-one-out arms read each component's marginal contribution at the
-/// operating point users get, and `-ce` reads the reranker's.
+/// The baseline is the pipeline as veld ships it, cross-encoder rerank off
+/// ([`crate::constants::RERANK_ENABLED_DEFAULT`]), so the leave-one-out arms read
+/// each component's marginal contribution at the operating point users get, and
+/// `+ce` reads what the reranker would add.
 ///
 /// Setting `SHODH_DISABLE_BOOSTS` replaces its default-disabled set, so every arm
 /// that sets it names `hebbian` and `graph_strength` (or `all`) to keep those terms
@@ -1953,7 +1954,7 @@ pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
         AblationConfig {
             name,
             env: env.to_vec(),
-            rerank_off: false,
+            rerank_on: false,
             reference: Some(ABLATION_BASELINE),
         }
     }
@@ -1961,7 +1962,7 @@ pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
         AblationConfig {
             name: ABLATION_BASELINE,
             env: vec![],
-            rerank_off: false,
+            rerank_on: false,
             reference: None,
         },
         arm(
@@ -2019,9 +2020,9 @@ pub(crate) fn ablation_configs() -> Vec<AblationConfig> {
         arm("leg=bm25", &[("SHODH_LEG", "bm25")]),
         arm("leg=graph", &[("SHODH_LEG", "graph")]),
         AblationConfig {
-            name: "-ce",
+            name: "+ce",
             env: vec![],
-            rerank_off: true,
+            rerank_on: true,
             reference: Some(ABLATION_BASELINE),
         },
     ]
@@ -2167,7 +2168,8 @@ fn preflight_ablation_env(configs: &[AblationConfig]) -> Result<()> {
 /// `CrossEncoderReranker::rerank` falls back to bi-encoder scores when the model
 /// is missing, so without this a run would report the unreranked pipeline under
 /// the shipped one's name. Loads the model now and scores one pair. Nothing is
-/// checked when the `use_reranking` dial is off, since then no reranker runs.
+/// checked when reranking is off (the `use_reranking` dial, or its default
+/// [`crate::constants::RERANK_ENABLED_DEFAULT`]), since then no reranker runs.
 /// `cfg!(test)` is exempt, as in [`guard_ner_backend`]: lib tests exercise the
 /// harness machinery on machines that may lack the model. Returns the id of the
 /// cross-encoder that loaded, `None` when none was checked.
@@ -2177,8 +2179,12 @@ pub(crate) fn guard_cross_encoder(manager: &MultiUserMemoryManager) -> Result<Op
     }
     let system = manager.get_user_memory(EVAL_USER)?;
     let system = system.read();
-    if system.cognitive_dials().use_reranking == Some(false) {
-        eprintln!("CROSS_ENCODER=off (use_reranking dial)");
+    if !system
+        .cognitive_dials()
+        .use_reranking
+        .unwrap_or(crate::constants::RERANK_ENABLED_DEFAULT)
+    {
+        eprintln!("CROSS_ENCODER=off (use_reranking dial or its default)");
         return Ok(None);
     }
     match system.probe_cross_encoder() {
@@ -2193,8 +2199,8 @@ pub(crate) fn guard_cross_encoder(manager: &MultiUserMemoryManager) -> Result<Op
         Some(Err(e)) => anyhow::bail!(
             "recall harness refusing to run: the cross-encoder did not load ({e:#}), so \
              reranking would fall back to bi-encoder scores and the run would measure a \
-             pipeline veld does not ship. Provide the model, or switch reranking off with \
-             VELD_DIALS_USE_RERANKING=false to measure without it."
+             pipeline it names. Provide the model, or leave VELD_DIALS_USE_RERANKING unset \
+             to measure without it."
         ),
     }
 }
@@ -2268,12 +2274,12 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
                 std::env::set_var(k, v);
             }
         }
-        let dials_before = config.rerank_off.then(|| {
+        let dials_before = config.rerank_on.then(|| {
             let guard = system.read();
             let before = guard.cognitive_dials();
-            let mut off = before.clone();
-            off.use_reranking = Some(false);
-            guard.set_cognitive_dials(off);
+            let mut on = before.clone();
+            on.use_reranking = Some(true);
+            guard.set_cognitive_dials(on);
             before
         });
 
@@ -2475,7 +2481,7 @@ mod ablation_config_tests {
         assert_eq!(roots.len(), 1, "exactly one arm may be unreferenced");
         assert_eq!(roots[0].name, ABLATION_BASELINE);
         assert!(
-            roots[0].env.is_empty() && !roots[0].rerank_off,
+            roots[0].env.is_empty() && !roots[0].rerank_on,
             "the baseline must be the pipeline as it ships"
         );
     }
@@ -2501,8 +2507,8 @@ mod ablation_config_tests {
                 );
             }
             assert!(
-                !r.rerank_off || c.rerank_off,
-                "`{}` turns the reranker back on against `{reference}`",
+                !r.rerank_on || c.rerank_on,
+                "`{}` turns the reranker back off against `{reference}`",
                 c.name
             );
             assert!(
@@ -2514,13 +2520,13 @@ mod ablation_config_tests {
     }
 
     #[test]
-    fn the_rerank_off_arm_names_its_dial_in_its_flags() {
+    fn the_rerank_on_arm_names_its_dial_in_its_flags() {
         let configs = ablation_configs();
         let ce = configs
             .iter()
-            .find(|c| c.rerank_off)
+            .find(|c| c.rerank_on)
             .expect("an arm measures the cross-encoder");
-        assert_eq!(ce.flags(), vec![RERANK_OFF_FLAG.to_string()]);
+        assert_eq!(ce.flags(), vec![RERANK_ON_FLAG.to_string()]);
         assert_eq!(ce.reference, Some(ABLATION_BASELINE));
     }
 
@@ -5660,7 +5666,7 @@ mod tests {
             &AblationConfig {
                 name: "+x",
                 env: vec![("SHODH_GRAPH_TRAVERSE", "1")],
-                rerank_off: false,
+                rerank_on: false,
                 reference: Some(ABLATION_BASELINE),
             },
             "why".into(),

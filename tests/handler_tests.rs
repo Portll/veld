@@ -3608,21 +3608,20 @@ async fn a_declared_file_path_is_recalled_by_its_file_name() {
 
     // With the reranker, then with reranking off. Off, Layer 5.3 is skipped and the fused order
     // stands: the order a declared path keeps when no cross-encoder can score it, where the
-    // bi-encoder fallback would rank `server.mjs` beside `serve.mjs`.
+    // bi-encoder fallback would rank `server.mjs` beside `serve.mjs`. Both are set explicitly
+    // because reranking is off by default (`constants::RERANK_ENABLED_DEFAULT`).
     for use_reranking in [true, false] {
-        if !use_reranking {
-            let (status, mut dials) =
-                json_of(h.app(), authed_get(&format!("/api/dials?user_id={user}"))).await;
-            assert_eq!(status, StatusCode::OK, "{dials}");
-            dials["use_reranking"] = json!(false);
-            let (status, body) = json_of(
-                h.app(),
-                authed_put("/api/dials", json!({"user_id": user, "dials": dials})),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
-            assert_eq!(body["use_reranking"], json!(false));
-        }
+        let (status, mut dials) =
+            json_of(h.app(), authed_get(&format!("/api/dials?user_id={user}"))).await;
+        assert_eq!(status, StatusCode::OK, "{dials}");
+        dials["use_reranking"] = json!(use_reranking);
+        let (status, body) = json_of(
+            h.app(),
+            authed_put("/api/dials", json!({"user_id": user, "dials": dials})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["use_reranking"], json!(use_reranking));
         for query in [
             "what changed in serve.mjs",
             "what changed in admin/serve.mjs",

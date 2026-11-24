@@ -38,7 +38,7 @@ Retrieval is the hot path. The pipeline is multi-layer hybrid search — no sing
 | 4.527 | BM25 specificity discount (high BM25, zero entity overlap → 5% penalty) | Modifier |
 | 4.92 | Interference detection (pairwise semantic opposition, demote older) | Modifier |
 | 5 | 20-signal composite score | Final ranking |
-| 5.3 | Cross-encoder reranker | 50% blend, top-30 budget from a 50-candidate pool |
+| 5.3 | Cross-encoder reranker | Off by default; opted in, a 50% blend, top-30 budget from a 50-candidate pool |
 | 5.9 | Focal-entity recency scan | Fallback for entity queries |
 
 ### 20 scoring signals (overview)
