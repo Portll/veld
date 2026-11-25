@@ -1521,7 +1521,13 @@ mod tests {
             .unwrap();
         let content = |text: &str| json!({"type": "content", "content": text, "importance": 0.9});
 
-        let ack = exchange(&mut socket, json!({"user_id": USER})).await;
+        // A slow handshake would otherwise let the time trigger extract on the content
+        // message, leaving the flush nothing to store.
+        let ack = exchange(
+            &mut socket,
+            json!({"user_id": USER, "extraction_config": {"checkpoint_interval_ms": 0}}),
+        )
+        .await;
         assert_eq!(ack["type"], "ack", "{ack}");
         exchange(&mut socket, content("the pier lights come on at dusk")).await;
         let stored = exchange(&mut socket, json!({"type": "flush"})).await;
