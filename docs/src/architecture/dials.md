@@ -34,6 +34,25 @@ the embedder is fed for turns written afterwards; records already written
 keep their embedding until re-indexed. Prior-turn resolution is counted in
 `veld_turn_context_total{source="preceding_id"|"conversation_key"|"none"}`.
 
+### Ingest dial: `turn_derivation`
+
+`turn_derivation: Option<bool>` controls whether `remember` writes into a
+linked memory the episode links its writer left out: the conversation key as
+`episode_id`, the prior turn resolved from that key as `preceding_memory_id`,
+and the next `sequence_number` (`thread_links` in `src/memory/index_text.rs`).
+The key is the memory's `episode_id`, else its first `conv-*` tag, else the
+transcript (`transcript:<id>`) or session (`session:<id>`) its writer declared.
+A field the writer sent is kept; a `preceding_memory_id` naming no stored
+memory is replaced by the turn resolved from the key. Numbering continues the
+prior turn's, or the chain tail's across a session gap, and starts at 1 for a
+conversation with no tail. After a restart that evicted a conversation's tail
+from working memory, its numbering starts again at 1. `None` keeps the engine
+default, which is **on**; `Some(false)` stores the record as the writer sent
+it. Env seed: `VELD_DIALS_TURN_DERIVATION=0|1`. `turn_context` governs only
+the index text, so a record is threaded with `turn_context` off. Derived
+fields are counted in
+`veld_turn_derived_total{field="episode_id"|"sequence_number"|"preceding_memory_id"}`.
+
 ### Recall dials: neighbour expansion
 
 An anaphoric reply ("Nate: I've had them for 3 years now!") shares no word
@@ -49,14 +68,15 @@ error it fixed the way a reply follows its question.
 |---|---|---|---|
 | `neighbour_expansion` | `VELD_DIALS_NEIGHBOUR_EXPANSION=0\|1` | `None` (on) | For each of the top `neighbour_expansion_top` fused candidates that is a live linked memory, the memories recorded as following it (at most two) join the pool at the parent's fused score × `NEIGHBOUR_EXPANSION_SCORE_DECAY` (0.95, `src/constants.rs`). A neighbour already in the pool below that score is lifted to it. A neighbour always scores below its parent, so the top fused candidate does not change. `Some(false)` leaves the pool as fusion built it. |
 | `neighbour_expansion_top` | `VELD_DIALS_NEIGHBOUR_EXPANSION_TOP=<n>` | `None` (10) | How many top fused candidates are read as parents. Sanitised to `1..=50` (50 is the widest pre-rerank pool, a decomposed query's). |
-| `neighbour_expansion_predecessor` | `VELD_DIALS_NEIGHBOUR_EXPANSION_PREDECESSOR=0\|1` | `None` (off) | Also brings in the turn each ranked turn follows (its `preceding_memory_id`), at the same score. Has no effect while `neighbour_expansion` is off. |
+| `neighbour_expansion_predecessor` | `VELD_DIALS_NEIGHBOUR_EXPANSION_PREDECESSOR=0\|1` | `None` (on) | Also brings in the turn each ranked turn follows (its `preceding_memory_id`), at the same score, so a question asked in the words of a fix reaches the error it fixed. `Some(false)` runs the successor leg alone. Has no effect while `neighbour_expansion` is off. |
 
 The successors come from a per-user index written by `remember`
 (`src/memory/turn_successors.rs`, one KV row per prior → successor pair,
 the same on RocksDB and redb), so a turn ranked after a restart still finds
-its reply. A row is written only when `remember` resolves the prior turn,
-which `turn_context` governs: turns written while `turn_context` is off have
-no successor rows. A successor forgotten since its row was written is
+its reply. A row is written only when the stored record names the turn it
+follows, which its writer sent or `turn_derivation` derived: turns written
+while `turn_derivation` is off have rows only where the writer threaded them.
+A successor forgotten since its row was written is
 skipped. The leg runs in the `Full` layer mode only, so the layer-attribution
 rungs below it are unchanged. Turns placed are counted in
 `veld_recall_neighbour_candidates_total{direction="successor"|"predecessor"}`,
@@ -77,8 +97,9 @@ diff two runs that overrode them differently.
 ### Signal switches
 
 `disabled_signals` (`VELD_DIALS_DISABLE_SIGNALS=id,id`) switches named recall
-signals off; every signal runs by default. `turn_context` and
-`neighbour_expansion` honour it too, so one build runs an arm with them off.
+signals off; every signal runs by default. `turn_context`,
+`turn_derivation` and `neighbour_expansion` honour it too, so one build runs an
+arm with them off.
 
 `enabled_signals` (`VELD_DIALS_ENABLE_SIGNALS=id,id`) switches on opt-in
 signals: ranking changes kept measurable on one build that did not earn a

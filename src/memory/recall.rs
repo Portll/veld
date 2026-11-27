@@ -7744,20 +7744,20 @@ mod neighbour_expansion_tests {
     }
 
     #[test]
-    fn the_predecessor_comes_in_only_under_its_dial() {
+    fn the_predecessor_comes_in_by_default_and_its_dial_switches_it_off() {
         let (sys, _tmp) = fresh_system();
         let (question, reply, _) = conversation(&sys);
-        let alone = sys.neighbour_candidates(&[(reply.clone(), 0.5)]);
-        assert!(
-            !alone.iter().any(|(id, _)| *id == question),
-            "the predecessor leg is off by default: {alone:?}"
-        );
+        let got = sys.neighbour_candidates(&[(reply.clone(), 0.5)]);
+        assert!(got.contains(&(question.clone(), 0.5 * DECAY)), "{got:?}");
         sys.set_cognitive_dials(CognitiveDials {
-            neighbour_expansion_predecessor: Some(true),
+            neighbour_expansion_predecessor: Some(false),
             ..Default::default()
         });
-        let got = sys.neighbour_candidates(&[(reply, 0.5)]);
-        assert!(got.contains(&(question, 0.5 * DECAY)), "{got:?}");
+        let alone = sys.neighbour_candidates(&[(reply, 0.5)]);
+        assert!(
+            !alone.iter().any(|(id, _)| *id == question),
+            "the dial off runs the successor leg alone: {alone:?}"
+        );
     }
 
     #[test]

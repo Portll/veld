@@ -6,7 +6,7 @@
 
 # Metrics Reference
 
-Veld exposes **50** Prometheus metrics on the `/metrics` endpoint. Visibility is configured by `VELD_METRICS_PUBLIC` — when `true`, `/metrics` is unauthenticated; otherwise it requires an API key.
+Veld exposes **51** Prometheus metrics on the `/metrics` endpoint. Visibility is configured by `VELD_METRICS_PUBLIC` — when `true`, `/metrics` is unauthenticated; otherwise it requires an API key.
 
 | Name | Kind | Help | Source |
 |---|---|---|---|
@@ -56,6 +56,7 @@ Veld exposes **50** Prometheus metrics on the `/metrics` endpoint. Visibility is
 | `veld_store_duration_seconds` | Histogram | Memory store operation duration | `src/metrics.rs` |
 | `veld_store_total` | IntCounterVec | Total memory store operations | `src/metrics.rs` |
 | `veld_turn_context_total` | IntCounterVec | Conversation turns contextualised at ingest, by prior-turn source | `src/metrics.rs` |
+| `veld_turn_derived_total` | IntCounterVec | Episode links derived into linked memories at ingest, by field | `src/metrics.rs` |
 | `veld_vector_search_total` | IntGauge | Total vector search operations | `src/metrics.rs` |
 | `veld_write_gate_duplicates_total` | IntCounter | Memories kept and tagged as duplicates by the write gate, by kind | `src/metrics.rs` |
 | `veld_write_stage_duration_seconds` | HistogramVec | Duration of each stage of the memory write path | `src/metrics.rs` |

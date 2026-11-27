@@ -995,6 +995,19 @@ pub static TURN_CONTEXT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("TURN_CONTEXT_TOTAL metric must be valid at compile time")
 });
 
+/// Episode links `remember` derived into linked memories whose writer left them out, by
+/// field: `episode_id`, `sequence_number`, `preceding_memory_id`.
+pub static TURN_DERIVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_turn_derived_total",
+            "Episode links derived into linked memories at ingest, by field",
+        ),
+        &["field"],
+    )
+    .expect("TURN_DERIVED_TOTAL metric must be valid at compile time")
+});
+
 pub static EMBEDDING_CACHE_CONTENT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -1246,6 +1259,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(EMBEDDING_CACHE_QUERY, "EMBEDDING_CACHE_QUERY");
     register!(EMBEDDING_CACHE_CONTENT, "EMBEDDING_CACHE_CONTENT");
     register!(TURN_CONTEXT_TOTAL, "TURN_CONTEXT_TOTAL");
+    register!(TURN_DERIVED_TOTAL, "TURN_DERIVED_TOTAL");
     register!(
         RECALL_NEIGHBOUR_CANDIDATES_TOTAL,
         "RECALL_NEIGHBOUR_CANDIDATES_TOTAL"

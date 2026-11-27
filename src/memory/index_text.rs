@@ -25,8 +25,11 @@
 //!
 //! The prior turn comes from `preceding_memory_id` when the writer threaded the
 //! episode; otherwise it is the latest conversation memory sharing the same
-//! conversation key (an `episode_id` or a `conv-*` tag) within the session gap
-//! (two hours), ordered by sequence number where both turns carry one.
+//! conversation key (an `episode_id`, a `conv-*` tag, or the transcript or session
+//! its writer declared) within the session gap (two hours), ordered by sequence
+//! number where both turns carry one. [`thread_links`] writes the links the writer
+//! left out back into the record, so the successor index and neighbour expansion
+//! read one chain whoever wrote the turn.
 //! Resolution lives on [`crate::memory::MemorySystem`]; this module is the pure
 //! text derivation plus the chain bookkeeping it needs.
 
@@ -52,6 +55,12 @@ pub const PRIOR_ENTITY_MAX: usize = 12;
 /// Inter-turn gap beyond which two turns are not the same session, in seconds.
 /// Matches `wavelet_sessions::detect_sessions`'s fixed threshold.
 pub const SESSION_GAP_SECS: i64 = 7_200;
+
+/// Prefix of a conversation key taken from the writer's declared transcript.
+pub const DECLARED_TRANSCRIPT_KEY_PREFIX: &str = "transcript:";
+
+/// Prefix of a conversation key taken from the writer's declared session.
+pub const DECLARED_SESSION_KEY_PREFIX: &str = "session:";
 
 /// Where the prior turn was found. Recorded in `veld_turn_context_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,23 +143,110 @@ pub fn applies(experience: &Experience) -> bool {
         })
 }
 
-/// The key that groups turns into one conversation: the episode id when set,
-/// else the first `conv-*` tag.
+/// The key that groups turns into one conversation: the episode id when set, else the
+/// first `conv-*` tag, else the transcript or session its writer declared.
+///
+/// The declared transcript comes before the declared session because a resumed session
+/// forks its id while keeping its transcript. A declared key carries a prefix, so it
+/// cannot collide with an episode id or tag another writer chose.
 pub fn conversation_key(experience: &Experience) -> Option<String> {
-    if let Some(id) = experience
-        .context
-        .as_ref()
+    let context = experience.context.as_ref();
+    if let Some(id) = context
         .and_then(|ctx| ctx.episode.episode_id.as_deref())
         .filter(|id| !id.trim().is_empty())
     {
         return Some(id.to_string());
     }
-    experience
+    if let Some(tag) = experience
         .tags
         .iter()
         .chain(experience.entities.iter())
         .find(|tag| is_conversation_tag(tag))
-        .cloned()
+    {
+        return Some(tag.clone());
+    }
+    let declared = &context?.session.declared;
+    let non_blank = |id: &Option<String>| {
+        id.as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    };
+    non_blank(&declared.transcript_id)
+        .map(|id| format!("{DECLARED_TRANSCRIPT_KEY_PREFIX}{id}"))
+        .or_else(|| {
+            non_blank(&declared.session_id).map(|id| format!("{DECLARED_SESSION_KEY_PREFIX}{id}"))
+        })
+}
+
+/// The episode fields [`thread_links`] filled in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedLinks {
+    pub episode_id: bool,
+    pub sequence_number: bool,
+    pub preceding_memory_id: bool,
+}
+
+/// Write into a linked memory the episode links its writer left out: the conversation
+/// key as its `episode_id`, the prior turn resolved from that key as its
+/// `preceding_memory_id`, and its place in the conversation as its `sequence_number`.
+/// A field the writer sent is kept, except a `preceding_memory_id` naming no stored
+/// memory, which the turn resolved from the key replaces. Nothing is written without a
+/// conversation key.
+///
+/// `tail` is the conversation's chain tail before this turn and `prior` the turn it
+/// follows, both resolved by the caller. The sequence number continues the prior
+/// turn's; when the session gap split the conversation it continues the tail's, so the
+/// tail stays the highest-numbered turn; a conversation with no tail starts at 1. A
+/// prior or tail without a number leaves the turn unnumbered rather than guessing.
+pub fn thread_links(
+    experience: &mut Experience,
+    created_at: DateTime<Utc>,
+    key: Option<&str>,
+    tail: Option<&ChainTail>,
+    prior: Option<&PriorTurn>,
+) -> DerivedLinks {
+    let mut derived = DerivedLinks::default();
+    let Some(key) = key else {
+        return derived;
+    };
+    let sequence_number = match sequence_number_of(experience) {
+        Some(_) => None,
+        None => next_sequence_number(tail, prior),
+    };
+    let preceding = prior
+        .filter(|prior| prior.source == PriorSource::ConversationKey)
+        .map(|prior| prior.id.0.to_string());
+    let episode = &mut experience
+        .context
+        .get_or_insert_with(|| threaded_context(created_at))
+        .episode;
+    if episode
+        .episode_id
+        .as_deref()
+        .is_none_or(|id| id.trim().is_empty())
+    {
+        episode.episode_id = Some(key.to_string());
+        derived.episode_id = true;
+    }
+    if let Some(id) = preceding {
+        episode.preceding_memory_id = Some(id);
+        derived.preceding_memory_id = true;
+    }
+    if let Some(seq) = sequence_number {
+        episode.sequence_number = Some(seq);
+        episode.is_episode_start |= seq == 1;
+        derived.sequence_number = true;
+    }
+    derived
+}
+
+fn next_sequence_number(tail: Option<&ChainTail>, prior: Option<&PriorTurn>) -> Option<u32> {
+    match (prior, tail) {
+        (Some(prior), _) => prior.sequence_number.map(|seq| seq.saturating_add(1)),
+        (None, Some(tail)) => tail.sequence_number.map(|seq| seq.saturating_add(1)),
+        (None, None) => Some(1),
+    }
 }
 
 /// The explicit predecessor, when the writer threaded the episode.
@@ -403,6 +499,141 @@ mod tests {
             sequence_number: None,
             source: PriorSource::ConversationKey,
         }
+    }
+
+    fn tail(sequence_number: Option<u32>) -> ChainTail {
+        ChainTail {
+            id: MemoryId(uuid::Uuid::new_v4()),
+            created_at: at(2022, 5, 1),
+            sequence_number,
+        }
+    }
+
+    fn episode(experience: &Experience) -> &EpisodeContext {
+        &experience.context.as_ref().expect("threaded").episode
+    }
+
+    #[test]
+    fn a_turn_tagged_with_its_conversation_is_threaded_into_it() {
+        let mut reply = turn("Nate: I've had them for 3 years.", &["conv-42"]);
+        let mut p = prior("Nate: I got two turtles last spring.", &[]);
+        p.sequence_number = Some(4);
+        let key = conversation_key(&reply);
+        let derived = thread_links(
+            &mut reply,
+            at(2022, 5, 1),
+            key.as_deref(),
+            Some(&tail(Some(4))),
+            Some(&p),
+        );
+        assert_eq!(
+            derived,
+            DerivedLinks {
+                episode_id: true,
+                sequence_number: true,
+                preceding_memory_id: true,
+            }
+        );
+        let ep = episode(&reply);
+        assert_eq!(ep.episode_id.as_deref(), Some("conv-42"));
+        assert_eq!(ep.preceding_memory_id, Some(p.id.0.to_string()));
+        assert_eq!(ep.sequence_number, Some(5));
+        assert!(!ep.is_episode_start);
+    }
+
+    #[test]
+    fn the_first_turn_of_a_conversation_starts_its_episode() {
+        let mut opener = turn("Joanna: Hey Nate!", &["conv-42"]);
+        let key = conversation_key(&opener);
+        thread_links(&mut opener, at(2022, 1, 21), key.as_deref(), None, None);
+        let ep = episode(&opener);
+        assert_eq!(ep.sequence_number, Some(1));
+        assert!(ep.is_episode_start);
+        assert_eq!(ep.preceding_memory_id, None);
+    }
+
+    #[test]
+    fn numbering_continues_past_a_session_gap() {
+        let mut later = turn("Joanna: Back again.", &["conv-42"]);
+        let key = conversation_key(&later);
+        let derived = thread_links(
+            &mut later,
+            at(2022, 6, 1),
+            key.as_deref(),
+            Some(&tail(Some(9))),
+            None,
+        );
+        assert!(!derived.preceding_memory_id);
+        assert_eq!(episode(&later).sequence_number, Some(10));
+    }
+
+    #[test]
+    fn an_unnumbered_prior_leaves_the_turn_unnumbered() {
+        let mut reply = turn("Nate: Yes.", &["conv-42"]);
+        let p = prior("Joanna: Turtles?", &[]);
+        let key = conversation_key(&reply);
+        let derived = thread_links(
+            &mut reply,
+            at(2022, 5, 1),
+            key.as_deref(),
+            Some(&tail(None)),
+            Some(&p),
+        );
+        assert!(!derived.sequence_number);
+        assert_eq!(episode(&reply).sequence_number, None);
+    }
+
+    #[test]
+    fn what_the_writer_sent_is_kept() {
+        let mut reply = turn("Nate: Yes.", &["conv-42"]);
+        let mut p = prior("Joanna: Turtles?", &[]);
+        p.source = PriorSource::PrecedingId;
+        p.sequence_number = Some(2);
+        let mut ctx = threaded_context(at(2022, 5, 1));
+        ctx.episode = EpisodeContext {
+            episode_id: Some("ep-writer".into()),
+            sequence_number: Some(7),
+            preceding_memory_id: Some(p.id.0.to_string()),
+            ..Default::default()
+        };
+        reply.context = Some(ctx);
+        let key = conversation_key(&reply);
+        let derived = thread_links(
+            &mut reply,
+            at(2022, 5, 1),
+            key.as_deref(),
+            Some(&tail(Some(2))),
+            Some(&p),
+        );
+        assert_eq!(derived, DerivedLinks::default());
+        let ep = episode(&reply);
+        assert_eq!(ep.episode_id.as_deref(), Some("ep-writer"));
+        assert_eq!(ep.sequence_number, Some(7));
+        assert_eq!(ep.preceding_memory_id, Some(p.id.0.to_string()));
+    }
+
+    #[test]
+    fn nothing_is_written_without_a_conversation_key() {
+        let mut stray = turn("Nate: Yes.", &[]);
+        assert_eq!(conversation_key(&stray), None);
+        let derived = thread_links(&mut stray, at(2022, 5, 1), None, None, None);
+        assert_eq!(derived, DerivedLinks::default());
+        assert!(stray.context.is_none());
+    }
+
+    #[test]
+    fn the_declared_transcript_keys_a_turn_with_no_episode_or_tag() {
+        let mut task = turn("Fix the E0308 in recall.rs", &[]);
+        let mut ctx = threaded_context(at(2022, 5, 1));
+        ctx.session.declared.session_id = Some("sess-1".into());
+        ctx.session.declared.transcript_id = Some("  ".into());
+        task.context = Some(ctx.clone());
+        assert_eq!(conversation_key(&task).as_deref(), Some("session:sess-1"));
+        ctx.session.declared.transcript_id = Some("tx-9".into());
+        task.context = Some(ctx);
+        assert_eq!(conversation_key(&task).as_deref(), Some("transcript:tx-9"));
+        task.tags.push("conv-7".into());
+        assert_eq!(conversation_key(&task).as_deref(), Some("conv-7"));
     }
 
     #[test]

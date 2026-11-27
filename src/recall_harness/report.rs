@@ -222,13 +222,16 @@ pub struct RetrievalDials {
     /// The `turn_context_embedding` dial: `None` is the engine default (off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_context_embedding: Option<bool>,
+    /// The `turn_derivation` dial: `None` is the engine default (on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_derivation: Option<bool>,
     /// The `neighbour_expansion` dial: `None` is the engine default (on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neighbour_expansion: Option<bool>,
     /// The `neighbour_expansion_top` dial: `None` is the engine default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neighbour_expansion_top: Option<usize>,
-    /// The `neighbour_expansion_predecessor` dial: `None` is the engine default (off).
+    /// The `neighbour_expansion_predecessor` dial: `None` is the engine default (on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neighbour_expansion_predecessor: Option<bool>,
 }
@@ -250,6 +253,7 @@ impl RetrievalDials {
             enabled_signals: sorted(&dials.enabled_signals),
             turn_context: dials.turn_context,
             turn_context_embedding: dials.turn_context_embedding,
+            turn_derivation: dials.turn_derivation,
             neighbour_expansion: dials.neighbour_expansion,
             neighbour_expansion_top: dials.neighbour_expansion_top,
             neighbour_expansion_predecessor: dials.neighbour_expansion_predecessor,
@@ -284,6 +288,9 @@ impl RetrievalDials {
         }
         if let Some(v) = self.turn_context_embedding {
             set.push(format!("turn_context_embedding={v}"));
+        }
+        if let Some(v) = self.turn_derivation {
+            set.push(format!("turn_derivation={v}"));
         }
         if let Some(v) = self.neighbour_expansion {
             set.push(format!("neighbour_expansion={v}"));

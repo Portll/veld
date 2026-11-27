@@ -2273,8 +2273,11 @@ impl MemorySystem {
 
         // Conversation turns are indexed with their date and the turn they follow
         // (index_text). The prior turn is resolved once here, before the experience
-        // moves into the record, and threads the episode when the writer did not.
-        let turn = self.turn_index_text(&mut experience, created_at);
+        // moves into the record, and the episode links the writer left out are
+        // derived into it while the user's write lock still orders the chain.
+        let turn_at = created_at.unwrap_or_else(chrono::Utc::now);
+        let prior = self.derive_turn_links(&mut experience, turn_at);
+        let turn = self.turn_index_text(&experience, turn_at, prior.as_ref());
         let embed_input: std::borrow::Cow<'_, str> = match &turn {
             Some(turn) if self.cognitive_dials.read().turn_context_embedding_enabled() => {
                 std::borrow::Cow::Owned(turn.embedding.clone())
@@ -2874,52 +2877,97 @@ impl MemorySystem {
         }
     }
 
-    /// Derive the index text for a conversation turn about to be stored, resolving the
-    /// turn it follows. Returns `None` when the dial is off or the experience is not a
-    /// conversation turn: the indexes then see the bare content, as before.
-    ///
-    /// When the writer sent no `preceding_memory_id` and the prior turn was resolved
-    /// from the conversation key, the episode context is threaded with the resolved id
-    /// so the deferred embed path, the BM25 projection, a follower and a later re-index
-    /// derive the same text, and the successor index can be built from the record.
-    fn turn_index_text(
+    /// Resolve the turn a linked memory about to be stored follows and, under
+    /// `turn_derivation`, write into it the episode links its writer left out (see
+    /// [`index_text::thread_links`]), so the deferred embed path, the BM25 projection, a
+    /// follower, a later re-index and the successor index all read them from the record.
+    /// Returns the prior turn for [`Self::turn_index_text`]; `None` when the memory is not
+    /// linked or both `turn_derivation` and `turn_context` are off.
+    fn derive_turn_links(
         &self,
         experience: &mut Experience,
-        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<index_text::PriorTurn> {
+        if !index_text::applies(experience) {
+            return None;
+        }
+        let (derive, contextualise) = {
+            let dials = self.cognitive_dials.read();
+            (
+                dials.turn_derivation_enabled(),
+                dials.turn_context_enabled(),
+            )
+        };
+        if !derive && !contextualise {
+            return None;
+        }
+        let key = index_text::conversation_key(experience);
+        let tail = key.as_deref().and_then(|key| self.chain_tail(key));
+        let prior = self.resolve_prior_turn(experience, created_at, tail.as_ref());
+        if derive {
+            let derived = index_text::thread_links(
+                experience,
+                created_at,
+                key.as_deref(),
+                tail.as_ref(),
+                prior.as_ref(),
+            );
+            for (field, stamped) in [
+                ("episode_id", derived.episode_id),
+                ("sequence_number", derived.sequence_number),
+                ("preceding_memory_id", derived.preceding_memory_id),
+            ] {
+                if stamped {
+                    crate::metrics::TURN_DERIVED_TOTAL
+                        .with_label_values(&[field])
+                        .inc();
+                }
+            }
+        }
+        prior
+    }
+
+    /// The index text for a linked memory about to be stored, carrying `prior`, the turn
+    /// it follows. Returns `None` when `turn_context` is off or the memory is not linked:
+    /// the indexes then see the bare content.
+    fn turn_index_text(
+        &self,
+        experience: &Experience,
+        created_at: chrono::DateTime<chrono::Utc>,
+        prior: Option<&index_text::PriorTurn>,
     ) -> Option<index_text::TurnIndexText> {
         if !index_text::applies(experience) || !self.cognitive_dials.read().turn_context_enabled() {
             return None;
         }
-        let created_at = created_at.unwrap_or_else(chrono::Utc::now);
-        let prior = self.resolve_prior_turn(experience, created_at);
-        let source = prior.as_ref().map_or("none", |prior| prior.source.label());
+        let source = prior.map_or("none", |prior| prior.source.label());
         crate::metrics::TURN_CONTEXT_TOTAL
             .with_label_values(&[source])
             .inc();
-        if let Some(prior) = prior
-            .as_ref()
-            .filter(|prior| prior.source == index_text::PriorSource::ConversationKey)
-        {
-            let ctx = experience
-                .context
-                .get_or_insert_with(|| index_text::threaded_context(created_at));
-            ctx.episode.preceding_memory_id = Some(prior.id.0.to_string());
-        }
         Some(index_text::build(
             &experience.content,
             created_at,
             &experience.entities,
-            prior.as_ref(),
+            prior,
         ))
     }
 
+    /// The latest turn seen for a conversation key: the chain tail, or a working-memory
+    /// scan after a restart.
+    fn chain_tail(&self, key: &str) -> Option<index_text::ChainTail> {
+        match self.turn_chain.get(key) {
+            Some(tail) => Some(tail.clone()),
+            None => self.scan_working_memory_for_tail(key),
+        }
+    }
+
     /// The turn `experience` follows: the writer's `preceding_memory_id` when it names a
-    /// stored memory, else the latest turn sharing the conversation key within the
-    /// session gap (the chain tail, or a working-memory scan after a restart).
+    /// stored memory, else `tail`, its conversation's latest turn, when that falls within
+    /// the session gap.
     fn resolve_prior_turn(
         &self,
         experience: &Experience,
         created_at: chrono::DateTime<chrono::Utc>,
+        tail: Option<&index_text::ChainTail>,
     ) -> Option<index_text::PriorTurn> {
         if let Some(id) = index_text::preceding_memory_id(experience) {
             match self.long_term_memory.get(&id) {
@@ -2937,13 +2985,12 @@ impl MemorySystem {
                 }
             }
         }
-        let key = index_text::conversation_key(experience)?;
-        let sequence_number = index_text::sequence_number_of(experience);
-        let tail = match self.turn_chain.get(&key) {
-            Some(tail) => Some(tail.clone()),
-            None => self.scan_working_memory_for_tail(&key),
-        }?;
-        if !index_text::chain_tail_precedes(&tail, created_at, sequence_number) {
+        let tail = tail?;
+        if !index_text::chain_tail_precedes(
+            tail,
+            created_at,
+            index_text::sequence_number_of(experience),
+        ) {
             return None;
         }
         let prior = self.long_term_memory.get(&tail.id).ok()?;
