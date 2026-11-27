@@ -493,6 +493,9 @@ Generated from git history. Sections are conventional-commit prefixes; hashes li
 
 ### fix
 
+- fix(mcp): stop storing echoes of read-only tool calls (4d5a9620)
+- fix(embeddings): build on Windows with zip 9, whose ZipFile::name() returns a Result (4802aad8)
+- fix(recall): the cross-encoder rerank is off unless the use_reranking dial turns it on (0ee16494)
 - fix(recall): the cross-encoder takes half the blend over the top 30 of 50 candidates (60a04008)
 - fix(recall): remove the length prior that demotes long evidence turns (1ceb1e67)
 - fix(recall): feed four ranking signals the inputs their weights assume (c10715e2)
@@ -750,6 +753,10 @@ Generated from git history. Sections are conventional-commit prefixes; hashes li
 - mcp: remember reads the handler's success field, not a stored field that never arrives (6224a50a)
 - mcp: the original tools decode what the server sends (088eebff)
 - mcp: expand VELD_* from the environment, dev key only as fallback (0ae4dbc4)
+
+### memory
+
+- memory: derive episode links at ingest and bring in the prior turn by default (01ebf9e2)
 
 ### metadata
 
@@ -1040,6 +1047,7 @@ Generated from git history. Sections are conventional-commit prefixes; hashes li
 
 ### recall
 
+- recall: re-record the gate baseline with the cross-encoder off (864274a4)
 - recall: re-record the gate baseline on train C3 (d02211aa)
 - recall: re-record the gate baseline under the new cross-encoder defaults (6925ad42)
 - recall: a directional suite asks who did what to whom (upstream #571) (ed0e64f1)
@@ -1144,6 +1152,8 @@ Generated from git history. Sections are conventional-commit prefixes; hashes li
 
 ### test
 
+- test: a prior turn naming no stored memory is replaced by the conversation's (d4d6bba4)
+- test(replica): the stream test turns the time trigger off before it flushes (7842936f)
 - test(recall): spend the 29 hold-out cases read to diagnose the fusion=rrf top-1 losses (7db1e401)
 - test(recall): a user-less recall on an owned system runs the owner's fact layers (216566b8)
 - test(replication): the follower refusals and a read-route sweep (47ce9f4f)
