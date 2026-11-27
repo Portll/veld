@@ -227,6 +227,9 @@ jobs:
         with:
           path: ~/.cache/veld
           key: veld-models-${{ runner.os }}-${{ env.EMBEDDER }}-${{ hashFiles('src/embeddings/downloader.rs') }}
+          # A downloader edit that leaves the pins alone must not force a fresh fetch: the fetch
+          # skips files already on disk, and the ONNX runtime's upstream release has gone (404).
+          restore-keys: veld-models-${{ runner.os }}-${{ env.EMBEDDER }}-
       - name: Fetch the ONNX runtime and the embedder
         if: steps.models.outputs.cache-hit != 'true'
         run: >-
